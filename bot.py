@@ -3,7 +3,7 @@ import uuid
 import sqlite3
 import hashlib
 import threading
-import urllib.parse
+import base64
 import telebot
 import requests
 import urllib3
@@ -98,7 +98,6 @@ def remember(chat_id, msg_id):
 # === МЕНЮ ===
 def main_menu():
     markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("🎨 Нарисовать картинку", callback_data="menu_image"))
     markup.add(telebot.types.InlineKeyboardButton("💳 Купить токены", callback_data="menu_buy"))
     markup.add(telebot.types.InlineKeyboardButton("🤖 Чат с ИИ", callback_data="menu_chat"))
     markup.add(telebot.types.InlineKeyboardButton("💰 Мой баланс", callback_data="menu_balance"))
@@ -152,58 +151,6 @@ def back_to_main(call):
     clear_old_messages(call.message.chat.id)
     send_main_menu(call.message.chat.id)
     bot.answer_callback_query(call.id)
-
-# === ГЕНЕРАЦИЯ КАРТИНОК (исправлено: скачиваем сами) ===
-@bot.callback_query_handler(func=lambda call: call.data == "menu_image")
-def image_menu(call):
-    bot.answer_callback_query(call.id)
-    try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
-        pass
-    clear_old_messages(call.message.chat.id)
-    sent = bot.send_message(
-        call.message.chat.id,
-        "🎨 <b>Генерация картинки</b>\n────────────────\nНапиши, что хочешь нарисовать:",
-        parse_mode='HTML',
-        reply_markup=back_menu()
-    )
-    remember(call.message.chat.id, sent.message_id)
-    bot.register_next_step_handler(sent, generate_image)
-
-def generate_image(message):
-    if message.text == "⬅️ Назад":
-        back_to_main(message)
-        return
-    try:
-        bot.delete_message(message.chat.id, message.message_id)
-    except Exception:
-        pass
-
-    prompt = message.text
-    bot.send_chat_action(message.chat.id, 'upload_photo')
-
-    encoded = urllib.parse.quote(prompt)
-    image_url = f"https://gen.pollinations.ai/image/{encoded}?width=1024&height=1024&nologo=true"
-
-    try:
-        # === СКАЧИВАЕМ КАРТИНКУ САМИ ===
-        r = requests.get(image_url, timeout=60)
-        if r.status_code != 200:
-            raise Exception(f"Сервер вернул {r.status_code}")
-
-        # === ОТПРАВЛЯЕМ БАЙТЫ, А НЕ ССЫЛКУ ===
-        sent = bot.send_photo(
-            message.chat.id,
-            r.content,
-            caption=f"🎨 <b>Запрос:</b> {prompt}",
-            parse_mode='HTML',
-            reply_markup=back_menu()
-        )
-        remember(message.chat.id, sent.message_id)
-    except Exception as e:
-        sent = bot.send_message(message.chat.id, f"❌ Ошибка генерации: {e}", reply_markup=back_menu())
-        remember(message.chat.id, sent.message_id)
 
 # === КУПИТЬ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_buy")
@@ -317,7 +264,8 @@ def enter_chat(call):
     update_state(call.message.chat.id, 'chat')
     sent = bot.send_message(
         call.message.chat.id,
-        f"🤖 <b>Вы в чате с ИИ.</b>\n💰 Баланс: {tokens} токенов.\nЗадайте вопрос — 1 запрос = 1 токен.",
+        f"🤖 <b>Вы в чате с ИИ.</b>\n💰 Баланс: {tokens} токенов.\n"
+        f"Задайте вопрос или отправьте фото — 1 запрос = 1 токен.",
         parse_mode='HTML',
         reply_markup=back_menu()
     )
@@ -353,7 +301,7 @@ def get_gigachat_token():
         print(f"Ошибка GigaChat: {e}")
         return None
 
-def ask_gigachat(question):
+def ask_gigachat(question, image_base64=None):
     access_token = get_gigachat_token()
     if not access_token:
         return "❌ Не удалось получить доступ к ИИ."
@@ -363,11 +311,21 @@ def ask_gigachat(question):
         "Accept": "application/json",
         "Authorization": f"Bearer {access_token}"
     }
+
+    if image_base64:
+        # Запрос с картинкой
+        content = [
+            {"type": "text", "text": question if question else "Что на этой картинке?"},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
+        ]
+    else:
+        content = question
+
     data = {
         "model": "GigaChat-3-Ultra",
         "messages": [
             {"role": "system", "content": "Ты полезный ИИ-помощник. Отвечай на русском языке."},
-            {"role": "user", "content": question}
+            {"role": "user", "content": content}
         ],
         "temperature": 0.7
     }
@@ -380,8 +338,8 @@ def ask_gigachat(question):
     except Exception as e:
         return f"❌ Ошибка: {e}"
 
-# === СООБЩЕНИЯ В ЧАТЕ ===
-@bot.message_handler(func=lambda m: True)
+# === СООБЩЕНИЯ В ЧАТЕ (текст и фото) ===
+@bot.message_handler(content_types=['text', 'photo'])
 def handle_message(message):
     tokens, state = get_user(message.chat.id)
     if state != 'chat':
@@ -398,13 +356,27 @@ def handle_message(message):
         sent = bot.send_message(message.chat.id, "❌ Токены закончились.", reply_markup=markup)
         remember(message.chat.id, sent.message_id)
         return
+
     try:
         bot.delete_message(message.chat.id, message.message_id)
     except Exception:
         pass
+
     add_tokens(message.chat.id, -1)
     bot.send_chat_action(message.chat.id, 'typing')
-    answer = ask_gigachat(message.text)
+
+    # === ЕСЛИ ПРИШЛО ФОТО ===
+    if message.photo:
+        # Берём самое большое фото
+        file_id = message.photo[-1].file_id
+        file_info = bot.get_file(file_id)
+        downloaded = bot.download_file(file_info.file_path)
+        image_base64 = base64.b64encode(downloaded).decode('utf-8')
+        caption = message.caption if message.caption else "Что на этой картинке?"
+        answer = ask_gigachat(caption, image_base64=image_base64)
+    else:
+        answer = ask_gigachat(message.text)
+
     tokens_left, _ = get_user(message.chat.id)
     if "```" in answer or "def " in answer or "import " in answer or "class " in answer:
         clean_code = answer.replace("```python", "").replace("```", "").strip()
