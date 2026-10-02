@@ -14,7 +14,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 YOOMONEY_RECEIVER = os.getenv('YOOMONEY_RECEIVER')
 YOOMONEY_SECRET = os.getenv('YOOMONEY_SECRET')
-GIGACHAT_AUTH_KEY = os.getenv('GIGACHAT_AUTH_KEY')  # Ключ авторизации GigaChat
+GIGACHAT_AUTH_KEY = os.getenv('GIGACHAT_AUTH_KEY')
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
@@ -308,6 +308,7 @@ def ask_gigachat(question):
     if not access_token:
         return "❌ Не удалось получить доступ к ИИ. Попробуйте позже."
 
+    # ИСПРАВЛЕННЫЙ URL
     url = "https://api.giga.chat/v1/chat/completions"
     headers = {
         "Content-Type": "application/json",
