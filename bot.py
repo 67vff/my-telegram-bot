@@ -34,13 +34,8 @@ def create_order(message):
             bot.send_message(message.chat.id, "Минимальная сумма — 10 рублей. Попробуй снова.")
             return
 
-        # Уникальный ID счёта (метка)
         order_id = f"ORD-{message.chat.id}-{int(amount)}"
-
-        # Ссылка на быстрый перевод ЮMoney с меткой
         link = f"https://yoomoney.ru/transfer/quickpay?receiver={YOOMONEY_RECEIVER}&sum={amount}&label={order_id}"
-
-        # Сохраняем счёт
         user_orders[order_id] = {"chat_id": message.chat.id, "amount": amount}
 
         bot.send_message(
@@ -56,7 +51,6 @@ def create_order(message):
 def yoomoney_webhook():
     data = request.form.to_dict()
 
-    # Проверка подписи (чтобы никто не подделал оплату)
     received_hash = data.get('sha1_hash', '')
     check_string = '&'.join([f"{k}={v}" for k, v in sorted(data.items()) if k != 'sha1_hash'])
     check_string += YOOMONEY_SECRET
@@ -65,7 +59,6 @@ def yoomoney_webhook():
     if calculated_hash != received_hash:
         return jsonify({"status": "error", "message": "Invalid signature"}), 403
 
-    # Обработка платежа
     label = data.get('label', '')
     amount = data.get('amount', '')
 
