@@ -94,7 +94,7 @@ def clear_old_messages(chat_id):
 def remember(chat_id, msg_id):
     last_messages.setdefault(chat_id, []).append(msg_id)
 
-# === МЕНЮ (БЕЗ КНОПКИ КАРТИНОК) ===
+# === МЕНЮ ===
 def main_menu():
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("💳 Купить токены", callback_data="menu_buy"))
@@ -263,8 +263,7 @@ def enter_chat(call):
     update_state(call.message.chat.id, 'chat')
     sent = bot.send_message(
         call.message.chat.id,
-        f"🤖 <b>Вы в чате с ИИ.</b>\n💰 Баланс: {tokens} токенов.\n"
-        f"Задайте вопрос или отправьте фото — 1 запрос = 1 токен.",
+        f"🤖 <b>Вы в чате с ИИ.</b>\n💰 Баланс: {tokens} токенов.\nЗадайте вопрос — 1 запрос = 1 токен.",
         parse_mode='HTML',
         reply_markup=back_menu()
     )
@@ -300,49 +299,24 @@ def get_gigachat_token():
         print(f"Ошибка GigaChat: {e}")
         return None
 
-def upload_image_to_gigachat(image_bytes, access_token):
-    """Загружаем картинку в GigaChat и получаем её file_id"""
-    url = "https://gigachat.devices.sberbank.ru/api/v1/files"
-    headers = {"Authorization": f"Bearer {access_token}"}
-    files = {"file": ("image.jpg", image_bytes, "image/jpeg")}
-    data = {"purpose": "general"}
-    try:
-        r = requests.post(url, headers=headers, files=files, data=data, verify=False, timeout=60)
-        result = r.json()
-        return result.get("id")
-    except Exception as e:
-        print(f"Ошибка загрузки картинки: {e}")
-        return None
-
-def ask_gigachat(question, image_bytes=None):
+def ask_gigachat(question):
     access_token = get_gigachat_token()
     if not access_token:
         return "❌ Не удалось получить доступ к ИИ."
-
-    url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
+    url = "https://api.giga.chat/v1/chat/completions"
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
         "Authorization": f"Bearer {access_token}"
     }
-
-    # Формируем запрос БЕЗ картинки
     data = {
-        "model": "GigaChat-2-Max",
+        "model": "GigaChat-3-Ultra",
         "messages": [
             {"role": "system", "content": "Ты полезный ИИ-помощник. Отвечай на русском языке."},
-            {"role": "user", "content": question if question else "Что на этой картинке?"}
+            {"role": "user", "content": question}
         ],
         "temperature": 0.7
     }
-
-    # Если есть картинка — загружаем и добавляем в ATTACHMENTS
-    if image_bytes:
-        file_id = upload_image_to_gigachat(image_bytes, access_token)
-        if not file_id:
-            return "❌ Не удалось загрузить картинку."
-        data["attachments"] = [file_id]  # ← ПРАВИЛЬНЫЙ ФОРМАТ[citation:1][citation:2]
-
     try:
         r = requests.post(url, headers=headers, json=data, verify=False, timeout=60)
         result = r.json()
@@ -352,8 +326,8 @@ def ask_gigachat(question, image_bytes=None):
     except Exception as e:
         return f"❌ Ошибка: {e}"
 
-# === СООБЩЕНИЯ В ЧАТЕ (текст и фото) ===
-@bot.message_handler(content_types=['text', 'photo'])
+# === СООБЩЕНИЯ В ЧАТЕ ===
+@bot.message_handler(func=lambda m: True)
 def handle_message(message):
     tokens, state = get_user(message.chat.id)
     if state != 'chat':
@@ -370,52 +344,60 @@ def handle_message(message):
         sent = bot.send_message(message.chat.id, "❌ Токены закончились.", reply_markup=markup)
         remember(message.chat.id, sent.message_id)
         return
-
     try:
         bot.delete_message(message.chat.id, message.message_id)
     except Exception:
         pass
-
     add_tokens(message.chat.id, -1)
     bot.send_chat_action(message.chat.id, 'typing')
-
-    if message.photo:
-        file_id = message.photo[-1].file_id
-        file_info = bot.get_file(file_id)
-        downloaded = bot.download_file(file_info.file_path)
-        caption = message.caption if message.caption else "Что на этой картинке?"
-        answer = ask_gigachat(caption, image_bytes=downloaded)
-    else:
-        answer = ask_gigachat(message.text)
-
+    answer = ask_gigachat(message.text)
     tokens_left, _ = get_user(message.chat.id)
-    if "```" in answer or "def " in answer or "import " in answer or "class " in answer:
-        clean_code = answer.replace("```python", "").replace("```", "").strip()
-        try:
-            copy_btn = telebot.types.InlineKeyboardButton(text="📋 Скопировать код", copy_text=clean_code)
-            markup = telebot.types.InlineKeyboardMarkup()
-            markup.add(copy_btn)
-            markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
-            sent = bot.send_message(
-                message.chat.id,
-                f"<pre><code>{clean_code}</code></pre>\n\n──────────\n💰 Осталось: {tokens_left}",
-                parse_mode='HTML',
-                reply_markup=markup
-            )
-        except Exception:
-            sent = bot.send_message(
-                message.chat.id,
-                f"<pre><code>{clean_code}</code></pre>\n\n──────────\n💰 Осталось: {tokens_left}",
-                parse_mode='HTML',
-                reply_markup=back_menu()
-            )
+
+    # === УЛУЧШЕННАЯ ОТПРАВКА КОДА ===
+    if "```" in answer:
+        # Разбиваем ответ на части по маркеру кода
+        parts = answer.split("```")
+        for i, part in enumerate(parts):
+            part = part.strip()
+            if not part:
+                continue
+            if i % 2 == 1:
+                # Это код — отправляем как отдельный блок с кнопкой копирования
+                clean_code = part.replace("python", "", 1).strip()
+                try:
+                    copy_btn = telebot.types.InlineKeyboardButton(text="📋 Скопировать код", copy_text=clean_code)
+                    markup = telebot.types.InlineKeyboardMarkup()
+                    markup.add(copy_btn)
+                    sent = bot.send_message(
+                        message.chat.id,
+                        f"<pre><code>{clean_code}</code></pre>",
+                        parse_mode='HTML',
+                        reply_markup=markup
+                    )
+                    remember(message.chat.id, sent.message_id)
+                except Exception:
+                    sent = bot.send_message(message.chat.id, f"<pre><code>{clean_code}</code></pre>", parse_mode='HTML')
+                    remember(message.chat.id, sent.message_id)
+            else:
+                # Это обычный текст
+                sent = bot.send_message(message.chat.id, part)
+                remember(message.chat.id, sent.message_id)
+
+        # Отдельно показываем остаток токенов
+        sent = bot.send_message(
+            message.chat.id,
+            f"──────────\n💰 Осталось: {tokens_left}",
+            reply_markup=back_menu()
+        )
+        remember(message.chat.id, sent.message_id)
     else:
+        # Если кода нет — отправляем как обычно
         sent = bot.send_message(
             message.chat.id,
             f"{answer}\n\n──────────\n💰 Осталось: {tokens_left}",
             reply_markup=back_menu()
         )
-    remember(message.chat.id, sent.message_id)
+        remember(message.chat.id, sent.message_id)
 
 # === СТРАНИЦА ОПЛАТЫ ===
 @app.route('/pay/<amount>/<label>')
