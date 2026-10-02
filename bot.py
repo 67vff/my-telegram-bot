@@ -1,15 +1,20 @@
 import os
+import uuid
 import sqlite3
 import hashlib
 import threading
 import telebot
 import requests
+import urllib3
 from flask import Flask, request, jsonify
+
+# Отключаем предупреждения SSL (нужно для GigaChat на Bothost)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 YOOMONEY_RECEIVER = os.getenv('YOOMONEY_RECEIVER')
 YOOMONEY_SECRET = os.getenv('YOOMONEY_SECRET')
-DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
+GIGACHAT_AUTH_KEY = os.getenv('GIGACHAT_AUTH_KEY')  # Ключ авторизации GigaChat
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
@@ -41,7 +46,6 @@ def get_user(chat_id):
     c.execute("SELECT tokens, state FROM users WHERE chat_id=?", (chat_id,))
     row = c.fetchone()
     if not row:
-        # Новому пользователю сразу 1000 токенов
         c.execute("INSERT INTO users (chat_id, tokens, state) VALUES (?, 1000, 'idle')", (chat_id,))
         conn.commit()
         row = (1000, 'idle')
@@ -280,19 +284,46 @@ def support(call):
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-# === DEEPSEEK ===
-def ask_deepseek(question):
-    headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
+# === GIGACHAT: ПОЛУЧЕНИЕ ТОКЕНА ДОСТУПА ===
+def get_gigachat_token():
+    url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+        "RqUID": str(uuid.uuid4()),
+        "Authorization": f"Bearer {GIGACHAT_AUTH_KEY}"
+    }
+    data = {"scope": "GIGACHAT_API_PERS"}
+    try:
+        response = requests.post(url, headers=headers, data=data, verify=False, timeout=30)
+        result = response.json()
+        return result.get("access_token")
+    except Exception as e:
+        print(f"Ошибка получения токена GigaChat: {e}")
+        return None
+
+# === GIGACHAT: ЗАПРОС ===
+def ask_gigachat(question):
+    access_token = get_gigachat_token()
+    if not access_token:
+        return "❌ Не удалось получить доступ к ИИ. Попробуйте позже."
+
+    url = "https://api.giga.chat/v1/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": f"Bearer {access_token}"
+    }
     data = {
-        "model": "deepseek-chat",
+        "model": "GigaChat-3-Ultra",
         "messages": [
-            {"role": "system", "content": "Ты полезный ИИ-помощник. Отвечай на русском."},
+            {"role": "system", "content": "Ты полезный ИИ-помощник. Отвечай на русском языке."},
             {"role": "user", "content": question}
         ],
         "temperature": 0.7
     }
     try:
-        r = requests.post("https://api.deepseek.com/v1/chat/completions", headers=headers, json=data, timeout=60)
+        r = requests.post(url, headers=headers, json=data, verify=False, timeout=60)
         result = r.json()
         if "choices" in result:
             return result["choices"][0]["message"]["content"]
@@ -321,7 +352,7 @@ def handle_message(message):
         pass
     add_tokens(message.chat.id, -1)
     bot.send_chat_action(message.chat.id, 'typing')
-    answer = ask_deepseek(message.text)
+    answer = ask_gigachat(message.text)
     tokens_left, _ = get_user(message.chat.id)
     sent = bot.send_message(
         message.chat.id,
