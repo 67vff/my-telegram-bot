@@ -95,7 +95,7 @@ def clear_old_messages(chat_id):
 def remember(chat_id, msg_id):
     last_messages.setdefault(chat_id, []).append(msg_id)
 
-# === МЕНЮ ===
+# === МЕНЮ (Inline) ===
 def main_menu():
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("💳 Купить токены", callback_data="menu_buy"))
@@ -106,11 +106,11 @@ def main_menu():
 
 def buy_menu():
     markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("🎁 10 ₽ — 2 токена (пробный)", callback_data="pack_10_2"))
+    markup.add(telebot.types.InlineKeyboardButton("🎁 10 ₽ — 2 токена", callback_data="pack_10_2"))
     markup.add(telebot.types.InlineKeyboardButton("100 ₽ — 20 токенов", callback_data="pack_100_20"))
     markup.add(telebot.types.InlineKeyboardButton("250 ₽ — 50 токенов", callback_data="pack_250_50"))
     markup.add(telebot.types.InlineKeyboardButton("500 ₽ — 100 токенов", callback_data="pack_500_100"))
-    markup.add(telebot.types.InlineKeyboardButton("✏️ Ввести свою сумму", callback_data="custom_amount"))
+    markup.add(telebot.types.InlineKeyboardButton("✏️ Своя сумма", callback_data="custom_amount"))
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
     return markup
 
@@ -284,7 +284,7 @@ def support(call):
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-# === GIGACHAT: ПОЛУЧЕНИЕ ТОКЕНА ДОСТУПА ===
+# === GIGACHAT: ПОЛУЧЕНИЕ ТОКЕНА ===
 def get_gigachat_token():
     url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
     headers = {
@@ -308,7 +308,6 @@ def ask_gigachat(question):
     if not access_token:
         return "❌ Не удалось получить доступ к ИИ. Попробуйте позже."
 
-    # ИСПРАВЛЕННЫЙ URL
     url = "https://api.giga.chat/v1/chat/completions"
     headers = {
         "Content-Type": "application/json",
@@ -347,19 +346,53 @@ def handle_message(message):
         sent = bot.send_message(message.chat.id, "❌ Токены закончились.", reply_markup=markup)
         remember(message.chat.id, sent.message_id)
         return
+
     try:
         bot.delete_message(message.chat.id, message.message_id)
     except Exception:
         pass
+
     add_tokens(message.chat.id, -1)
     bot.send_chat_action(message.chat.id, 'typing')
     answer = ask_gigachat(message.text)
     tokens_left, _ = get_user(message.chat.id)
-    sent = bot.send_message(
-        message.chat.id,
-        f"{answer}\n\n──────────\n💰 Осталось токенов: {tokens_left}",
-        reply_markup=chat_menu()
-    )
+
+    # Проверяем, есть ли в ответе код (по маркерам)
+    if "```" in answer or "def " in answer or "class " in answer or "import " in answer:
+        # Очищаем от markdown-оберток, если есть
+        clean_code = answer.replace("```python", "").replace("```", "").strip()
+        
+        # Используем HTML для красивого отображения и кнопку копирования
+        # (Доступно в Telegram Bot API 7.11+ и новых pyTelegramBotAPI)
+        try:
+            copy_btn = telebot.types.InlineKeyboardButton(
+                text="📋 Скопировать код",
+                copy_text=clean_code
+            )
+            markup = telebot.types.InlineKeyboardMarkup()
+            markup.add(copy_btn)
+            markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
+            sent = bot.send_message(
+                message.chat.id,
+                f"<pre><code>{clean_code}</code></pre>\n\n──────────\n💰 Осталось токенов: {tokens_left}",
+                parse_mode='HTML',
+                reply_markup=markup
+            )
+        except Exception:
+            # Если copy_text не поддерживается, просто отправляем код
+            sent = bot.send_message(
+                message.chat.id,
+                f"<pre><code>{clean_code}</code></pre>\n\n──────────\n💰 Осталось токенов: {tokens_left}",
+                parse_mode='HTML',
+                reply_markup=chat_menu()
+            )
+    else:
+        # Обычный текстовый ответ
+        sent = bot.send_message(
+            message.chat.id,
+            f"{answer}\n\n──────────\n💰 Осталось токенов: {tokens_left}",
+            reply_markup=chat_menu()
+        )
     remember(message.chat.id, sent.message_id)
 
 # === СТРАНИЦА ОПЛАТЫ ===
