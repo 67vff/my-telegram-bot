@@ -3,7 +3,6 @@ import uuid
 import sqlite3
 import hashlib
 import threading
-import base64
 import telebot
 import requests
 import urllib3
@@ -95,7 +94,7 @@ def clear_old_messages(chat_id):
 def remember(chat_id, msg_id):
     last_messages.setdefault(chat_id, []).append(msg_id)
 
-# === МЕНЮ (кнопки картинок УБРАНЫ) ===
+# === МЕНЮ (БЕЗ КНОПКИ КАРТИНОК) ===
 def main_menu():
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("💳 Купить токены", callback_data="menu_buy"))
@@ -284,7 +283,7 @@ def support(call):
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-# === GIGACHAT (с загрузкой файла для картинок) ===
+# === GIGACHAT ===
 def get_gigachat_token():
     url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
     headers = {
@@ -302,7 +301,7 @@ def get_gigachat_token():
         return None
 
 def upload_image_to_gigachat(image_bytes, access_token):
-    """Загружаем картинку в GigaChat и получаем её ID"""
+    """Загружаем картинку в GigaChat и получаем её file_id"""
     url = "https://gigachat.devices.sberbank.ru/api/v1/files"
     headers = {"Authorization": f"Bearer {access_token}"}
     files = {"file": ("image.jpg", image_bytes, "image/jpeg")}
@@ -327,28 +326,23 @@ def ask_gigachat(question, image_bytes=None):
         "Authorization": f"Bearer {access_token}"
     }
 
-    if image_bytes:
-        # Сначала загружаем картинку, получаем file_id
-        file_id = upload_image_to_gigachat(image_bytes, access_token)
-        if not file_id:
-            return "❌ Не удалось загрузить картинку."
-
-        # Мультимодальный запрос
-        content = [
-            {"type": "text", "text": question if question else "Что на этой картинке?"},
-            {"type": "image_url", "image_url": {"url": f"file://{file_id}"}}
-        ]
-    else:
-        content = question
-
+    # Формируем запрос БЕЗ картинки
     data = {
-        "model": "GigaChat-2-Max",  # Мультимодальная модель
+        "model": "GigaChat-2-Max",
         "messages": [
             {"role": "system", "content": "Ты полезный ИИ-помощник. Отвечай на русском языке."},
-            {"role": "user", "content": content}
+            {"role": "user", "content": question if question else "Что на этой картинке?"}
         ],
         "temperature": 0.7
     }
+
+    # Если есть картинка — загружаем и добавляем в ATTACHMENTS
+    if image_bytes:
+        file_id = upload_image_to_gigachat(image_bytes, access_token)
+        if not file_id:
+            return "❌ Не удалось загрузить картинку."
+        data["attachments"] = [file_id]  # ← ПРАВИЛЬНЫЙ ФОРМАТ[citation:1][citation:2]
+
     try:
         r = requests.post(url, headers=headers, json=data, verify=False, timeout=60)
         result = r.json()
@@ -385,7 +379,6 @@ def handle_message(message):
     add_tokens(message.chat.id, -1)
     bot.send_chat_action(message.chat.id, 'typing')
 
-    # === ЕСЛИ ПРИШЛО ФОТО ===
     if message.photo:
         file_id = message.photo[-1].file_id
         file_info = bot.get_file(file_id)
