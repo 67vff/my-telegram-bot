@@ -10,7 +10,6 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 YOOMONEY_RECEIVER = os.getenv('YOOMONEY_RECEIVER')
 YOOMONEY_SECRET = os.getenv('YOOMONEY_SECRET')
 DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
-ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))  # Твой Telegram ID
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
@@ -23,7 +22,7 @@ def init_db():
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS users (
         chat_id INTEGER PRIMARY KEY,
-        tokens INTEGER DEFAULT 0,
+        tokens INTEGER DEFAULT 1000,
         state TEXT DEFAULT 'idle'
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS orders (
@@ -42,9 +41,10 @@ def get_user(chat_id):
     c.execute("SELECT tokens, state FROM users WHERE chat_id=?", (chat_id,))
     row = c.fetchone()
     if not row:
-        c.execute("INSERT INTO users (chat_id, tokens, state) VALUES (?, 0, 'idle')", (chat_id,))
+        # Новому пользователю сразу 1000 токенов
+        c.execute("INSERT INTO users (chat_id, tokens, state) VALUES (?, 1000, 'idle')", (chat_id,))
         conn.commit()
-        row = (0, 'idle')
+        row = (1000, 'idle')
     conn.close()
     return row
 
@@ -91,7 +91,7 @@ def clear_old_messages(chat_id):
 def remember(chat_id, msg_id):
     last_messages.setdefault(chat_id, []).append(msg_id)
 
-# === ГЛАВНОЕ МЕНЮ ===
+# === МЕНЮ ===
 def main_menu():
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("💳 Купить токены", callback_data="menu_buy"))
@@ -136,16 +136,6 @@ def start(message):
         pass
     clear_old_messages(message.chat.id)
     send_main_menu(message.chat.id)
-
-# === АДМИН: /give_tokens ===
-@bot.message_handler(commands=['give_tokens'])
-def give_tokens(message):
-    if message.chat.id != ADMIN_ID:
-        bot.send_message(message.chat.id, "❌ У вас нет доступа.")
-        return
-    add_tokens(message.chat.id, 1000)
-    tokens, _ = get_user(message.chat.id)
-    bot.send_message(message.chat.id, f"✅ Начислено 1000 токенов.\n💰 Баланс: {tokens}")
 
 # === НАЗАД ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_main")
