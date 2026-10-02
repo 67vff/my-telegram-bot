@@ -1,5 +1,6 @@
 import os
 import hashlib
+import threading
 import telebot
 from flask import Flask, request, jsonify
 
@@ -72,7 +73,15 @@ def yoomoney_webhook():
 
     return jsonify({"status": "ok"}), 200
 
-# === ЗАПУСК ===
-if __name__ == '__main__':
+# === ЗАПУСК FLASK В ОТДЕЛЬНОМ ПОТОКЕ ===
+def run_flask():
     port = int(os.getenv('PORT', 3000))
     app.run(host='0.0.0.0', port=port)
+
+# === ЗАПУСК БОТА (polling) ===
+if __name__ == '__main__':
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+
+    bot.polling(none_stop=True)
