@@ -1,56 +1,85 @@
 import os
+import hashlib
 import telebot
-from telebot import types
-from yookassa import Configuration, Payment
+from flask import Flask, request, jsonify
 
-# Настройка ЮKassa (ключи берутся из переменных окружения хостинга)
-Configuration.account_id = os.getenv('YOOKASSA_SHOP_ID')
-Configuration.secret_key = os.getenv('YOOKASSA_SECRET_KEY')
+# === ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ (берутся с Bothost) ===
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+YOOMONEY_RECEIVER = os.getenv('YOOMONEY_RECEIVER')
+YOOMONEY_SECRET = os.getenv('YOOMONEY_SECRET')
 
-bot = telebot.TeleBot(os.getenv('TELEGRAM_BOT_TOKEN'))
+bot = telebot.TeleBot(BOT_TOKEN)
+app = Flask(__name__)
 
-# Хранилище для сумм, которые вводят пользователи
-user_amounts = {}
+# Хранилище счетов
+user_orders = {}
 
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    btn = types.KeyboardButton("Создать ссылку оплаты")
-    markup.add(btn)
-    bot.send_message(message.chat.id, "Привет! Нажми на кнопку, чтобы создать счёт на оплату 👇", reply_markup=markup)
+# === КОМАНДА /start ===
+@bot.message_handler(commands=['start'])
+def start(message):
+    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(telebot.types.KeyboardButton("Создать счёт"))
+    bot.send_message(message.chat.id, "Привет! Нажми кнопку, чтобы создать счёт.", reply_markup=markup)
 
-@bot.message_handler(func=lambda message: message.text == "Создать ссылку оплаты")
+# === КНОПКА "Создать счёт" ===
+@bot.message_handler(func=lambda m: m.text == "Создать счёт")
 def ask_amount(message):
     msg = bot.send_message(message.chat.id, "Введи сумму в рублях (минимум 10):")
-    bot.register_next_step_handler(msg, create_payment_link)
+    bot.register_next_step_handler(msg, create_order)
 
-def create_payment_link(message):
+def create_order(message):
     try:
         amount = float(message.text)
         if amount < 10:
-            bot.send_message(message.chat.id, "Минимум 10 рублей. Попробуй снова.")
+            bot.send_message(message.chat.id, "Минимальная сумма — 10 рублей. Попробуй снова.")
             return
-        
-        # Создаём платёж в ЮKassa
-        payment = Payment.create({
-            "amount": {"value": f"{amount:.2f}", "currency": "RUB"},
-            "confirmation": {"type": "redirect", "return_url": "https://t.me/твой_бот"},
-            "capture": True,
-            "description": f"Оплата от {message.from_user.id}"
-        })
-        
-        # Отправляем ссылку пользователю
-        link = payment.confirmation.confirmation_url
-        bot.send_message(message.chat.id, f"Ссылка на оплату: {link}")
-        
+
+        # Уникальный ID счёта (метка)
+        order_id = f"ORD-{message.chat.id}-{int(amount)}"
+
+        # Ссылка на быстрый перевод ЮMoney с меткой
+        link = f"https://yoomoney.ru/transfer/quickpay?receiver={YOOMONEY_RECEIVER}&sum={amount}&label={order_id}"
+
+        # Сохраняем счёт
+        user_orders[order_id] = {"chat_id": message.chat.id, "amount": amount}
+
+        bot.send_message(
+            message.chat.id,
+            f"Счёт: `{order_id}`\nСумма: {amount} ₽\n\nОплати по ссылке: {link}",
+            parse_mode='Markdown'
+        )
     except ValueError:
-        bot.send_message(message.chat.id, "Это не число. Попробуй снова.")
-    except Exception as e:
-        bot.send_message(message.chat.id, f"Ошибка: {e}")
+        bot.send_message(message.chat.id, "Это не число. Введи сумму цифрами.")
 
-# Эхо для всех остальных сообщений (можно убрать)
-@bot.message_handler(func=lambda message: True)
-def echo_all(message):
-    bot.reply_to(message, message.text)
+# === ПРИЁМ УВЕДОМЛЕНИЯ ОТ ЮMONEY ===
+@app.route('/webhook', methods=['POST'])
+def yoomoney_webhook():
+    data = request.form.to_dict()
 
-bot.polling(none_stop=True)
+    # Проверка подписи (чтобы никто не подделал оплату)
+    received_hash = data.get('sha1_hash', '')
+    check_string = '&'.join([f"{k}={v}" for k, v in sorted(data.items()) if k != 'sha1_hash'])
+    check_string += YOOMONEY_SECRET
+    calculated_hash = hashlib.sha1(check_string.encode('utf-8')).hexdigest()
+
+    if calculated_hash != received_hash:
+        return jsonify({"status": "error", "message": "Invalid signature"}), 403
+
+    # Обработка платежа
+    label = data.get('label', '')
+    amount = data.get('amount', '')
+
+    if label in user_orders:
+        order = user_orders.pop(label)
+        bot.send_message(
+            order['chat_id'],
+            f"✅ Счёт `{label}` на {amount} ₽ оплачен!",
+            parse_mode='Markdown'
+        )
+
+    return jsonify({"status": "ok"}), 200
+
+# === ЗАПУСК ===
+if __name__ == '__main__':
+    port = int(os.getenv('PORT', 3000))
+    app.run(host='0.0.0.0', port=port)
