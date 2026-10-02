@@ -187,9 +187,14 @@ def generate_image(message):
     image_url = f"https://gen.pollinations.ai/image/{encoded}?width=1024&height=1024&nologo=true"
 
     try:
+        # Скачиваем картинку сами — обходим проблему с Telegram CDN
+        r = requests.get(image_url, timeout=60)
+        if r.status_code != 200:
+            raise Exception(f"Сервер вернул {r.status_code}")
+
         sent = bot.send_photo(
             message.chat.id,
-            image_url,
+            r.content,
             caption=f"🎨 <b>Запрос:</b> {prompt}",
             parse_mode='HTML',
             reply_markup=back_menu()
@@ -374,7 +379,7 @@ def ask_gigachat(question):
     except Exception as e:
         return f"❌ Ошибка: {e}"
 
-# === СООБЩЕНИЯ В ЧАТЕ (только если state == 'chat') ===
+# === СООБЩЕНИЯ В ЧАТЕ ===
 @bot.message_handler(func=lambda m: True)
 def handle_message(message):
     tokens, state = get_user(message.chat.id)
