@@ -9,7 +9,6 @@ import requests
 import urllib3
 from flask import Flask, request, jsonify
 
-# Отключаем предупреждения SSL (нужно для GigaChat на Bothost)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -96,7 +95,7 @@ def clear_old_messages(chat_id):
 def remember(chat_id, msg_id):
     last_messages.setdefault(chat_id, []).append(msg_id)
 
-# === МЕНЮ ===
+# === МЕНЮ (картинка — ПЕРВАЯ кнопка!) ===
 def main_menu():
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("🎨 Нарисовать картинку", callback_data="menu_image"))
@@ -108,20 +107,15 @@ def main_menu():
 
 def buy_menu():
     markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("🎁 10 ₽ — 2 токена (пробный)", callback_data="pack_10_2"))
+    markup.add(telebot.types.InlineKeyboardButton("🎁 10 ₽ — 2 токена", callback_data="pack_10_2"))
     markup.add(telebot.types.InlineKeyboardButton("100 ₽ — 20 токенов", callback_data="pack_100_20"))
     markup.add(telebot.types.InlineKeyboardButton("250 ₽ — 50 токенов", callback_data="pack_250_50"))
     markup.add(telebot.types.InlineKeyboardButton("500 ₽ — 100 токенов", callback_data="pack_500_100"))
-    markup.add(telebot.types.InlineKeyboardButton("✏️ Ввести свою сумму", callback_data="custom_amount"))
+    markup.add(telebot.types.InlineKeyboardButton("✏️ Своя сумма", callback_data="custom_amount"))
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
     return markup
 
-def chat_menu():
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
-    return markup
-
-def image_menu_btn():
+def back_menu():
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
     return markup
@@ -159,6 +153,52 @@ def back_to_main(call):
     send_main_menu(call.message.chat.id)
     bot.answer_callback_query(call.id)
 
+# === ГЕНЕРАЦИЯ КАРТИНОК ===
+@bot.callback_query_handler(func=lambda call: call.data == "menu_image")
+def image_menu(call):
+    bot.answer_callback_query(call.id)
+    try:
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
+    clear_old_messages(call.message.chat.id)
+    sent = bot.send_message(
+        call.message.chat.id,
+        "🎨 <b>Генерация картинки</b>\n────────────────\nНапиши, что хочешь нарисовать:",
+        parse_mode='HTML',
+        reply_markup=back_menu()
+    )
+    remember(call.message.chat.id, sent.message_id)
+    bot.register_next_step_handler(sent, generate_image)
+
+def generate_image(message):
+    if message.text == "⬅️ Назад":
+        back_to_main(message)
+        return
+    try:
+        bot.delete_message(message.chat.id, message.message_id)
+    except Exception:
+        pass
+
+    prompt = message.text
+    bot.send_chat_action(message.chat.id, 'upload_photo')
+
+    encoded = urllib.parse.quote(prompt)
+    image_url = f"https://gen.pollinations.ai/image/{encoded}?width=1024&height=1024&nologo=true"
+
+    try:
+        sent = bot.send_photo(
+            message.chat.id,
+            image_url,
+            caption=f"🎨 <b>Запрос:</b> {prompt}",
+            parse_mode='HTML',
+            reply_markup=back_menu()
+        )
+        remember(message.chat.id, sent.message_id)
+    except Exception as e:
+        sent = bot.send_message(message.chat.id, f"❌ Ошибка генерации: {e}", reply_markup=back_menu())
+        remember(message.chat.id, sent.message_id)
+
 # === КУПИТЬ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_buy")
 def buy_tokens(call):
@@ -194,11 +234,14 @@ def custom_amount(call):
     except Exception:
         pass
     clear_old_messages(call.message.chat.id)
-    sent = bot.send_message(call.message.chat.id, "✏️ Введи количество токенов (минимум 20):")
+    sent = bot.send_message(call.message.chat.id, "✏️ Введи количество токенов (минимум 20):", reply_markup=back_menu())
     remember(call.message.chat.id, sent.message_id)
     bot.register_next_step_handler(sent, custom_tokens)
 
 def custom_tokens(message):
+    if message.text == "⬅️ Назад":
+        back_to_main(message)
+        return
     try:
         bot.delete_message(message.chat.id, message.message_id)
     except Exception:
@@ -207,13 +250,13 @@ def custom_tokens(message):
     try:
         tokens = int(message.text)
         if tokens < 20:
-            sent = bot.send_message(message.chat.id, "❌ Минимум 20 токенов.")
+            sent = bot.send_message(message.chat.id, "❌ Минимум 20 токенов.", reply_markup=back_menu())
             remember(message.chat.id, sent.message_id)
             return
         amount = tokens * 5
         create_invoice(message.chat.id, amount, tokens)
     except ValueError:
-        sent = bot.send_message(message.chat.id, "❌ Введи число.")
+        sent = bot.send_message(message.chat.id, "❌ Введи число.", reply_markup=back_menu())
         remember(message.chat.id, sent.message_id)
 
 # === СЧЁТ ===
@@ -244,9 +287,7 @@ def show_balance(call):
         pass
     clear_old_messages(call.message.chat.id)
     tokens, _ = get_user(call.message.chat.id)
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
-    sent = bot.send_message(call.message.chat.id, f"💰 <b>Ваш баланс:</b> {tokens} токенов", parse_mode='HTML', reply_markup=markup)
+    sent = bot.send_message(call.message.chat.id, f"💰 <b>Ваш баланс:</b> {tokens} токенов", parse_mode='HTML', reply_markup=back_menu())
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
@@ -272,7 +313,7 @@ def enter_chat(call):
         call.message.chat.id,
         f"🤖 <b>Вы в чате с ИИ.</b>\n💰 Баланс: {tokens} токенов.\nЗадайте вопрос — 1 запрос = 1 токен.",
         parse_mode='HTML',
-        reply_markup=chat_menu()
+        reply_markup=back_menu()
     )
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
@@ -285,55 +326,11 @@ def support(call):
     except Exception:
         pass
     clear_old_messages(call.message.chat.id)
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
-    sent = bot.send_message(call.message.chat.id, "🆘 Напишите: @твой_юзернейм", reply_markup=markup)
+    sent = bot.send_message(call.message.chat.id, "🆘 Напишите: @твой_юзернейм", reply_markup=back_menu())
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-# === ГЕНЕРАЦИЯ КАРТИНОК ===
-@bot.callback_query_handler(func=lambda call: call.data == "menu_image")
-def image_menu(call):
-    bot.answer_callback_query(call.id)
-    try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
-        pass
-    clear_old_messages(call.message.chat.id)
-    sent = bot.send_message(
-        call.message.chat.id,
-        "🎨 <b>Генерация картинки</b>\n────────────────\nНапиши, что хочешь нарисовать:",
-        parse_mode='HTML'
-    )
-    remember(call.message.chat.id, sent.message_id)
-    bot.register_next_step_handler(sent, generate_image)
-
-def generate_image(message):
-    try:
-        bot.delete_message(message.chat.id, message.message_id)
-    except Exception:
-        pass
-
-    prompt = message.text
-    bot.send_chat_action(message.chat.id, 'upload_photo')
-
-    encoded = urllib.parse.quote(prompt)
-    image_url = f"https://gen.pollinations.ai/image/{encoded}?width=1024&height=1024&nologo=true"
-
-    try:
-        sent = bot.send_photo(
-            message.chat.id,
-            image_url,
-            caption=f"🎨 <b>Запрос:</b> {prompt}",
-            parse_mode='HTML',
-            reply_markup=image_menu_btn()
-        )
-        remember(message.chat.id, sent.message_id)
-    except Exception as e:
-        sent = bot.send_message(message.chat.id, f"❌ Ошибка генерации: {e}", reply_markup=image_menu_btn())
-        remember(message.chat.id, sent.message_id)
-
-# === GIGACHAT: ПОЛУЧЕНИЕ ТОКЕНА ===
+# === GIGACHAT ===
 def get_gigachat_token():
     url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
     headers = {
@@ -345,18 +342,15 @@ def get_gigachat_token():
     data = {"scope": "GIGACHAT_API_PERS"}
     try:
         response = requests.post(url, headers=headers, data=data, verify=False, timeout=30)
-        result = response.json()
-        return result.get("access_token")
+        return response.json().get("access_token")
     except Exception as e:
-        print(f"Ошибка получения токена GigaChat: {e}")
+        print(f"Ошибка GigaChat: {e}")
         return None
 
-# === GIGACHAT: ЗАПРОС ===
 def ask_gigachat(question):
     access_token = get_gigachat_token()
     if not access_token:
-        return "❌ Не удалось получить доступ к ИИ. Попробуйте позже."
-
+        return "❌ Не удалось получить доступ к ИИ."
     url = "https://api.giga.chat/v1/chat/completions"
     headers = {
         "Content-Type": "application/json",
@@ -383,6 +377,9 @@ def ask_gigachat(question):
 # === СООБЩЕНИЯ В ЧАТЕ ===
 @bot.message_handler(func=lambda m: True)
 def handle_message(message):
+    if message.text == "⬅️ Назад":
+        back_to_main(message)
+        return
     tokens, state = get_user(message.chat.id)
     if state != 'chat':
         return
@@ -395,18 +392,15 @@ def handle_message(message):
         sent = bot.send_message(message.chat.id, "❌ Токены закончились.", reply_markup=markup)
         remember(message.chat.id, sent.message_id)
         return
-
     try:
         bot.delete_message(message.chat.id, message.message_id)
     except Exception:
         pass
-
     add_tokens(message.chat.id, -1)
     bot.send_chat_action(message.chat.id, 'typing')
     answer = ask_gigachat(message.text)
     tokens_left, _ = get_user(message.chat.id)
-
-    if "```" in answer or "def " in answer or "class " in answer or "import " in answer:
+    if "```" in answer or "def " in answer or "import " in answer or "class " in answer:
         clean_code = answer.replace("```python", "").replace("```", "").strip()
         try:
             copy_btn = telebot.types.InlineKeyboardButton(text="📋 Скопировать код", copy_text=clean_code)
@@ -415,22 +409,22 @@ def handle_message(message):
             markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
             sent = bot.send_message(
                 message.chat.id,
-                f"<pre><code>{clean_code}</code></pre>\n\n──────────\n💰 Осталось токенов: {tokens_left}",
+                f"<pre><code>{clean_code}</code></pre>\n\n──────────\n💰 Осталось: {tokens_left}",
                 parse_mode='HTML',
                 reply_markup=markup
             )
         except Exception:
             sent = bot.send_message(
                 message.chat.id,
-                f"<pre><code>{clean_code}</code></pre>\n\n──────────\n💰 Осталось токенов: {tokens_left}",
+                f"<pre><code>{clean_code}</code></pre>\n\n──────────\n💰 Осталось: {tokens_left}",
                 parse_mode='HTML',
-                reply_markup=chat_menu()
+                reply_markup=back_menu()
             )
     else:
         sent = bot.send_message(
             message.chat.id,
-            f"{answer}\n\n──────────\n💰 Осталось токенов: {tokens_left}",
-            reply_markup=chat_menu()
+            f"{answer}\n\n──────────\n💰 Осталось: {tokens_left}",
+            reply_markup=back_menu()
         )
     remember(message.chat.id, sent.message_id)
 
@@ -475,8 +469,8 @@ def yoomoney_webhook():
             f"✅ <b>Оплата прошла!</b>\n\n"
             f"🧾 Счёт: <code>{label}</code>\n"
             f"💰 Сумма: {amount} ₽\n"
-            f"🎫 Начислено токенов: <b>{tokens}</b>\n"
-            f"💎 Новый баланс: <b>{new_balance} токенов</b>",
+            f"🎫 Токенов: <b>{tokens}</b>\n"
+            f"💎 Баланс: <b>{new_balance}</b>",
             parse_mode='HTML',
             reply_markup=main_menu()
         )
