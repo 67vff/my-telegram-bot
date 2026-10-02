@@ -95,7 +95,7 @@ def clear_old_messages(chat_id):
 def remember(chat_id, msg_id):
     last_messages.setdefault(chat_id, []).append(msg_id)
 
-# === МЕНЮ ===
+# === МЕНЮ (кнопки картинок УБРАНЫ) ===
 def main_menu():
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("💳 Купить токены", callback_data="menu_buy"))
@@ -284,7 +284,7 @@ def support(call):
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-# === GIGACHAT ===
+# === GIGACHAT (с загрузкой файла для картинок) ===
 def get_gigachat_token():
     url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
     headers = {
@@ -301,28 +301,48 @@ def get_gigachat_token():
         print(f"Ошибка GigaChat: {e}")
         return None
 
-def ask_gigachat(question, image_base64=None):
+def upload_image_to_gigachat(image_bytes, access_token):
+    """Загружаем картинку в GigaChat и получаем её ID"""
+    url = "https://gigachat.devices.sberbank.ru/api/v1/files"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    files = {"file": ("image.jpg", image_bytes, "image/jpeg")}
+    data = {"purpose": "general"}
+    try:
+        r = requests.post(url, headers=headers, files=files, data=data, verify=False, timeout=60)
+        result = r.json()
+        return result.get("id")
+    except Exception as e:
+        print(f"Ошибка загрузки картинки: {e}")
+        return None
+
+def ask_gigachat(question, image_bytes=None):
     access_token = get_gigachat_token()
     if not access_token:
         return "❌ Не удалось получить доступ к ИИ."
-    url = "https://api.giga.chat/v1/chat/completions"
+
+    url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
         "Authorization": f"Bearer {access_token}"
     }
 
-    if image_base64:
-        # Запрос с картинкой
+    if image_bytes:
+        # Сначала загружаем картинку, получаем file_id
+        file_id = upload_image_to_gigachat(image_bytes, access_token)
+        if not file_id:
+            return "❌ Не удалось загрузить картинку."
+
+        # Мультимодальный запрос
         content = [
             {"type": "text", "text": question if question else "Что на этой картинке?"},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
+            {"type": "image_url", "image_url": {"url": f"file://{file_id}"}}
         ]
     else:
         content = question
 
     data = {
-        "model": "GigaChat-3-Ultra",
+        "model": "GigaChat-2-Max",  # Мультимодальная модель
         "messages": [
             {"role": "system", "content": "Ты полезный ИИ-помощник. Отвечай на русском языке."},
             {"role": "user", "content": content}
@@ -367,13 +387,11 @@ def handle_message(message):
 
     # === ЕСЛИ ПРИШЛО ФОТО ===
     if message.photo:
-        # Берём самое большое фото
         file_id = message.photo[-1].file_id
         file_info = bot.get_file(file_id)
         downloaded = bot.download_file(file_info.file_path)
-        image_base64 = base64.b64encode(downloaded).decode('utf-8')
         caption = message.caption if message.caption else "Что на этой картинке?"
-        answer = ask_gigachat(caption, image_base64=image_base64)
+        answer = ask_gigachat(caption, image_bytes=downloaded)
     else:
         answer = ask_gigachat(message.text)
 
