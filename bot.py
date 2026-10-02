@@ -90,7 +90,7 @@ def clear_old_messages(chat_id):
 def remember(chat_id, msg_id):
     last_messages.setdefault(chat_id, []).append(msg_id)
 
-# === ГЛАВНОЕ МЕНЮ (Inline-кнопки) ===
+# === ГЛАВНОЕ МЕНЮ (Inline) ===
 def main_menu():
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("💳 Купить токены", callback_data="menu_buy"))
@@ -99,7 +99,7 @@ def main_menu():
     markup.add(telebot.types.InlineKeyboardButton("🆘 Поддержка", callback_data="menu_support"))
     return markup
 
-# === МЕНЮ ПОКУПКИ ТОКЕНОВ ===
+# === МЕНЮ ПОКУПКИ ===
 def buy_menu():
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("🎁 10 ₽ — 2 токена (пробный)", callback_data="pack_10_2"))
@@ -107,14 +107,27 @@ def buy_menu():
     markup.add(telebot.types.InlineKeyboardButton("250 ₽ — 50 токенов", callback_data="pack_250_50"))
     markup.add(telebot.types.InlineKeyboardButton("500 ₽ — 100 токенов", callback_data="pack_500_100"))
     markup.add(telebot.types.InlineKeyboardButton("✏️ Ввести свою сумму", callback_data="custom_amount"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_back"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
     return markup
 
-# === ЧАТ-МЕНЮ ===
+# === МЕНЮ ЧАТА ===
 def chat_menu():
     markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_back"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
     return markup
+
+# === ОТПРАВКА ГЛАВНОГО МЕНЮ ===
+def send_main_menu(chat_id):
+    tokens, _ = get_user(chat_id)
+    update_state(chat_id, 'idle')
+    text = (
+        "👋 <b>Главное меню</b>\n"
+        f"💰 Токенов: <b>{tokens}</b>\n"
+        "────────────────\n"
+        "Выбери действие:"
+    )
+    sent = bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=main_menu())
+    remember(chat_id, sent.message_id)
 
 # === /start ===
 @bot.message_handler(commands=['start'])
@@ -124,21 +137,9 @@ def start(message):
     except Exception:
         pass
     clear_old_messages(message.chat.id)
+    send_main_menu(message.chat.id)
 
-    tokens, _ = get_user(message.chat.id)
-    update_state(message.chat.id, 'idle')
-    text = (
-        "👋 <b>Привет!</b>\n"
-        f"Ваш ID: <code>{message.chat.id}</code>\n"
-        f"💰 Токенов: <b>{tokens}</b>\n"
-        "────────────────\n\n"
-        "🤖 Я ИИ-помощник. Могу писать код, отвечать на вопросы, помогать с текстами.\n\n"
-        "💎 <b>1 токен = 1 запрос к ИИ</b>"
-    )
-    sent = bot.send_message(message.chat.id, text, parse_mode='HTML', reply_markup=main_menu())
-    remember(message.chat.id, sent.message_id)
-
-# === ГЛАВНОЕ МЕНЮ (кнопки) ===
+# === НАЗАД В ГЛАВНОЕ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_main")
 def back_to_main(call):
     try:
@@ -146,19 +147,10 @@ def back_to_main(call):
     except Exception:
         pass
     clear_old_messages(call.message.chat.id)
-
-    tokens, _ = get_user(call.message.chat.id)
-    text = (
-        "👋 <b>Главное меню</b>\n"
-        f"💰 Токенов: <b>{tokens}</b>\n"
-        "────────────────\n"
-        "Выбери действие:"
-    )
-    sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=main_menu())
-    remember(call.message.chat.id, sent.message_id)
+    send_main_menu(call.message.chat.id)
     bot.answer_callback_query(call.id)
 
-# === "Купить токены" ===
+# === КУПИТЬ ТОКЕНЫ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_buy")
 def buy_tokens(call):
     try:
@@ -166,25 +158,22 @@ def buy_tokens(call):
     except Exception:
         pass
     clear_old_messages(call.message.chat.id)
-
     text = "💳 <b>Покупка токенов</b>\n────────────────\nВыбери пакет:"
     sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=buy_menu())
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-# === ГОТОВЫЕ ПАКЕТЫ ===
+# === ПАКЕТЫ ===
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pack_"))
 def pack_selected(call):
     parts = call.data.split("_")
     amount = int(parts[1])
     tokens = int(parts[2])
-
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
     except Exception:
         pass
     clear_old_messages(call.message.chat.id)
-
     create_invoice(call.message.chat.id, amount, tokens)
     bot.answer_callback_query(call.id)
 
@@ -197,7 +186,6 @@ def custom_amount(call):
     except Exception:
         pass
     clear_old_messages(call.message.chat.id)
-
     sent = bot.send_message(call.message.chat.id, "✏️ Введи количество токенов (минимум 20):")
     remember(call.message.chat.id, sent.message_id)
     bot.register_next_step_handler(sent, custom_tokens)
@@ -208,7 +196,6 @@ def custom_tokens(message):
     except Exception:
         pass
     clear_old_messages(message.chat.id)
-
     try:
         tokens = int(message.text)
         if tokens < 20:
@@ -226,14 +213,9 @@ def create_invoice(chat_id, amount, tokens):
     order_id = f"ORD-{chat_id}-{tokens}-{amount}"
     save_order(order_id, chat_id, tokens)
     pay_url = f"https://bot-1790959533-7739-maks746395.bothost.tech/pay/{amount}/{order_id}"
-
     markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton(
-        text=f"💳 Оплатить {amount} ₽",
-        url=pay_url
-    ))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_back"))
-
+    markup.add(telebot.types.InlineKeyboardButton(text=f"💳 Оплатить {amount} ₽", url=pay_url))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
     sent = bot.send_message(
         chat_id,
         f"🧾 <b>Счёт:</b> <code>{order_id}</code>\n"
@@ -245,7 +227,7 @@ def create_invoice(chat_id, amount, tokens):
     )
     remember(chat_id, sent.message_id)
 
-# === "Мой баланс" ===
+# === БАЛАНС ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_balance")
 def show_balance(call):
     try:
@@ -253,19 +235,15 @@ def show_balance(call):
     except Exception:
         pass
     clear_old_messages(call.message.chat.id)
-
     tokens, _ = get_user(call.message.chat.id)
-    text = (
-        f"💰 <b>Ваш баланс:</b> {tokens} токенов\n"
-        f"Ваш ID: <code>{call.message.chat.id}</code>"
-    )
+    text = f"💰 <b>Ваш баланс:</b> {tokens} токенов"
     markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_back"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
     sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=markup)
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-# === "Чат с ИИ" ===
+# === ЧАТ С ИИ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_chat")
 def enter_chat(call):
     tokens, _ = get_user(call.message.chat.id)
@@ -278,12 +256,8 @@ def enter_chat(call):
     if tokens < 1:
         markup = telebot.types.InlineKeyboardMarkup()
         markup.add(telebot.types.InlineKeyboardButton("💳 Купить токены", callback_data="menu_buy"))
-        markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_back"))
-        sent = bot.send_message(
-            call.message.chat.id,
-            "❌ У вас нет токенов. Купите токены, чтобы использовать ИИ.",
-            reply_markup=markup
-        )
+        markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
+        sent = bot.send_message(call.message.chat.id, "❌ У вас нет токенов. Купите токены.", reply_markup=markup)
         remember(call.message.chat.id, sent.message_id)
         bot.answer_callback_query(call.id)
         return
@@ -300,7 +274,7 @@ def enter_chat(call):
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-# === "Поддержка" ===
+# === ПОДДЕРЖКА ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_support")
 def support(call):
     try:
@@ -308,44 +282,19 @@ def support(call):
     except Exception:
         pass
     clear_old_messages(call.message.chat.id)
-
     markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_back"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
     sent = bot.send_message(call.message.chat.id, "🆘 Напишите: @твой_юзернейм", reply_markup=markup)
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-# === "Назад" ===
-@bot.callback_query_handler(func=lambda call: call.data == "menu_back")
-def back(call):
-    update_state(call.message.chat.id, 'idle')
-    try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
-        pass
-    clear_old_messages(call.message.chat.id)
-
-    tokens, _ = get_user(call.message.chat.id)
-    text = (
-        "👋 <b>Главное меню</b>\n"
-        f"💰 Токенов: <b>{tokens}</b>\n"
-        "────────────────\n"
-        "Выбери действие:"
-    )
-    sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=main_menu())
-    remember(call.message.chat.id, sent.message_id)
-    bot.answer_callback_query(call.id)
-
-# === ЗАПРОС В DEEPSEEK ===
+# === DEEPSEEK ===
 def ask_deepseek(question):
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
     data = {
         "model": "deepseek-chat",
         "messages": [
-            {"role": "system", "content": "Ты полезный ИИ-помощник. Отвечай на русском языке."},
+            {"role": "system", "content": "Ты полезный ИИ-помощник. Отвечай на русском."},
             {"role": "user", "content": question}
         ],
         "temperature": 0.7
@@ -359,7 +308,7 @@ def ask_deepseek(question):
     except Exception as e:
         return f"❌ Ошибка: {e}"
 
-# === ОБРАБОТКА СООБЩЕНИЙ В ЧАТЕ ===
+# === СООБЩЕНИЯ В ЧАТЕ ===
 @bot.message_handler(func=lambda m: True)
 def handle_message(message):
     tokens, state = get_user(message.chat.id)
@@ -370,8 +319,8 @@ def handle_message(message):
         clear_old_messages(message.chat.id)
         markup = telebot.types.InlineKeyboardMarkup()
         markup.add(telebot.types.InlineKeyboardButton("💳 Купить токены", callback_data="menu_buy"))
-        markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_back"))
-        sent = bot.send_message(message.chat.id, "❌ Токены закончились. Купите ещё.", reply_markup=markup)
+        markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
+        sent = bot.send_message(message.chat.id, "❌ Токены закончились.", reply_markup=markup)
         remember(message.chat.id, sent.message_id)
         return
 
@@ -419,7 +368,6 @@ def yoomoney_webhook():
     check_string += YOOMONEY_SECRET
     if hashlib.sha1(check_string.encode('utf-8')).hexdigest() != received_hash:
         return jsonify({"status": "error"}), 403
-
     label = data.get('label', '')
     amount = data.get('amount', '')
     order = get_order(label)
@@ -439,7 +387,6 @@ def yoomoney_webhook():
             reply_markup=main_menu()
         )
         remember(chat_id, sent.message_id)
-
     return jsonify({"status": "ok"}), 200
 
 # === ЗАПУСК ===
