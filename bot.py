@@ -95,7 +95,7 @@ def clear_old_messages(chat_id):
 def remember(chat_id, msg_id):
     last_messages.setdefault(chat_id, []).append(msg_id)
 
-# === МЕНЮ (картинка — ПЕРВАЯ кнопка!) ===
+# === МЕНЮ ===
 def main_menu():
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("🎨 Нарисовать картинку", callback_data="menu_image"))
@@ -374,14 +374,14 @@ def ask_gigachat(question):
     except Exception as e:
         return f"❌ Ошибка: {e}"
 
-# === СООБЩЕНИЯ В ЧАТЕ ===
+# === СООБЩЕНИЯ В ЧАТЕ (только если state == 'chat') ===
 @bot.message_handler(func=lambda m: True)
 def handle_message(message):
-    if message.text == "⬅️ Назад":
-        back_to_main(message)
-        return
     tokens, state = get_user(message.chat.id)
     if state != 'chat':
+        return
+    if message.text == "⬅️ Назад":
+        back_to_main(message)
         return
     if tokens < 1:
         update_state(message.chat.id, 'idle')
