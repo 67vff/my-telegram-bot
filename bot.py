@@ -4,7 +4,7 @@ import threading
 import telebot
 from flask import Flask, request, jsonify
 
-# === ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ (берутся с Bothost) ===
+# === ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ (Bothost) ===
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 YOOMONEY_RECEIVER = os.getenv('YOOMONEY_RECEIVER')
 YOOMONEY_SECRET = os.getenv('YOOMONEY_SECRET')
@@ -36,16 +36,46 @@ def create_order(message):
             return
 
         order_id = f"ORD-{message.chat.id}-{int(amount)}"
-        link = f"https://yoomoney.ru/transfer/quickpay?receiver={YOOMONEY_RECEIVER}&sum={amount}&label={order_id}"
         user_orders[order_id] = {"chat_id": message.chat.id, "amount": amount}
+
+        # Ссылка на нашу Flask-страницу, которая автоматически отправит форму в ЮMoney
+        pay_url = f"https://bot-1790959533-7739-maks746395.bothost.tech/pay/{int(amount)}/{order_id}"
+
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.add(telebot.types.InlineKeyboardButton(
+            text=f"💳 Оплатить {amount} ₽",
+            url=pay_url
+        ))
 
         bot.send_message(
             message.chat.id,
-            f"Счёт: `{order_id}`\nСумма: {amount} ₽\n\nОплати по ссылке: {link}",
-            parse_mode='Markdown'
+            f"Счёт: `{order_id}`\nСумма: {amount} ₽\n\nНажми кнопку, чтобы оплатить:",
+            parse_mode='Markdown',
+            reply_markup=markup
         )
     except ValueError:
         bot.send_message(message.chat.id, "Это не число. Введи сумму цифрами.")
+
+# === СТРАНИЦА ОПЛАТЫ (автоматически отправляет форму в ЮMoney) ===
+@app.route('/pay/<amount>/<label>')
+def pay_page(amount, label):
+    html = f'''
+    <html>
+    <head><meta charset="utf-8"><title>Переход к оплате...</title></head>
+    <body onload="document.forms[0].submit()">
+        <p>Перенаправляем на страницу оплаты...</p>
+        <form method="POST" action="https://yoomoney.ru/quickpay/confirm">
+            <input type="hidden" name="receiver" value="{YOOMONEY_RECEIVER}"/>
+            <input type="hidden" name="quickpay-form" value="button"/>
+            <input type="hidden" name="sum" value="{amount}"/>
+            <input type="hidden" name="label" value="{label}"/>
+            <input type="hidden" name="paymentType" value="AC"/>
+            <input type="submit" value="Перейти к оплате"/>
+        </form>
+    </body>
+    </html>
+    '''
+    return html
 
 # === ПРИЁМ УВЕДОМЛЕНИЯ ОТ ЮMONEY ===
 @app.route('/webhook', methods=['POST'])
@@ -78,7 +108,7 @@ def run_flask():
     port = int(os.getenv('PORT', 3000))
     app.run(host='0.0.0.0', port=port)
 
-# === ЗАПУСК БОТА (polling) ===
+# === ЗАПУСК БОТА ===
 if __name__ == '__main__':
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
