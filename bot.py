@@ -153,7 +153,7 @@ def back_to_main(call):
     send_main_menu(call.message.chat.id)
     bot.answer_callback_query(call.id)
 
-# === ГЕНЕРАЦИЯ КАРТИНОК ===
+# === ГЕНЕРАЦИЯ КАРТИНОК (исправлено: скачиваем сами) ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_image")
 def image_menu(call):
     bot.answer_callback_query(call.id)
@@ -187,11 +187,12 @@ def generate_image(message):
     image_url = f"https://gen.pollinations.ai/image/{encoded}?width=1024&height=1024&nologo=true"
 
     try:
-        # Скачиваем картинку сами — обходим проблему с Telegram CDN
+        # === СКАЧИВАЕМ КАРТИНКУ САМИ ===
         r = requests.get(image_url, timeout=60)
         if r.status_code != 200:
             raise Exception(f"Сервер вернул {r.status_code}")
 
+        # === ОТПРАВЛЯЕМ БАЙТЫ, А НЕ ССЫЛКУ ===
         sent = bot.send_photo(
             message.chat.id,
             r.content,
