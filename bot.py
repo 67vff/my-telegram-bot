@@ -3,6 +3,7 @@ import uuid
 import sqlite3
 import hashlib
 import threading
+import urllib.parse
 import telebot
 import requests
 import urllib3
@@ -95,9 +96,10 @@ def clear_old_messages(chat_id):
 def remember(chat_id, msg_id):
     last_messages.setdefault(chat_id, []).append(msg_id)
 
-# === МЕНЮ (Inline) ===
+# === МЕНЮ ===
 def main_menu():
     markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("🎨 Нарисовать картинку", callback_data="menu_image"))
     markup.add(telebot.types.InlineKeyboardButton("💳 Купить токены", callback_data="menu_buy"))
     markup.add(telebot.types.InlineKeyboardButton("🤖 Чат с ИИ", callback_data="menu_chat"))
     markup.add(telebot.types.InlineKeyboardButton("💰 Мой баланс", callback_data="menu_balance"))
@@ -106,15 +108,20 @@ def main_menu():
 
 def buy_menu():
     markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("🎁 10 ₽ — 2 токена", callback_data="pack_10_2"))
+    markup.add(telebot.types.InlineKeyboardButton("🎁 10 ₽ — 2 токена (пробный)", callback_data="pack_10_2"))
     markup.add(telebot.types.InlineKeyboardButton("100 ₽ — 20 токенов", callback_data="pack_100_20"))
     markup.add(telebot.types.InlineKeyboardButton("250 ₽ — 50 токенов", callback_data="pack_250_50"))
     markup.add(telebot.types.InlineKeyboardButton("500 ₽ — 100 токенов", callback_data="pack_500_100"))
-    markup.add(telebot.types.InlineKeyboardButton("✏️ Своя сумма", callback_data="custom_amount"))
+    markup.add(telebot.types.InlineKeyboardButton("✏️ Ввести свою сумму", callback_data="custom_amount"))
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
     return markup
 
 def chat_menu():
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
+    return markup
+
+def image_menu_btn():
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
     return markup
@@ -284,6 +291,48 @@ def support(call):
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
+# === ГЕНЕРАЦИЯ КАРТИНОК ===
+@bot.callback_query_handler(func=lambda call: call.data == "menu_image")
+def image_menu(call):
+    bot.answer_callback_query(call.id)
+    try:
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
+    clear_old_messages(call.message.chat.id)
+    sent = bot.send_message(
+        call.message.chat.id,
+        "🎨 <b>Генерация картинки</b>\n────────────────\nНапиши, что хочешь нарисовать:",
+        parse_mode='HTML'
+    )
+    remember(call.message.chat.id, sent.message_id)
+    bot.register_next_step_handler(sent, generate_image)
+
+def generate_image(message):
+    try:
+        bot.delete_message(message.chat.id, message.message_id)
+    except Exception:
+        pass
+
+    prompt = message.text
+    bot.send_chat_action(message.chat.id, 'upload_photo')
+
+    encoded = urllib.parse.quote(prompt)
+    image_url = f"https://gen.pollinations.ai/image/{encoded}?width=1024&height=1024&nologo=true"
+
+    try:
+        sent = bot.send_photo(
+            message.chat.id,
+            image_url,
+            caption=f"🎨 <b>Запрос:</b> {prompt}",
+            parse_mode='HTML',
+            reply_markup=image_menu_btn()
+        )
+        remember(message.chat.id, sent.message_id)
+    except Exception as e:
+        sent = bot.send_message(message.chat.id, f"❌ Ошибка генерации: {e}", reply_markup=image_menu_btn())
+        remember(message.chat.id, sent.message_id)
+
 # === GIGACHAT: ПОЛУЧЕНИЕ ТОКЕНА ===
 def get_gigachat_token():
     url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
@@ -357,18 +406,10 @@ def handle_message(message):
     answer = ask_gigachat(message.text)
     tokens_left, _ = get_user(message.chat.id)
 
-    # Проверяем, есть ли в ответе код (по маркерам)
     if "```" in answer or "def " in answer or "class " in answer or "import " in answer:
-        # Очищаем от markdown-оберток, если есть
         clean_code = answer.replace("```python", "").replace("```", "").strip()
-        
-        # Используем HTML для красивого отображения и кнопку копирования
-        # (Доступно в Telegram Bot API 7.11+ и новых pyTelegramBotAPI)
         try:
-            copy_btn = telebot.types.InlineKeyboardButton(
-                text="📋 Скопировать код",
-                copy_text=clean_code
-            )
+            copy_btn = telebot.types.InlineKeyboardButton(text="📋 Скопировать код", copy_text=clean_code)
             markup = telebot.types.InlineKeyboardMarkup()
             markup.add(copy_btn)
             markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
@@ -379,7 +420,6 @@ def handle_message(message):
                 reply_markup=markup
             )
         except Exception:
-            # Если copy_text не поддерживается, просто отправляем код
             sent = bot.send_message(
                 message.chat.id,
                 f"<pre><code>{clean_code}</code></pre>\n\n──────────\n💰 Осталось токенов: {tokens_left}",
@@ -387,7 +427,6 @@ def handle_message(message):
                 reply_markup=chat_menu()
             )
     else:
-        # Обычный текстовый ответ
         sent = bot.send_message(
             message.chat.id,
             f"{answer}\n\n──────────\n💰 Осталось токенов: {tokens_left}",
