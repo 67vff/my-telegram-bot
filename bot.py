@@ -29,14 +29,13 @@ TRIAL_WINDOW = 3600
 SPAM_WINDOW = 3
 SPAM_LIMIT = 5
 
-# Хранилище для антиспама
 spam_tracker = {}
 spam_warned = {}
 
 def escape_html(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-# === АНТИСПАМ (БЕЗ БЛОКИРОВКИ) ===
+# === АНТИСПАМ ===
 def is_spamming(chat_id):
     now = time.time()
     if chat_id not in spam_tracker:
@@ -44,7 +43,6 @@ def is_spamming(chat_id):
     spam_tracker[chat_id] = [t for t in spam_tracker[chat_id] if now - t < SPAM_WINDOW]
     spam_tracker[chat_id].append(now)
     if len(spam_tracker[chat_id]) > SPAM_LIMIT:
-        # Показываем предупреждение только раз в 10 секунд
         last_warn = spam_warned.get(chat_id, 0)
         if now - last_warn > 10:
             spam_warned[chat_id] = now
@@ -57,7 +55,6 @@ def spam_warning(call):
         bot.send_message(call.message.chat.id, "🛑 <b>Хватит спамить!</b>", parse_mode='HTML')
     except Exception:
         pass
-    # Через 2 секунды открываем главное меню
     def reopen():
         time.sleep(2)
         try:
@@ -213,9 +210,19 @@ def main_menu():
     markup.add(telebot.types.InlineKeyboardButton("🆘 Поддержка", callback_data="menu_support"))
     return markup
 
-def buy_menu():
-    """Стандартное меню покупки (без пробного пакета)"""
+def buy_menu(chat_id):
+    """Обычное меню тарифов. Если подарок ещё доступен — показываем кнопку подарка."""
     markup = telebot.types.InlineKeyboardMarkup()
+    _, _, _, trial_started, trial_used = get_user(chat_id)
+    now = int(time.time())
+    # Если подарок ещё не использован и время не истекло — показываем кнопку подарка
+    if not trial_used and trial_started > 0 and (now - trial_started) < TRIAL_WINDOW:
+        left = TRIAL_WINDOW - (now - trial_started)
+        minutes = left // 60
+        markup.add(telebot.types.InlineKeyboardButton(
+            f"🎁 Подарок: 2 токена за 10 ₽ (осталось {minutes} мин)",
+            callback_data="pack_trial"
+        ))
     markup.add(telebot.types.InlineKeyboardButton("100 ₽ — 20 токенов", callback_data="pack_100_20"))
     markup.add(telebot.types.InlineKeyboardButton("250 ₽ — 50 токенов", callback_data="pack_250_50"))
     markup.add(telebot.types.InlineKeyboardButton("500 ₽ — 100 токенов", callback_data="pack_500_100"))
@@ -224,10 +231,10 @@ def buy_menu():
     return markup
 
 def gift_menu():
-    """Меню для подарка — на весь экран с двумя кнопками"""
+    """Меню подарка на весь экран."""
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("✅ Приобрести", callback_data="pack_trial"))
-    markup.add(telebot.types.InlineKeyboardButton("❌ Не надо", callback_data="menu_buy"))
+    markup.add(telebot.types.InlineKeyboardButton("❌ Не надо", callback_data="decline_gift"))
     return markup
 
 def mode_menu():
@@ -278,8 +285,6 @@ def buy_tokens(call):
     if is_spamming(call.message.chat.id):
         spam_warning(call)
         return
-
-    # Проверяем, показывать ли подарок
     _, _, _, trial_started, trial_used = get_user(call.message.chat.id)
     now = int(time.time())
     show_gift = False
@@ -289,15 +294,12 @@ def buy_tokens(call):
             trial_started = now
         if now - trial_started < TRIAL_WINDOW:
             show_gift = True
-
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
     except Exception:
         pass
     clear_old_messages(call.message.chat.id)
-
     if show_gift:
-        # Показываем подарок на весь экран
         left = TRIAL_WINDOW - (now - trial_started)
         minutes = left // 60
         text = (
@@ -310,9 +312,27 @@ def buy_tokens(call):
         )
         sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=gift_menu())
     else:
-        # Обычное меню покупки
-        sent = bot.send_message(call.message.chat.id, "💳 <b>Покупка токенов</b>\n────────────────\nВыбери пакет:", parse_mode='HTML', reply_markup=buy_menu())
+        sent = bot.send_message(call.message.chat.id, "💳 <b>Покупка токенов</b>\n────────────────\nВыбери пакет:", parse_mode='HTML', reply_markup=buy_menu(call.message.chat.id))
+    remember(call.message.chat.id, sent.message_id)
+    bot.answer_callback_query(call.id)
 
+@bot.callback_query_handler(func=lambda call: call.data == "decline_gift")
+def decline_gift(call):
+    """Пользователь нажал 'Не надо' — показываем обычные тарифы с кнопкой подарка."""
+    if is_spamming(call.message.chat.id):
+        spam_warning(call)
+        return
+    try:
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
+    clear_old_messages(call.message.chat.id)
+    sent = bot.send_message(
+        call.message.chat.id,
+        "💳 <b>Покупка токенов</b>\n────────────────\nВыбери пакет:",
+        parse_mode='HTML',
+        reply_markup=buy_menu(call.message.chat.id)
+    )
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
