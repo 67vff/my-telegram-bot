@@ -180,7 +180,6 @@ def clear_old_messages(chat_id):
 def remember(chat_id, msg_id):
     last_messages.setdefault(chat_id, []).append(msg_id)
 
-# === ЭМОДЗИ ПО ТЕМЕ ===
 def emoji(chat_id, key):
     _, _, _, _, theme, _, _ = get_user(chat_id)
     if theme == 'minimal':
@@ -188,7 +187,7 @@ def emoji(chat_id, key):
     icons = {"buy": "💳 ", "chat": "🤖 ", "balance": "💰 ", "support": "🆘 ", "settings": "⚙️ ", "back": "⬅️ "}
     return icons.get(key, "")
 
-# === ГЛАВНОЕ МЕНЮ ===
+# === МЕНЮ ===
 def main_menu(chat_id):
     e = lambda k: emoji(chat_id, k)
     markup = telebot.types.InlineKeyboardMarkup()
@@ -210,7 +209,6 @@ def buy_menu():
     return markup
 
 def mode_menu():
-    """7 режимов + настройки + назад"""
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("🤖 Обычный ИИ", callback_data="mode_regular"))
     markup.add(telebot.types.InlineKeyboardButton("💻 Кодер", callback_data="mode_coder"))
@@ -257,7 +255,6 @@ def start(message):
     clear_old_messages(message.chat.id)
     send_main_menu(message.chat.id)
 
-# === НАЗАД ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_main")
 def back_to_main(call):
     try:
@@ -268,7 +265,6 @@ def back_to_main(call):
     send_main_menu(call.message.chat.id)
     bot.answer_callback_query(call.id)
 
-# === КУПИТЬ ТОКЕНЫ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_buy")
 def buy_tokens(call):
     try:
@@ -280,7 +276,6 @@ def buy_tokens(call):
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-# === ПАКЕТЫ ===
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pack_"))
 def pack_selected(call):
     parts = call.data.split("_")
@@ -294,7 +289,6 @@ def pack_selected(call):
     create_invoice(call.message.chat.id, amount, tokens)
     bot.answer_callback_query(call.id)
 
-# === СВОЯ СУММА ===
 @bot.callback_query_handler(func=lambda call: call.data == "custom_amount")
 def custom_amount(call):
     bot.answer_callback_query(call.id)
@@ -328,7 +322,6 @@ def custom_tokens(message):
         sent = bot.send_message(message.chat.id, "❌ Введи число.", reply_markup=back_menu())
         remember(message.chat.id, sent.message_id)
 
-# === СЧЁТ ===
 def create_invoice(chat_id, amount, tokens):
     order_id = f"ORD-{chat_id}-{tokens}-{amount}"
     save_order(order_id, chat_id, tokens)
@@ -344,7 +337,6 @@ def create_invoice(chat_id, amount, tokens):
     )
     remember(chat_id, sent.message_id)
 
-# === БАЛАНС ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_balance")
 def show_balance(call):
     try:
@@ -357,7 +349,6 @@ def show_balance(call):
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-# === НАСТРОЙКИ ===
 @bot.callback_query_handler(func=lambda call: call.data in ["menu_settings", "settings_from_chat"])
 def open_settings(call):
     try:
@@ -426,7 +417,6 @@ def clear_chat(call):
     clear_history(call.message.chat.id)
     bot.answer_callback_query(call.id, "📜 История чата очищена.")
 
-# === ЧАТ С ИИ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_chat")
 def enter_chat(call):
     tokens, _, mode, _, _, _, _ = get_user(call.message.chat.id)
@@ -448,7 +438,7 @@ def enter_chat(call):
     sent = bot.send_message(
         call.message.chat.id,
         f"🤖 <b>Вы в чате с ИИ.</b>\n💰 Баланс: {tokens} токенов.\nРежим: <b>{mode_name}</b>\n\n"
-        f"Задайте вопрос, отправьте фото или ссылку — 1 запрос = 1 токен.\n"
+        f"Задайте вопрос или отправьте фото — 1 запрос = 1 токен.\n"
         f"💡 Если хотите сменить режим — просто напишите «переключись на кодера».",
         parse_mode='HTML',
         reply_markup=mode_menu()
@@ -456,7 +446,6 @@ def enter_chat(call):
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-# === РЕЖИМЫ (КНОПКИ) ===
 @bot.callback_query_handler(func=lambda call: call.data.startswith("mode_"))
 def set_mode(call):
     mode = call.data.replace("mode_", "")
@@ -464,7 +453,6 @@ def set_mode(call):
     mode_name = {"regular": "🤖 Обычный ИИ", "coder": "💻 Кодер", "explainer": "📖 Объяснятор", "translator": "🌍 Переводчик", "editor": "✍️ Редактор", "summary": "📝 Резюме", "lawyer": "⚖️ Юрист"}.get(mode, "🤖 Обычный ИИ")
     bot.answer_callback_query(call.id, f"Режим: {mode_name}")
 
-# === ПОДДЕРЖКА ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_support")
 def support(call):
     try:
@@ -549,8 +537,7 @@ def ask_gigachat(chat_id, question, mode, image_base64=None):
         ]})
     else:
         messages.append({"role": "user", "content": question})
-    data = {"model": "GigaChat-3-Ultra", "messages": messages, "temperature": 0.7, "max_tokens": 2000,
-            "tools": [{"type": "url_content_extraction"}]}
+    data = {"model": "GigaChat-3-Ultra", "messages": messages, "temperature": 0.7, "max_tokens": 2000}
     try:
         r = requests.post(url, headers=headers, json=data, verify=False, timeout=90)
         result = r.json()
@@ -563,7 +550,6 @@ def ask_gigachat(chat_id, question, mode, image_base64=None):
     except Exception as e:
         return f"❌ Ошибка: {e}"
 
-# === СООБЩЕНИЯ В ЧАТЕ ===
 @bot.message_handler(content_types=['text', 'photo'])
 def handle_message(message):
     tokens, state, mode, _, _, night, _ = get_user(message.chat.id)
@@ -582,7 +568,6 @@ def handle_message(message):
         remember(message.chat.id, sent.message_id)
         return
 
-    # === ПЕРЕКЛЮЧЕНИЕ РЕЖИМА + ОТВЕТ В ОДНОМ СООБЩЕНИИ ===
     prefix = ""
     if message.text:
         new_mode = detect_mode_request(message.text)
@@ -592,7 +577,6 @@ def handle_message(message):
             prefix = f"✅ Переключился на режим {mode_name}.\n\n"
             mode = new_mode
 
-    # === РЕЖИМ РЕЗЮМЕ — проверка длины ===
     if mode == "summary" and message.text:
         cost = count_tokens_for_summary(message.text)
         if cost == 0:
@@ -629,7 +613,6 @@ def handle_message(message):
     tokens_left, _, _, _, _, _, _ = get_user(message.chat.id)
     full_answer = prefix + answer
 
-    # === НОЧНОЙ РЕЖИМ ===
     now_hour = time.localtime().tm_hour
     if night and 0 <= now_hour < 6:
         if len(full_answer) > 200:
@@ -656,7 +639,6 @@ def handle_message(message):
             sent = bot.send_message(message.chat.id, f"{full_answer}\n\n──────────\n💰 Осталось: {tokens_left}", reply_markup=mode_menu())
     remember(message.chat.id, sent.message_id)
 
-# === СТРАНИЦА ОПЛАТЫ ===
 @app.route('/pay/<amount>/<label>')
 def pay_page(amount, label):
     html = f'''
@@ -675,7 +657,6 @@ def pay_page(amount, label):
     '''
     return html
 
-# === ВЕБХУК ===
 @app.route('/webhook', methods=['POST'])
 def yoomoney_webhook():
     data = request.form.to_dict()
@@ -711,7 +692,6 @@ def yoomoney_webhook():
         remember(chat_id, sent.message_id)
     return jsonify({"status": "ok"}), 200
 
-# === ЗАПУСК ===
 def run_flask():
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 3000)))
 
