@@ -178,7 +178,6 @@ def main_menu():
     return markup
 
 def buy_menu(chat_id):
-    """Обычное меню тарифов. Если подарок доступен — показываем кнопку подарка с таймером."""
     markup = telebot.types.InlineKeyboardMarkup()
     _, _, _, trial_started, trial_used = get_user(chat_id)
     now = int(time.time())
@@ -197,7 +196,6 @@ def buy_menu(chat_id):
     return markup
 
 def gift_menu():
-    """Подарок на весь экран."""
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("✅ Приобрести", callback_data="pack_trial"))
     markup.add(telebot.types.InlineKeyboardButton("❌ Не надо", callback_data="decline_gift"))
@@ -244,7 +242,7 @@ def back_to_main(call):
     send_main_menu(call.message.chat.id)
     bot.answer_callback_query(call.id)
 
-# === КУПИТЬ ТОКЕНЫ (НОВАЯ СИСТЕМА С ПОДАРКОМ) ===
+# === КУПИТЬ ТОКЕНЫ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_buy")
 def buy_tokens(call):
     _, _, _, trial_started, trial_used = get_user(call.message.chat.id)
@@ -278,7 +276,7 @@ def buy_tokens(call):
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-# === ОТКАЗ ОТ ПОДАРКА (переход к тарифам с кнопкой подарка) ===
+# === ОТКАЗ ОТ ПОДАРКА ===
 @bot.callback_query_handler(func=lambda call: call.data == "decline_gift")
 def decline_gift(call):
     try:
@@ -391,7 +389,7 @@ def show_balance(call):
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-# === ЧАТ С ИИ (СТАРАЯ РАБОЧАЯ ВЕРСИЯ + РЕЖИМЫ) ===
+# === ЧАТ С ИИ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_chat")
 def enter_chat(call):
     tokens, _, mode, _, _ = get_user(call.message.chat.id)
@@ -413,15 +411,15 @@ def enter_chat(call):
     sent = bot.send_message(
         call.message.chat.id,
         f"🤖 <b>Вы в чате с ИИ.</b>\n💰 Баланс: {tokens} токенов.\nРежим: <b>{mode_name}</b>\n\n"
-        f"Задайте вопрос или отправьте фото — 1 запрос = 1 токен.\n"
-        f"💡 Если хотите сменить режим — просто напишите «переключись на кодера» или «стань переводчиком».",
+        f"Задайте вопрос, отправьте фото или ссылку — 1 запрос = 1 токен.\n"
+        f"💡 Если хотите сменить режим — просто напишите «переключись на кодера».",
         parse_mode='HTML',
         reply_markup=mode_menu()
     )
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-# === РЕЖИМ (КНОПКА) ===
+# === РЕЖИМ ===
 @bot.callback_query_handler(func=lambda call: call.data.startswith("mode_"))
 def set_mode(call):
     mode = call.data.replace("mode_", "")
@@ -451,7 +449,7 @@ def support(call):
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-# === GIGACHAT ===
+# === GIGACHAT (с поддержкой ссылок через v2) ===
 def get_gigachat_token():
     url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
     headers = {
@@ -517,7 +515,9 @@ def ask_gigachat(chat_id, question, mode, image_base64=None):
     access_token = get_gigachat_token()
     if not access_token:
         return "❌ Не удалось получить доступ к ИИ."
-    url = "https://api.giga.chat/v1/chat/completions"
+    
+    # Используем v2 API для поддержки встроенных инструментов (анализ ссылок)
+    url = "https://api.giga.chat/v2/chat/completions"
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
@@ -544,7 +544,10 @@ def ask_gigachat(chat_id, question, mode, image_base64=None):
         "model": "GigaChat-3-Ultra",
         "messages": messages,
         "temperature": 0.7,
-        "max_tokens": 2000
+        "max_tokens": 2000,
+        "tools": [
+            {"type": "url_content_extraction"}
+        ]
     }
     try:
         r = requests.post(url, headers=headers, json=data, verify=False, timeout=90)
@@ -558,7 +561,7 @@ def ask_gigachat(chat_id, question, mode, image_base64=None):
     except Exception as e:
         return f"❌ Ошибка: {e}"
 
-# === СООБЩЕНИЯ В ЧАТЕ (ТЕКСТ И ФОТО) ===
+# === СООБЩЕНИЯ В ЧАТЕ ===
 @bot.message_handler(content_types=['text', 'photo'])
 def handle_message(message):
     tokens, state, mode, _, _ = get_user(message.chat.id)
@@ -577,7 +580,6 @@ def handle_message(message):
         remember(message.chat.id, sent.message_id)
         return
 
-    # === ПЕРЕКЛЮЧЕНИЕ РЕЖИМА ПО ФРАЗЕ ===
     if message.text:
         new_mode = detect_mode_request(message.text)
         if new_mode:
@@ -616,7 +618,6 @@ def handle_message(message):
 
     tokens_left, _, _, _, _ = get_user(message.chat.id)
 
-    # === ЕСЛИ ЕСТЬ КОД — ОТПРАВЛЯЕМ С КНОПКОЙ КОПИРОВАНИЯ ===
     if "```" in answer or "def " in answer or "import " in answer or "class " in answer:
         clean_code = answer.replace("```python", "").replace("```", "").strip()
         safe_code = escape_html(clean_code)
