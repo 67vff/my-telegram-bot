@@ -1266,15 +1266,23 @@ MODE_PROMPTS = {
     "regular": "РЕЖИМ: ОБЫЧНЫЙ. Отвечай на любые вопросы.",
     "coder_hints": (
         "РЕЖИМ: КОДЕР С ПОДСКАЗКАМИ. "
-        "Пиши рабочий код с комментариями. После кода коротко объясни. "
+        "Пиши рабочий код с комментариями НА АНГЛИЙСКОМ ЯЗЫКЕ. "
+        "Все переменные, функции, комментарии — ТОЛЬКО НА АНГЛИЙСКОМ. "
+        "Пользователю объясняй на русском. "
+        "ВАЖНО: если пользователь просит код для Roblox Studio (Lua) — напиши ДВА скрипта: "
+        "сначала LOCAL SCRIPT (для клиента), потом SERVER SCRIPT (для сервера). "
+        "Каждый подпиши: 'Локальный скрипт:' и 'Серверный скрипт:'. "
         "Код в ``` ... ```."
     ),
     "coder_only": (
         "РЕЖИМ: КОДЕР ТОЛЬКО КОД. "
         "Пиши ТОЛЬКО код, без объяснений, без приветствий. "
+        "Комментарии в коде и переменные — ТОЛЬКО НА АНГЛИЙСКОМ. "
+        "ВАЖНО: если пользователь просит код для Roblox Studio (Lua) — напиши ДВА скрипта: "
+        "LOCAL SCRIPT и SERVER SCRIPT. Подпиши их. "
         "Код в ``` ... ```."
     ),
-    "explainer": "РЕЖИМ: ОБЪЯСНЯТОР. Объясняй просто, с примерами.",
+    "explainer": "РЕЖИМ: ОБЪЯСНЯТОР. Объясняй просто, с примерами. Отвечай на русском.",
     "translator": "РЕЖИМ: ПЕРЕВОДЧИК. Переводи тексты. Русский ↔ английский.",
 }
 
@@ -1386,8 +1394,10 @@ def handle_message(message):
         return
 
     prefix = ""
+    switched = False
     new_mode, new_ai_mode = detect_mode_request(message.text)
     if new_mode or new_ai_mode:
+        switched = True
         if new_mode:
             update_user(message.chat.id, 'mode', new_mode)
             mode = new_mode
@@ -1418,6 +1428,26 @@ def handle_message(message):
         bot.delete_message(message.chat.id, message.message_id)
     except Exception:
         pass
+
+    if switched:
+        tokens_now = get_user(message.chat.id)[0]
+        mode_now = get_user(message.chat.id)[2]
+        ai_now = get_user(message.chat.id)[3]
+        coder_mode = get_user(message.chat.id)[9]
+        if mode_now == "coder":
+            mode_name = "💻 Кодер (с подсказками)" if coder_mode == "with_hints" else "⚡ Кодер (только код)"
+        else:
+            mode_name = {"regular": "🤖 Обычный ИИ", "explainer": "📖 Объяснятор", "translator": "🌍 Переводчик"}.get(mode_now, "🤖 Обычный ИИ")
+        ai_name = {"regular": "🤖 Обычный", "smart": "🧠 Умный", "open": "💬 Откровенный", "uncensored": "🔥 Без цензуры"}.get(ai_now, "🤖 Обычный")
+        sent = bot.send_message(
+            message.chat.id,
+            f"✅ <b>Переключился.</b>\n💰 Баланс: {tokens_now} токенов.\n"
+            f"Режим: <b>{mode_name}</b>\nПоведение: <b>{ai_name}</b>\n\n"
+            f"Задайте вопрос — 1 запрос = 1 токен.",
+            parse_mode='HTML',
+            reply_markup=chat_menu()
+        )
+        remember(message.chat.id, sent.message_id)
 
     add_tokens(message.chat.id, -1)
     log_stat(message.chat.id, 1)
