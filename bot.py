@@ -187,6 +187,29 @@ def emoji(chat_id, key):
     icons = {"buy": "💳 ", "chat": "🤖 ", "balance": "💰 ", "support": "🆘 ", "settings": "⚙️ ", "back": "⬅️ "}
     return icons.get(key, "")
 
+# === НАЗВАНИЯ РЕЖИМОВ ===
+MODE_NAMES = {
+    "regular": "🤖 Обычный ИИ",
+    "coder": "💻 Кодер",
+    "explainer": "📖 Объяснятор",
+    "translator": "🌍 Переводчик",
+    "editor": "✍️ Редактор",
+    "summary": "📝 Резюме",
+    "lawyer": "⚖️ Юрист"
+}
+
+def get_mode_name(mode):
+    return MODE_NAMES.get(mode, "🤖 Обычный ИИ")
+
+def chat_text(tokens, mode):
+    return (
+        f"🤖 <b>Вы в чате с ИИ.</b>\n"
+        f"💰 Баланс: {tokens} токенов.\n"
+        f"Режим: <b>{get_mode_name(mode)}</b>\n\n"
+        f"Задайте вопрос или отправьте фото — 1 запрос = 1 токен.\n"
+        f"💡 Если хотите сменить режим — просто напишите «переключись на кодера»."
+    )
+
 # === МЕНЮ ===
 def main_menu(chat_id):
     e = lambda k: emoji(chat_id, k)
@@ -208,15 +231,13 @@ def buy_menu():
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
     return markup
 
-def mode_menu():
+def mode_menu(chat_id):
+    """Показываем все 7 режимов. Текущий — с галочкой."""
+    _, _, current_mode, _, _, _, _ = get_user(chat_id)
     markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("🤖 Обычный ИИ", callback_data="mode_regular"))
-    markup.add(telebot.types.InlineKeyboardButton("💻 Кодер", callback_data="mode_coder"))
-    markup.add(telebot.types.InlineKeyboardButton("📖 Объяснятор", callback_data="mode_explainer"))
-    markup.add(telebot.types.InlineKeyboardButton("🌍 Переводчик", callback_data="mode_translator"))
-    markup.add(telebot.types.InlineKeyboardButton("✍️ Редактор", callback_data="mode_editor"))
-    markup.add(telebot.types.InlineKeyboardButton("📝 Резюме", callback_data="mode_summary"))
-    markup.add(telebot.types.InlineKeyboardButton("⚖️ Юрист", callback_data="mode_lawyer"))
+    for key, name in MODE_NAMES.items():
+        prefix = "✅ " if key == current_mode else ""
+        markup.add(telebot.types.InlineKeyboardButton(f"{prefix}{name}", callback_data=f"mode_{key}"))
     markup.add(telebot.types.InlineKeyboardButton("⚙️ Настройки", callback_data="settings_from_chat"))
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
     return markup
@@ -417,6 +438,7 @@ def clear_chat(call):
     clear_history(call.message.chat.id)
     bot.answer_callback_query(call.id, "📜 История чата очищена.")
 
+# === ЧАТ С ИИ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_chat")
 def enter_chat(call):
     tokens, _, mode, _, _, _, _ = get_user(call.message.chat.id)
@@ -434,24 +456,31 @@ def enter_chat(call):
         bot.answer_callback_query(call.id)
         return
     update_user(call.message.chat.id, 'state', 'chat')
-    mode_name = {"regular": "🤖 Обычный ИИ", "coder": "💻 Кодер", "explainer": "📖 Объяснятор", "translator": "🌍 Переводчик", "editor": "✍️ Редактор", "summary": "📝 Резюме", "lawyer": "⚖️ Юрист"}.get(mode, "🤖 Обычный ИИ")
-    sent = bot.send_message(
-        call.message.chat.id,
-        f"🤖 <b>Вы в чате с ИИ.</b>\n💰 Баланс: {tokens} токенов.\nРежим: <b>{mode_name}</b>\n\n"
-        f"Задайте вопрос или отправьте фото — 1 запрос = 1 токен.\n"
-        f"💡 Если хотите сменить режим — просто напишите «переключись на кодера».",
-        parse_mode='HTML',
-        reply_markup=mode_menu()
-    )
+    sent = bot.send_message(call.message.chat.id, chat_text(tokens, mode), parse_mode='HTML', reply_markup=mode_menu(call.message.chat.id))
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
+# === ПЕРЕКЛЮЧЕНИЕ РЕЖИМА (СРАЗУ ОБНОВЛЯЕМ ТЕКСТ) ===
 @bot.callback_query_handler(func=lambda call: call.data.startswith("mode_"))
 def set_mode(call):
     mode = call.data.replace("mode_", "")
+    if mode not in MODE_NAMES:
+        bot.answer_callback_query(call.id, "❌ Неизвестный режим.")
+        return
     update_user(call.message.chat.id, 'mode', mode)
-    mode_name = {"regular": "🤖 Обычный ИИ", "coder": "💻 Кодер", "explainer": "📖 Объяснятор", "translator": "🌍 Переводчик", "editor": "✍️ Редактор", "summary": "📝 Резюме", "lawyer": "⚖️ Юрист"}.get(mode, "🤖 Обычный ИИ")
-    bot.answer_callback_query(call.id, f"Режим: {mode_name}")
+    tokens, _, _, _, _, _, _ = get_user(call.message.chat.id)
+    # Сразу обновляем текст и кнопки в том же сообщении
+    try:
+        bot.edit_message_text(
+            chat_text(tokens, mode),
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode='HTML',
+            reply_markup=mode_menu(call.message.chat.id)
+        )
+    except Exception as e:
+        print(f"Ошибка обновления режима: {e}")
+    bot.answer_callback_query(call.id, f"✅ Режим: {get_mode_name(mode)}")
 
 @bot.callback_query_handler(func=lambda call: call.data == "menu_support")
 def support(call):
@@ -573,8 +602,7 @@ def handle_message(message):
         new_mode = detect_mode_request(message.text)
         if new_mode:
             update_user(message.chat.id, 'mode', new_mode)
-            mode_name = {"regular": "🤖 Обычный ИИ", "coder": "💻 Кодер", "explainer": "📖 Объяснятор", "translator": "🌍 Переводчик", "editor": "✍️ Редактор", "summary": "📝 Резюме", "lawyer": "⚖️ Юрист"}.get(new_mode, "🤖 Обычный ИИ")
-            prefix = f"✅ Переключился на режим {mode_name}.\n\n"
+            prefix = f"✅ Переключился на режим {get_mode_name(new_mode)}.\n\n"
             mode = new_mode
 
     if mode == "summary" and message.text:
@@ -630,13 +658,13 @@ def handle_message(message):
             markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
             sent = bot.send_message(message.chat.id, f"<pre><code>{safe_code}</code></pre>\n\n──────────\n💰 Осталось: {tokens_left}", parse_mode='HTML', reply_markup=markup)
         except Exception:
-            sent = bot.send_message(message.chat.id, f"{full_answer}\n\n──────────\n💰 Осталось: {tokens_left}", reply_markup=mode_menu())
+            sent = bot.send_message(message.chat.id, f"{full_answer}\n\n──────────\n💰 Осталось: {tokens_left}", reply_markup=mode_menu(message.chat.id))
     else:
         safe_answer = escape_html(full_answer)
         try:
-            sent = bot.send_message(message.chat.id, f"{safe_answer}\n\n──────────\n💰 Осталось: {tokens_left}", parse_mode='HTML', reply_markup=mode_menu())
+            sent = bot.send_message(message.chat.id, f"{safe_answer}\n\n──────────\n💰 Осталось: {tokens_left}", parse_mode='HTML', reply_markup=mode_menu(message.chat.id))
         except Exception:
-            sent = bot.send_message(message.chat.id, f"{full_answer}\n\n──────────\n💰 Осталось: {tokens_left}", reply_markup=mode_menu())
+            sent = bot.send_message(message.chat.id, f"{full_answer}\n\n──────────\n💰 Осталось: {tokens_left}", reply_markup=mode_menu(message.chat.id))
     remember(message.chat.id, sent.message_id)
 
 @app.route('/pay/<amount>/<label>')
