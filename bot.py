@@ -49,7 +49,6 @@ def init_db():
         content TEXT
     )''')
     conn.commit()
-    # Миграция: добавляем mode, если её нет
     try:
         c.execute("ALTER TABLE users ADD COLUMN mode TEXT DEFAULT 'coder'")
         conn.commit()
@@ -341,14 +340,16 @@ def enter_chat(call):
     mode_name = {"coder": "💻 Кодер", "explainer": "📖 Объяснятор", "translator": "🌍 Переводчик"}.get(mode, "💻 Кодер")
     sent = bot.send_message(
         call.message.chat.id,
-        f"🤖 <b>Привет, я Боб!</b>\n💰 Баланс: {tokens} токенов.\nРежим: <b>{mode_name}</b>\n\nЗадайте вопрос — 1 запрос = 1 токен.",
+        f"🤖 <b>Привет, я Боб!</b>\n💰 Баланс: {tokens} токенов.\nРежим: <b>{mode_name}</b>\n\n"
+        f"Задайте вопрос — 1 запрос = 1 токен.\n"
+        f"💡 Если хотите сменить режим — просто напишите «переключись на кодера» или «стань переводчиком».",
         parse_mode='HTML',
         reply_markup=mode_menu()
     )
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-# === ВЫБОР РЕЖИМА ===
+# === ВЫБОР РЕЖИМА (кнопка) ===
 @bot.callback_query_handler(func=lambda call: call.data.startswith("mode_"))
 def set_mode(call):
     mode = call.data.replace("mode_", "")
@@ -395,18 +396,63 @@ def get_gigachat_token():
         print(f"Ошибка GigaChat: {e}")
         return None
 
+# === УМНЫЕ ПРОМПТЫ С ПОДДЕРЖКОЙ ПЕРЕКЛЮЧЕНИЯ РЕЖИМА ===
 BASE_PROMPT = (
-    "Тебя зовут Боб. Ты — дружелюбный ИИ-помощник. "
-    "Если тебя спросят 'какая ты модель', 'кто ты', 'что ты за ИИ' — отвечай: "
-    "'Я Боб, твой ИИ-помощник. Помогаю с кодом, объяснениями и переводами.' "
+    "Тебя зовут Боб. Ты — очень умный и полезный ИИ-помощник. "
+    "Ты умеешь писать код, объяснять сложные вещи простыми словами и переводить тексты. "
+    "Если тебя спросят 'какая ты модель', 'кто ты' — отвечай: 'Я Боб, твой ИИ-помощник.' "
     "Никогда не упоминай GigaChat, Сбер, OpenAI и другие компании. Ты просто Боб. "
+    "\n\n"
+    "ВАЖНО: У тебя есть 3 режима работы:\n"
+    "1. 💻 КОДЕР — пишешь только код на Python.\n"
+    "2. 📖 ОБЪЯСНЯТОР — объясняешь сложные вещи простыми словами.\n"
+    "3. 🌍 ПЕРЕВОДЧИК — переводишь тексты (русский ↔ английский).\n\n"
+    "Если пользователь просит переключить режим (например, 'переключись на кодера', "
+    "'стань переводчиком', 'режим объяснятор') — ты должен ответить: "
+    "'✅ Переключаюсь на режим [название]. Теперь я [описание]'. "
+    "И в дальнейшем отвечать в этом режиме. "
+    "\n\n"
 )
 
 SYSTEM_PROMPTS = {
-    "coder": BASE_PROMPT + "\n\nРЕЖИМ: КОДЕР.\nТы пишешь ТОЛЬКО код на Python. Формат: ```python ... ```, потом одно короткое пояснение.",
-    "explainer": BASE_PROMPT + "\n\nРЕЖИМ: ОБЪЯСНЯТОР.\nОбъясняй простыми словами, без воды.",
-    "translator": BASE_PROMPT + "\n\nРЕЖИМ: ПЕРЕВОДЧИК.\nПереводи тексты. Русский ↔ английский."
+    "coder": BASE_PROMPT + (
+        "ТЕКУЩИЙ РЕЖИМ: 💻 КОДЕР.\n"
+        "Ты пишешь ТОЛЬКО код на Python. Формат ответа: сначала блок ```python ... ```, "
+        "потом одно короткое предложение пояснения (не больше 2 строк). "
+        "Никаких 'Конечно!', 'Вот ваш код:', 'Надеюсь, это поможет'. "
+        "Только код и краткое пояснение. Если код не нужен — отвечай кратко."
+    ),
+    "explainer": BASE_PROMPT + (
+        "ТЕКУЩИЙ РЕЖИМ: 📖 ОБЪЯСНЯТОР.\n"
+        "Ты объясняешь сложные вещи простыми словами. Приводишь примеры из жизни. "
+        "Пиши дружелюбно, но без воды. Не используй сложные термины без объяснения. "
+        "Старайся отвечать структурированно: сначала краткий ответ, потом пояснение."
+    ),
+    "translator": BASE_PROMPT + (
+        "ТЕКУЩИЙ РЕЖИМ: 🌍 ПЕРЕВОДЧИК.\n"
+        "Ты переводишь тексты. Если пользователь пишет на русском — переводи на английский. "
+        "Если на английском — переводи на русский. Отвечай ТОЛЬКО переводом, без пояснений. "
+        "Если просят перевести на конкретный язык — переводи на него."
+    )
 }
+
+# === ОПРЕДЕЛЕНИЕ ЗАПРОСА НА СМЕНУ РЕЖИМА ===
+def detect_mode_request(text):
+    """Проверяем, просит ли пользователь сменить режим"""
+    text_lower = text.lower()
+    # Кодер
+    if any(word in text_lower for word in ["кодер", "программист", "код", "code", "coder"]):
+        if any(word in text_lower for word in ["переключ", "стань", "режим", "смени", "включи"]):
+            return "coder"
+    # Объяснятор
+    if any(word in text_lower for word in ["объясн", "учитель", "explain", "объяснятор"]):
+        if any(word in text_lower for word in ["переключ", "стань", "режим", "смени", "включи"]):
+            return "explainer"
+    # Переводчик
+    if any(word in text_lower for word in ["перевод", "translate", "translator", "переводчик"]):
+        if any(word in text_lower for word in ["переключ", "стань", "режим", "смени", "включи"]):
+            return "translator"
+    return None
 
 def ask_gigachat(chat_id, question, mode):
     access_token = get_gigachat_token()
@@ -420,9 +466,9 @@ def ask_gigachat(chat_id, question, mode):
     for role, content in history:
         messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": question})
-    data = {"model": "GigaChat-3-Ultra", "messages": messages, "temperature": 0.5}
+    data = {"model": "GigaChat-3-Ultra", "messages": messages, "temperature": 0.7, "max_tokens": 2000}
     try:
-        r = requests.post(url, headers=headers, json=data, verify=False, timeout=60)
+        r = requests.post(url, headers=headers, json=data, verify=False, timeout=90)
         result = r.json()
         if "choices" in result:
             answer = result["choices"][0]["message"]["content"]
@@ -451,6 +497,25 @@ def handle_message(message):
         sent = bot.send_message(message.chat.id, "❌ Токены закончились.", reply_markup=markup)
         remember(message.chat.id, sent.message_id)
         return
+
+    # === ПРОВЕРКА: не просит ли сменить режим ===
+    new_mode = detect_mode_request(message.text)
+    if new_mode:
+        update_mode(message.chat.id, new_mode)
+        mode_name = {"coder": "💻 Кодер", "explainer": "📖 Объяснятор", "translator": "🌍 Переводчик"}.get(new_mode, "💻 Кодер")
+        try:
+            bot.delete_message(message.chat.id, message.message_id)
+        except Exception:
+            pass
+        sent = bot.send_message(
+            message.chat.id,
+            f"✅ <b>Переключаюсь на режим {mode_name}.</b>\n\nТеперь задайте вопрос.",
+            parse_mode='HTML',
+            reply_markup=mode_menu()
+        )
+        remember(message.chat.id, sent.message_id)
+        return
+
     try:
         bot.delete_message(message.chat.id, message.message_id)
     except Exception:
