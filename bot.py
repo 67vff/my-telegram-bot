@@ -23,60 +23,9 @@ bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
 DB_PATH = "/app/data/users.db"
-LOG_PATH = "/app/data/debug.log"
-TRIAL_PRICE = 10
-TRIAL_TOKENS = 2
-TRIAL_WINDOW = 3600
-SPAM_WINDOW = 3
-SPAM_LIMIT = 10
-
-spam_tracker = {}
-spam_warned = {}
-
-def log_debug(text):
-    try:
-        with open(LOG_PATH, "a") as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {text}\n")
-    except Exception as e:
-        print(f"LOG ERROR: {e}")
 
 def escape_html(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-# === АНТИСПАМ ===
-def is_spamming(chat_id):
-    now = time.time()
-    if chat_id not in spam_tracker:
-        spam_tracker[chat_id] = []
-    spam_tracker[chat_id] = [t for t in spam_tracker[chat_id] if now - t < SPAM_WINDOW]
-    spam_tracker[chat_id].append(now)
-    if len(spam_tracker[chat_id]) > SPAM_LIMIT:
-        last_warn = spam_warned.get(chat_id, 0)
-        if now - last_warn > 10:
-            spam_warned[chat_id] = now
-            return True
-    return False
-
-def spam_warning(call):
-    bot.answer_callback_query(call.id, "🛑 Хватит спамить!")
-    warn_msg = None
-    try:
-        warn_msg = bot.send_message(call.message.chat.id, "🛑 <b>Хватит спамить!</b>", parse_mode='HTML')
-    except Exception:
-        pass
-    def reopen():
-        time.sleep(2)
-        if warn_msg:
-            try:
-                bot.delete_message(call.message.chat.id, warn_msg.message_id)
-            except Exception:
-                pass
-        try:
-            clear_old_messages(call.message.chat.id)
-            send_main_menu(call.message.chat.id)
-        except Exception:
-            pass
-    threading.Thread(target=reopen, daemon=True).start()
 
 # === БАЗА ДАННЫХ ===
 def init_db():
@@ -86,9 +35,7 @@ def init_db():
         chat_id INTEGER PRIMARY KEY,
         tokens INTEGER DEFAULT 1000,
         state TEXT DEFAULT 'idle',
-        mode TEXT DEFAULT 'coder',
-        trial_started INTEGER DEFAULT 0,
-        trial_used INTEGER DEFAULT 0
+        mode TEXT DEFAULT 'coder'
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS orders (
         order_id TEXT PRIMARY KEY,
@@ -102,16 +49,12 @@ def init_db():
         content TEXT
     )''')
     conn.commit()
-    for col, definition in [
-        ("mode", "TEXT DEFAULT 'coder'"),
-        ("trial_started", "INTEGER DEFAULT 0"),
-        ("trial_used", "INTEGER DEFAULT 0"),
-    ]:
-        try:
-            c.execute(f"ALTER TABLE users ADD COLUMN {col} {definition}")
-            conn.commit()
-        except sqlite3.OperationalError:
-            pass
+    # Миграция: добавляем mode, если её нет
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN mode TEXT DEFAULT 'coder'")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
     conn.close()
 
 init_db()
@@ -120,35 +63,21 @@ def get_user(chat_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     try:
-        c.execute("SELECT tokens, state, mode, trial_started, trial_used FROM users WHERE chat_id=?", (chat_id,))
+        c.execute("SELECT tokens, state, mode FROM users WHERE chat_id=?", (chat_id,))
         row = c.fetchone()
     except sqlite3.OperationalError:
         conn.close()
         init_db()
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("SELECT tokens, state, mode, trial_started, trial_used FROM users WHERE chat_id=?", (chat_id,))
+        c.execute("SELECT tokens, state, mode FROM users WHERE chat_id=?", (chat_id,))
         row = c.fetchone()
     if not row:
-        c.execute("INSERT INTO users (chat_id, tokens, state, mode, trial_started, trial_used) VALUES (?, 1000, 'idle', 'coder', 0, 0)", (chat_id,))
+        c.execute("INSERT INTO users (chat_id, tokens, state, mode) VALUES (?, 1000, 'idle', 'coder')", (chat_id,))
         conn.commit()
-        row = (1000, 'idle', 'coder', 0, 0)
+        row = (1000, 'idle', 'coder')
     conn.close()
     return row
-
-def set_trial_started(chat_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE users SET trial_started=? WHERE chat_id=?", (int(time.time()), chat_id))
-    conn.commit()
-    conn.close()
-
-def set_trial_used(chat_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE users SET trial_used=1 WHERE chat_id=?", (chat_id,))
-    conn.commit()
-    conn.close()
 
 def update_state(chat_id, state):
     conn = sqlite3.connect(DB_PATH)
@@ -224,28 +153,14 @@ def main_menu():
     markup.add(telebot.types.InlineKeyboardButton("🆘 Поддержка", callback_data="menu_support"))
     return markup
 
-def buy_menu(chat_id):
+def buy_menu():
     markup = telebot.types.InlineKeyboardMarkup()
-    _, _, _, trial_started, trial_used = get_user(chat_id)
-    now = int(time.time())
-    if not trial_used and trial_started > 0 and (now - trial_started) < TRIAL_WINDOW:
-        left = TRIAL_WINDOW - (now - trial_started)
-        minutes = left // 60
-        markup.add(telebot.types.InlineKeyboardButton(
-            f"🎁 Подарок: 2 токена за 10 ₽ (осталось {minutes} мин)",
-            callback_data="pack_trial"
-        ))
+    markup.add(telebot.types.InlineKeyboardButton("🎁 10 ₽ — 2 токена", callback_data="pack_10_2"))
     markup.add(telebot.types.InlineKeyboardButton("100 ₽ — 20 токенов", callback_data="pack_100_20"))
     markup.add(telebot.types.InlineKeyboardButton("250 ₽ — 50 токенов", callback_data="pack_250_50"))
     markup.add(telebot.types.InlineKeyboardButton("500 ₽ — 100 токенов", callback_data="pack_500_100"))
     markup.add(telebot.types.InlineKeyboardButton("✏️ Своя сумма", callback_data="custom_amount"))
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
-    return markup
-
-def gift_menu():
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("✅ Приобрести", callback_data="pack_trial"))
-    markup.add(telebot.types.InlineKeyboardButton("❌ Не надо", callback_data="decline_gift"))
     return markup
 
 def mode_menu():
@@ -262,15 +177,15 @@ def back_menu():
     return markup
 
 def send_main_menu(chat_id):
-    tokens, _, _, _, _ = get_user(chat_id)
+    tokens, _, _ = get_user(chat_id)
     update_state(chat_id, 'idle')
     text = f"👋 <b>Главное меню</b>\n💰 Токенов: <b>{tokens}</b>\n────────────────\nВыбери действие:"
     sent = bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=main_menu())
     remember(chat_id, sent.message_id)
 
+# === /start ===
 @bot.message_handler(commands=['start'])
 def start(message):
-    log_debug(f"START from {message.chat.id}")
     try:
         bot.delete_message(message.chat.id, message.message_id)
     except Exception:
@@ -278,13 +193,9 @@ def start(message):
     clear_old_messages(message.chat.id)
     send_main_menu(message.chat.id)
 
-# === НАЗАД В ГЛАВНОЕ (ТОЛЬКО menu_main!) ===
-@bot.callback_query_handler(func=lambda call: call.data == "menu_main")
+# === НАЗАД ===
+@bot.callback_query_handler(func=lambda call: call.data in ["menu_main", "menu_chat"])
 def back_to_main(call):
-    log_debug(f"BACK_TO_MAIN")
-    if is_spamming(call.message.chat.id):
-        spam_warning(call)
-        return
     update_state(call.message.chat.id, 'idle')
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -294,91 +205,21 @@ def back_to_main(call):
     send_main_menu(call.message.chat.id)
     bot.answer_callback_query(call.id)
 
+# === КУПИТЬ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_buy")
 def buy_tokens(call):
-    log_debug(f"BUY_BUTTON")
-    if is_spamming(call.message.chat.id):
-        spam_warning(call)
-        return
-    _, _, _, trial_started, trial_used = get_user(call.message.chat.id)
-    now = int(time.time())
-    show_gift = False
-    if not trial_used:
-        if trial_started == 0:
-            set_trial_started(call.message.chat.id)
-            trial_started = now
-        if now - trial_started < TRIAL_WINDOW:
-            show_gift = True
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
     except Exception:
         pass
     clear_old_messages(call.message.chat.id)
-    if show_gift:
-        left = TRIAL_WINDOW - (now - trial_started)
-        minutes = left // 60
-        text = (
-            "🎁 <b>ПОДАРОК НА ПЕРВЫЙ РАЗ!</b>\n"
-            "────────────────\n"
-            f"🎫 <b>2 токена</b> всего за <b>10 ₽</b>\n"
-            "🤖 Попробуй чат с ИИ!\n\n"
-            f"⏳ Осталось: <b>{minutes} мин</b>\n"
-            "────────────────"
-        )
-        sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=gift_menu())
-    else:
-        sent = bot.send_message(call.message.chat.id, "💳 <b>Покупка токенов</b>\n────────────────\nВыбери пакет:", parse_mode='HTML', reply_markup=buy_menu(call.message.chat.id))
+    sent = bot.send_message(call.message.chat.id, "💳 <b>Покупка токенов</b>\n────────────────\nВыбери пакет:", parse_mode='HTML', reply_markup=buy_menu())
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-@bot.callback_query_handler(func=lambda call: call.data == "decline_gift")
-def decline_gift(call):
-    log_debug(f"DECLINE_GIFT")
-    if is_spamming(call.message.chat.id):
-        spam_warning(call)
-        return
-    try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
-        pass
-    clear_old_messages(call.message.chat.id)
-    sent = bot.send_message(
-        call.message.chat.id,
-        "💳 <b>Покупка токенов</b>\n────────────────\nВыбери пакет:",
-        parse_mode='HTML',
-        reply_markup=buy_menu(call.message.chat.id)
-    )
-    remember(call.message.chat.id, sent.message_id)
-    bot.answer_callback_query(call.id)
-
-@bot.callback_query_handler(func=lambda call: call.data == "pack_trial")
-def pack_trial(call):
-    log_debug(f"PACK_TRIAL")
-    if is_spamming(call.message.chat.id):
-        spam_warning(call)
-        return
-    _, _, _, trial_started, trial_used = get_user(call.message.chat.id)
-    if trial_used:
-        bot.answer_callback_query(call.id, "❌ Подарок уже использован.")
-        return
-    if int(time.time()) - trial_started > TRIAL_WINDOW:
-        bot.answer_callback_query(call.id, "⏳ Время подарка истекло.")
-        return
-    try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
-        pass
-    clear_old_messages(call.message.chat.id)
-    set_trial_used(call.message.chat.id)
-    create_invoice(call.message.chat.id, TRIAL_PRICE, TRIAL_TOKENS)
-    bot.answer_callback_query(call.id)
-
+# === ПАКЕТЫ ===
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pack_"))
 def pack_selected(call):
-    log_debug(f"PACK_SELECTED: {call.data}")
-    if is_spamming(call.message.chat.id):
-        spam_warning(call)
-        return
     parts = call.data.split("_")
     amount = int(parts[1])
     tokens = int(parts[2])
@@ -390,12 +231,9 @@ def pack_selected(call):
     create_invoice(call.message.chat.id, amount, tokens)
     bot.answer_callback_query(call.id)
 
+# === СВОЯ СУММА ===
 @bot.callback_query_handler(func=lambda call: call.data == "custom_amount")
 def custom_amount(call):
-    log_debug(f"CUSTOM_AMOUNT")
-    if is_spamming(call.message.chat.id):
-        spam_warning(call)
-        return
     bot.answer_callback_query(call.id)
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -427,6 +265,7 @@ def custom_tokens(message):
         sent = bot.send_message(message.chat.id, "❌ Введи число.", reply_markup=back_menu())
         remember(message.chat.id, sent.message_id)
 
+# === СЧЁТ ===
 def create_invoice(chat_id, amount, tokens):
     order_id = f"ORD-{chat_id}-{tokens}-{amount}"
     save_order(order_id, chat_id, tokens)
@@ -442,28 +281,22 @@ def create_invoice(chat_id, amount, tokens):
     )
     remember(chat_id, sent.message_id)
 
+# === БАЛАНС ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_balance")
 def show_balance(call):
-    log_debug(f"BALANCE_BUTTON")
-    if is_spamming(call.message.chat.id):
-        spam_warning(call)
-        return
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
     except Exception:
         pass
     clear_old_messages(call.message.chat.id)
-    tokens, _, _, _, _ = get_user(call.message.chat.id)
+    tokens, _, _ = get_user(call.message.chat.id)
     sent = bot.send_message(call.message.chat.id, f"💰 <b>Ваш баланс:</b> {tokens} токенов", parse_mode='HTML', reply_markup=back_menu())
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
+# === ИСТОРИЯ ЧАТА ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_history")
 def show_history(call):
-    log_debug(f"HISTORY_BUTTON")
-    if is_spamming(call.message.chat.id):
-        spam_warning(call)
-        return
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
     except Exception:
@@ -487,50 +320,37 @@ def show_history(call):
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-# === ЧАТ С ИИ (ТЕПЕРЬ НЕ ПЕРЕХВАТЫВАЕТСЯ) ===
+# === ЧАТ С ИИ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_chat")
 def enter_chat(call):
-    log_debug(f"CHAT_BUTTON_PRESSED: chat_id={call.message.chat.id}")
+    tokens, _, mode = get_user(call.message.chat.id)
     try:
-        if is_spamming(call.message.chat.id):
-            spam_warning(call)
-            return
-        tokens, _, mode, _, _ = get_user(call.message.chat.id)
-        log_debug(f"CHAT: tokens={tokens}, mode={mode}")
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except Exception:
-            pass
-        clear_old_messages(call.message.chat.id)
-        if tokens < 1:
-            markup = telebot.types.InlineKeyboardMarkup()
-            markup.add(telebot.types.InlineKeyboardButton("💳 Купить токены", callback_data="menu_buy"))
-            markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
-            sent = bot.send_message(call.message.chat.id, "❌ У вас нет токенов.", reply_markup=markup)
-            remember(call.message.chat.id, sent.message_id)
-            bot.answer_callback_query(call.id)
-            return
-        update_state(call.message.chat.id, 'chat')
-        mode_name = {"coder": "💻 Кодер", "explainer": "📖 Объяснятор", "translator": "🌍 Переводчик"}.get(mode, "💻 Кодер")
-        sent = bot.send_message(
-            call.message.chat.id,
-            f"🤖 <b>Привет, я Боб!</b>\n💰 Баланс: {tokens} токенов.\nРежим: <b>{mode_name}</b>\n\nЗадайте вопрос — 1 запрос = 1 токен.",
-            parse_mode='HTML',
-            reply_markup=mode_menu()
-        )
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
+    clear_old_messages(call.message.chat.id)
+    if tokens < 1:
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.add(telebot.types.InlineKeyboardButton("💳 Купить токены", callback_data="menu_buy"))
+        markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
+        sent = bot.send_message(call.message.chat.id, "❌ У вас нет токенов.", reply_markup=markup)
         remember(call.message.chat.id, sent.message_id)
         bot.answer_callback_query(call.id)
-        log_debug("CHAT: success")
-    except Exception as e:
-        log_debug(f"CHAT ERROR: {e}")
-        bot.answer_callback_query(call.id, f"Ошибка: {e}")
+        return
+    update_state(call.message.chat.id, 'chat')
+    mode_name = {"coder": "💻 Кодер", "explainer": "📖 Объяснятор", "translator": "🌍 Переводчик"}.get(mode, "💻 Кодер")
+    sent = bot.send_message(
+        call.message.chat.id,
+        f"🤖 <b>Привет, я Боб!</b>\n💰 Баланс: {tokens} токенов.\nРежим: <b>{mode_name}</b>\n\nЗадайте вопрос — 1 запрос = 1 токен.",
+        parse_mode='HTML',
+        reply_markup=mode_menu()
+    )
+    remember(call.message.chat.id, sent.message_id)
+    bot.answer_callback_query(call.id)
 
+# === ВЫБОР РЕЖИМА ===
 @bot.callback_query_handler(func=lambda call: call.data.startswith("mode_"))
 def set_mode(call):
-    log_debug(f"MODE: {call.data}")
-    if is_spamming(call.message.chat.id):
-        spam_warning(call)
-        return
     mode = call.data.replace("mode_", "")
     update_mode(call.message.chat.id, mode)
     mode_name = {"coder": "💻 Кодер", "explainer": "📖 Объяснятор", "translator": "🌍 Переводчик"}.get(mode, "💻 Кодер")
@@ -546,12 +366,9 @@ def set_mode(call):
     except Exception:
         pass
 
+# === ПОДДЕРЖКА ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_support")
 def support(call):
-    log_debug(f"SUPPORT_BUTTON")
-    if is_spamming(call.message.chat.id):
-        spam_warning(call)
-        return
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
     except Exception:
@@ -575,7 +392,7 @@ def get_gigachat_token():
         response = requests.post(url, headers=headers, data=data, verify=False, timeout=30)
         return response.json().get("access_token")
     except Exception as e:
-        log_debug(f"GIGACHAT_TOKEN ERROR: {e}")
+        print(f"Ошибка GigaChat: {e}")
         return None
 
 BASE_PROMPT = (
@@ -616,9 +433,10 @@ def ask_gigachat(chat_id, question, mode):
     except Exception as e:
         return f"❌ Ошибка: {e}"
 
+# === СООБЩЕНИЯ В ЧАТЕ ===
 @bot.message_handler(func=lambda m: True)
 def handle_message(message):
-    tokens, state, mode, _, _ = get_user(message.chat.id)
+    tokens, state, mode = get_user(message.chat.id)
     if state != 'chat':
         return
     if message.text == "⬅️ Назад":
@@ -650,7 +468,7 @@ def handle_message(message):
     typing_thread.daemon = True
     typing_thread.start()
     answer = ask_gigachat(message.chat.id, message.text, mode)
-    tokens_left, _, _, _, _ = get_user(message.chat.id)
+    tokens_left, _, _ = get_user(message.chat.id)
     stop_typing.set()
     typing_thread.join(timeout=2)
     if "```" in answer:
@@ -730,7 +548,7 @@ def yoomoney_webhook():
     if order:
         chat_id, tokens = order
         add_tokens(chat_id, tokens)
-        new_balance, _, _, _, _ = get_user(chat_id)
+        new_balance, _, _ = get_user(chat_id)
         clear_old_messages(chat_id)
         parts = label.split("-")
         real_amount = parts[-1] if len(parts) >= 4 else amount
@@ -743,13 +561,10 @@ def yoomoney_webhook():
         remember(chat_id, sent.message_id)
     return jsonify({"status": "ok"}), 200
 
+# === ЗАПУСК ===
 def run_flask():
-    log_debug("FLASK STARTED")
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 3000)))
 
 if __name__ == '__main__':
-    log_debug("BOT STARTING...")
     threading.Thread(target=run_flask, daemon=True).start()
-    log_debug("POLLING STARTING...")
     bot.polling(none_stop=True)
-    log_debug("POLLING STOPPED")
