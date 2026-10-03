@@ -1,11 +1,14 @@
 import os
 import uuid
+import hmac
 import sqlite3
 import hashlib
 import threading
+import urllib.parse
 import telebot
 import requests
 import urllib3
+from hashlib import sha256
 from flask import Flask, request, jsonify
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -22,7 +25,6 @@ DB_PATH = "/app/data/users.db"
 
 # === ЭКРАНИРОВАНИЕ HTML ===
 def escape_html(text):
-    """Заменяет спецсимволы, чтобы Telegram не пытался парсить их как HTML"""
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 # === БАЗА ДАННЫХ ===
@@ -464,7 +466,7 @@ def ask_gigachat(chat_id, question, mode):
     except Exception as e:
         return f"❌ Ошибка: {e}"
 
-# === СООБЩЕНИЯ В ЧАТЕ (С ЭКРАНИРОВАНИЕМ HTML) ===
+# === СООБЩЕНИЯ В ЧАТЕ ===
 @bot.message_handler(func=lambda m: True)
 def handle_message(message):
     tokens, state, mode = get_user(message.chat.id)
@@ -582,15 +584,42 @@ def pay_page(amount, label):
     '''
     return html
 
-# === ВЕБХУК ===
+# === ВЕБХУК (С ПРАВИЛЬНОЙ ПРОВЕРКОЙ ПОДПИСИ sign) ===
 @app.route('/webhook', methods=['POST'])
 def yoomoney_webhook():
     data = request.form.to_dict()
-    received_hash = data.get('sha1_hash', '')
-    check_string = '&'.join([f"{k}={v}" for k, v in sorted(data.items()) if k != 'sha1_hash'])
-    check_string += YOOMONEY_SECRET
-    if hashlib.sha1(check_string.encode('utf-8')).hexdigest() != received_hash:
-        return jsonify({"status": "error"}), 403
+
+    # === НОВАЯ ПРОВЕРКА ПОДПИСИ sign (HMAC-SHA256) ===
+    received_sign = data.pop('sign', '')
+
+    if received_sign:
+        # Сортируем оставшиеся параметры по алфавиту
+        sorted_items = sorted(data.items())
+        # Формируем строку с URL-кодированием значений
+        check_string = '&'.join(
+            f"{k}={urllib.parse.quote(str(v), safe='')}"
+            for k, v in sorted_items
+        )
+        # Вычисляем HMAC-SHA256
+        calculated_sign = hmac.new(
+            YOOMONEY_SECRET.encode('utf-8'),
+            check_string.encode('utf-8'),
+            sha256
+        ).hexdigest()
+
+        if not hmac.compare_digest(calculated_sign, received_sign):
+            return jsonify({"status": "error", "message": "Invalid sign"}), 403
+    else:
+        # Если sign нет — проверяем старый sha1_hash (на переходный период)
+        received_hash = data.pop('sha1_hash', '')
+        if received_hash:
+            check_string = '&'.join([f"{k}={v}" for k, v in sorted(data.items())])
+            check_string += YOOMONEY_SECRET
+            calculated_hash = hashlib.sha1(check_string.encode('utf-8')).hexdigest()
+            if calculated_hash != received_hash:
+                return jsonify({"status": "error", "message": "Invalid sha1"}), 403
+
+    # === ОБРАБОТКА ПЛАТЕЖА ===
     label = data.get('label', '')
     amount = data.get('amount', '')
     order = get_order(label)
