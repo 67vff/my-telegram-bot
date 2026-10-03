@@ -254,7 +254,7 @@ def clear_old_messages(chat_id):
 def remember(chat_id, msg_id):
     last_messages.setdefault(chat_id, []).append(msg_id)
 
-# === "ПЕЧАТАЕТ" В ОТДЕЛЬНОМ ПОТОКЕ ===
+# === "ПЕЧАТАЕТ" ===
 def start_typing(chat_id):
     stop = threading.Event()
     def loop():
@@ -509,7 +509,7 @@ def show_balance(call):
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-# === ИСТОРИЯ ЧАТА (ПОЛНЫЙ ТЕКСТ) ===
+# === ИСТОРИЯ ЧАТА ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_history")
 def show_history(call):
     try:
@@ -523,13 +523,11 @@ def show_history(call):
         remember(call.message.chat.id, sent.message_id)
         bot.answer_callback_query(call.id)
         return
-
-    # Разбиваем на несколько сообщений, потому что Telegram ограничивает 4096 символов
     full_text = "📜 <b>Ваша история чата:</b>\n\n"
     parts = []
     for role, content in history:
         prefix = "👤 <b>Вы:</b> " if role == "user" else "🤖 <b>Боб:</b> "
-        safe = escape_html(content)  # ПОЛНЫЙ ТЕКСТ, без обрезки
+        safe = escape_html(content)
         block = f"{prefix}{safe}\n\n"
         if len(full_text) + len(block) > 4000:
             parts.append(full_text)
@@ -538,13 +536,11 @@ def show_history(call):
             full_text += block
     if full_text:
         parts.append(full_text)
-
     for i, p in enumerate(parts):
         try:
             sent = bot.send_message(call.message.chat.id, p, parse_mode='HTML', reply_markup=back_menu() if i == len(parts) - 1 else None)
             remember(call.message.chat.id, sent.message_id)
         except Exception:
-            # если HTML сломался — шлём без разметки
             sent = bot.send_message(call.message.chat.id, p.replace("<b>","").replace("</b>",""), reply_markup=back_menu())
             remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
@@ -728,7 +724,7 @@ def admin_send_reply(message, ticket_id):
     sent = bot.send_message(message.chat.id, f"✅ Ответ отправлен по тикету #{ticket_id}.", reply_markup=admin_menu())
     remember(message.chat.id, sent.message_id)
 
-# === НАЧИСЛИТЬ ТОКЕНЫ + СПИСОК ПОЛЬЗОВАТЕЛЕЙ ===
+# === НАЧИСЛИТЬ ТОКЕНЫ ===
 @bot.callback_query_handler(func=lambda call: call.data == "admin_give")
 def admin_give(call):
     if call.message.chat.id != ADMIN_ID:
@@ -738,12 +734,10 @@ def admin_give(call):
     if not users:
         bot.answer_callback_query(call.id, "Пользователей нет.")
         return
-    text = "💰 <b>Начислить токены</b>\n\nНажми на ID пользователя, чтобы скопировать:\n\n"
+    text = "💰 <b>Начислить токены</b>\n\nНажми на пользователя, чтобы скопировать его ID:\n\n"
     markup = telebot.types.InlineKeyboardMarkup()
     for uid, uname, tokens in users[:30]:
-        label = f"{uname or '—'} — {tokens} ток."
-        # Кнопка с ID для копирования (в callback_data)
-        markup.add(telebot.types.InlineKeyboardButton(f"🆔 {uid}  {label}", callback_data=f"admin_copy_{uid}"))
+        markup.add(telebot.types.InlineKeyboardButton(f"🆔 {uid} — {uname or '—'} ({tokens})", callback_data=f"admin_copy_{uid}"))
     markup.add(telebot.types.InlineKeyboardButton("✏️ Ввести вручную", callback_data="admin_give_manual"))
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_admin"))
     try:
@@ -759,9 +753,8 @@ def admin_copy_id(call):
         bot.answer_callback_query(call.id, "❌ Доступ запрещён.")
         return
     uid = call.data.replace("admin_copy_", "")
-    # Отправляем ID отдельным сообщением — его можно скопировать
     bot.answer_callback_query(call.id, f"ID: {uid}")
-    bot.send_message(call.message.chat.id, f"🆔 ID пользователя:\n<code>{uid}</code>\n\nСкопируй и введи: <code>{uid} 10</code>", parse_mode='HTML')
+    bot.send_message(call.message.chat.id, f"🆔 ID пользователя:\n<code>{uid}</code>", parse_mode='HTML')
 
 @bot.callback_query_handler(func=lambda call: call.data == "admin_give_manual")
 def admin_give_manual(call):
@@ -798,7 +791,6 @@ def admin_users(call):
     if not users:
         bot.answer_callback_query(call.id, "Пользователей нет.")
         return
-    # Разбиваем на части по 4000 символов
     text = "👥 <b>Список пользователей:</b>\n\n"
     parts = []
     for uid, uname, tokens in users:
@@ -810,7 +802,6 @@ def admin_users(call):
             text += line
     if text:
         parts.append(text)
-
     for p in parts:
         try:
             sent = bot.send_message(call.message.chat.id, p, parse_mode='HTML', reply_markup=admin_menu())
@@ -922,7 +913,7 @@ BASE_PROMPT = (
 
 SYSTEM_PROMPTS = {
     "regular": BASE_PROMPT + "РЕЖИМ: ОБЫЧНЫЙ ИИ. Отвечай на любые вопросы.",
-    "coder": BASE_PROMPT + "РЕЖИМ: КОДЕР. Пиши ТОЛЬКО код. Формат: ```python ... ``` + одно короткое пояснение.",
+    "coder": BASE_PROMPT + "РЕЖИМ: КОДЕР. Пиши ТОЛЬКО код. Весь код оборачивай в ``` ... ```. Без лишних слов.",
     "explainer": BASE_PROMPT + "РЕЖИМ: ОБЪЯСНЯТОР. Объясняй сложные вещи простыми словами.",
     "translator": BASE_PROMPT + "РЕЖИМ: ПЕРЕВОДЧИК. Переводи тексты. Русский ↔ английский."
 }
@@ -1017,7 +1008,6 @@ def handle_message(message):
     add_tokens(message.chat.id, -1)
     log_stat(message.chat.id, 1)
 
-    # === ЗАПУСКАЕМ "ПЕЧАТАЕТ" В ОТДЕЛЬНОМ ПОТОКЕ ===
     stop_event, typing_thread = start_typing(message.chat.id)
 
     if message.photo:
@@ -1030,29 +1020,58 @@ def handle_message(message):
     else:
         answer = ask_gigachat(message.chat.id, message.text, mode)
 
-    # === ОСТАНАВЛИВАЕМ "ПЕЧАТАЕТ" ===
     stop_typing(stop_event, typing_thread)
 
     tokens_left = get_user(message.chat.id)[0]
     full_answer = prefix + answer
 
-    if "```" in full_answer or "def " in full_answer or "import " in full_answer or "class " in full_answer:
-        clean_code = full_answer.replace("```python", "").replace("```", "").strip()
-        safe_code = escape_html(clean_code)
+    # === ОТПРАВКА КОДА ===
+    is_code = False
+    code_text = ""
+
+    if "```" in full_answer:
+        is_code = True
+        parts = full_answer.split("```")
+        code_parts = []
+        for i, part in enumerate(parts):
+            if i % 2 == 1:
+                clean = part.strip()
+                if clean.lower().startswith(("python", "py\n", "javascript", "js\n", "html", "css", "sql", "java", "c++", "c#", "php", "go", "rust")):
+                    clean = clean.split("\n", 1)[1] if "\n" in clean else clean
+                code_parts.append(clean.strip())
+        code_text = "\n\n".join(code_parts)
+    elif mode == "coder" and any(x in full_answer for x in ["def ", "import ", "class ", "print(", "function ", "const ", "let ", "var ", "<?php", "SELECT ", "INSERT ", "CREATE TABLE", "#include", "public class"]):
+        is_code = True
+        code_text = full_answer
+
+    if is_code and code_text:
+        safe_code = escape_html(code_text)
         try:
-            copy_btn = telebot.types.InlineKeyboardButton(text="📋 Скопировать код", copy_text=clean_code)
-            markup = telebot.types.InlineKeyboardMarkup()
-            markup.add(copy_btn)
-            markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
-            sent = bot.send_message(message.chat.id, f"<pre><code>{safe_code}</code></pre>\n\n──────────\n💰 Осталось: {tokens_left}", parse_mode='HTML', reply_markup=markup)
+            sent = bot.send_message(
+                message.chat.id,
+                f"<pre><code>{safe_code}</code></pre>\n\n──────────\n💰 Осталось: {tokens_left}",
+                parse_mode='HTML'
+            )
         except Exception:
-            sent = bot.send_message(message.chat.id, f"{full_answer}\n\n──────────\n💰 Осталось: {tokens_left}", reply_markup=mode_menu())
+            sent = bot.send_message(
+                message.chat.id,
+                f"{code_text}\n\n──────────\n💰 Осталось: {tokens_left}"
+            )
     else:
         safe_answer = escape_html(full_answer)
         try:
-            sent = bot.send_message(message.chat.id, f"{safe_answer}\n\n──────────\n💰 Осталось: {tokens_left}", parse_mode='HTML', reply_markup=mode_menu())
+            sent = bot.send_message(
+                message.chat.id,
+                f"{safe_answer}\n\n──────────\n💰 Осталось: {tokens_left}",
+                parse_mode='HTML',
+                reply_markup=mode_menu()
+            )
         except Exception:
-            sent = bot.send_message(message.chat.id, f"{full_answer}\n\n──────────\n💰 Осталось: {tokens_left}", reply_markup=mode_menu())
+            sent = bot.send_message(
+                message.chat.id,
+                f"{full_answer}\n\n──────────\n💰 Осталось: {tokens_left}",
+                reply_markup=mode_menu()
+            )
     remember(message.chat.id, sent.message_id)
 
 # === СТРАНИЦА ОПЛАТЫ ===
