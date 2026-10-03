@@ -23,7 +23,6 @@ app = Flask(__name__)
 
 DB_PATH = "/app/data/users.db"
 
-# === ЭКРАНИРОВАНИЕ HTML ===
 def escape_html(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -106,7 +105,6 @@ def get_order(order_id):
     conn.close()
     return row
 
-# === ИСТОРИЯ ===
 def add_to_history(chat_id, role, content):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -122,14 +120,6 @@ def get_history(chat_id, limit=20):
     conn.close()
     return list(reversed(rows))
 
-def clear_history(chat_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("DELETE FROM history WHERE chat_id=?", (chat_id,))
-    conn.commit()
-    conn.close()
-
-# === УДАЛЕНИЕ СТАРЫХ СООБЩЕНИЙ ===
 last_messages = {}
 
 def clear_old_messages(chat_id):
@@ -179,16 +169,10 @@ def back_menu():
 def send_main_menu(chat_id):
     tokens, _, _ = get_user(chat_id)
     update_state(chat_id, 'idle')
-    text = (
-        "👋 <b>Главное меню</b>\n"
-        f"💰 Токенов: <b>{tokens}</b>\n"
-        "────────────────\n"
-        "Выбери действие:"
-    )
+    text = f"👋 <b>Главное меню</b>\n💰 Токенов: <b>{tokens}</b>\n────────────────\nВыбери действие:"
     sent = bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=main_menu())
     remember(chat_id, sent.message_id)
 
-# === /start ===
 @bot.message_handler(commands=['start'])
 def start(message):
     try:
@@ -198,7 +182,6 @@ def start(message):
     clear_old_messages(message.chat.id)
     send_main_menu(message.chat.id)
 
-# === НАЗАД ===
 @bot.callback_query_handler(func=lambda call: call.data in ["menu_main", "menu_chat"])
 def back_to_main(call):
     update_state(call.message.chat.id, 'idle')
@@ -210,7 +193,6 @@ def back_to_main(call):
     send_main_menu(call.message.chat.id)
     bot.answer_callback_query(call.id)
 
-# === КУПИТЬ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_buy")
 def buy_tokens(call):
     try:
@@ -222,7 +204,6 @@ def buy_tokens(call):
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-# === ПАКЕТЫ ===
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pack_"))
 def pack_selected(call):
     parts = call.data.split("_")
@@ -236,7 +217,6 @@ def pack_selected(call):
     create_invoice(call.message.chat.id, amount, tokens)
     bot.answer_callback_query(call.id)
 
-# === СВОЯ СУММА ===
 @bot.callback_query_handler(func=lambda call: call.data == "custom_amount")
 def custom_amount(call):
     bot.answer_callback_query(call.id)
@@ -270,7 +250,6 @@ def custom_tokens(message):
         sent = bot.send_message(message.chat.id, "❌ Введи число.", reply_markup=back_menu())
         remember(message.chat.id, sent.message_id)
 
-# === СЧЁТ ===
 def create_invoice(chat_id, amount, tokens):
     order_id = f"ORD-{chat_id}-{tokens}-{amount}"
     save_order(order_id, chat_id, tokens)
@@ -280,16 +259,12 @@ def create_invoice(chat_id, amount, tokens):
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
     sent = bot.send_message(
         chat_id,
-        f"🧾 <b>Счёт:</b> <code>{order_id}</code>\n"
-        f"🎫 <b>Токенов:</b> {tokens}\n"
-        f"💰 <b>Сумма:</b> {amount} ₽\n\n"
-        f"Нажми кнопку ниже 👇",
+        f"🧾 <b>Счёт:</b> <code>{order_id}</code>\n🎫 <b>Токенов:</b> {tokens}\n💰 <b>Сумма:</b> {amount} ₽\n\nНажми кнопку ниже 👇",
         parse_mode='HTML',
         reply_markup=markup
     )
     remember(chat_id, sent.message_id)
 
-# === БАЛАНС ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_balance")
 def show_balance(call):
     try:
@@ -302,7 +277,6 @@ def show_balance(call):
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-# === ИСТОРИЯ ЧАТА ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_history")
 def show_history(call):
     try:
@@ -328,7 +302,6 @@ def show_history(call):
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-# === ЧАТ С ИИ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_chat")
 def enter_chat(call):
     tokens, _, mode = get_user(call.message.chat.id)
@@ -349,16 +322,13 @@ def enter_chat(call):
     mode_name = {"coder": "💻 Кодер", "explainer": "📖 Объяснятор", "translator": "🌍 Переводчик"}.get(mode, "💻 Кодер")
     sent = bot.send_message(
         call.message.chat.id,
-        f"🤖 <b>Привет, я Боб!</b>\n💰 Баланс: {tokens} токенов.\n"
-        f"Режим: <b>{mode_name}</b>\n\n"
-        f"Задайте вопрос — 1 запрос = 1 токен.",
+        f"🤖 <b>Привет, я Боб!</b>\n💰 Баланс: {tokens} токенов.\nРежим: <b>{mode_name}</b>\n\nЗадайте вопрос — 1 запрос = 1 токен.",
         parse_mode='HTML',
         reply_markup=mode_menu()
     )
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-# === ВЫБОР РЕЖИМА ===
 @bot.callback_query_handler(func=lambda call: call.data.startswith("mode_"))
 def set_mode(call):
     mode = call.data.replace("mode_", "")
@@ -367,9 +337,7 @@ def set_mode(call):
     bot.answer_callback_query(call.id, f"Режим: {mode_name}")
     try:
         bot.edit_message_text(
-            f"🤖 <b>Привет, я Боб!</b>\n"
-            f"Режим: <b>{mode_name}</b>\n\n"
-            f"Задайте вопрос.",
+            f"🤖 <b>Привет, я Боб!</b>\nРежим: <b>{mode_name}</b>\n\nЗадайте вопрос.",
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             parse_mode='HTML',
@@ -378,7 +346,6 @@ def set_mode(call):
     except Exception:
         pass
 
-# === ПОДДЕРЖКА ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_support")
 def support(call):
     try:
@@ -415,22 +382,9 @@ BASE_PROMPT = (
 )
 
 SYSTEM_PROMPTS = {
-    "coder": BASE_PROMPT + (
-        "\n\nРЕЖИМ: КОДЕР.\n"
-        "Ты пишешь ТОЛЬКО код на Python. Без приветствий, без объяснений до кода. "
-        "Формат ответа: сначала блок ```python ... ``` с кодом, потом (если нужно) одно короткое предложение пояснения. "
-        "Никаких 'Конечно!', 'Вот ваш код:', 'Надеюсь, это поможет'. Только код и краткое пояснение."
-    ),
-    "explainer": BASE_PROMPT + (
-        "\n\nРЕЖИМ: ОБЪЯСНЯТОР.\n"
-        "Ты объясняешь сложные вещи простыми словами. Приводишь примеры из жизни. "
-        "Пиши дружелюбно, но без воды. Не используй сложные термины без объяснения."
-    ),
-    "translator": BASE_PROMPT + (
-        "\n\nРЕЖИМ: ПЕРЕВОДЧИК.\n"
-        "Ты переводишь тексты. Если пользователь пишет на русском — переводи на английский. "
-        "Если на английском — переводи на русский. Отвечай ТОЛЬКО переводом, без пояснений."
-    )
+    "coder": BASE_PROMPT + "\n\nРЕЖИМ: КОДЕР.\nТы пишешь ТОЛЬКО код на Python. Формат: ```python ... ```, потом одно короткое пояснение.",
+    "explainer": BASE_PROMPT + "\n\nРЕЖИМ: ОБЪЯСНЯТОР.\nОбъясняй простыми словами, без воды.",
+    "translator": BASE_PROMPT + "\n\nРЕЖИМ: ПЕРЕВОДЧИК.\nПереводи тексты. Русский ↔ английский."
 }
 
 def ask_gigachat(chat_id, question, mode):
@@ -438,22 +392,14 @@ def ask_gigachat(chat_id, question, mode):
     if not access_token:
         return "❌ Не удалось получить доступ к ИИ."
     url = "https://api.giga.chat/v1/chat/completions"
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Authorization": f"Bearer {access_token}"
-    }
+    headers = {"Content-Type": "application/json", "Accept": "application/json", "Authorization": f"Bearer {access_token}"}
     system_prompt = SYSTEM_PROMPTS.get(mode, SYSTEM_PROMPTS["coder"])
     messages = [{"role": "system", "content": system_prompt}]
     history = get_history(chat_id, limit=20)
     for role, content in history:
         messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": question})
-    data = {
-        "model": "GigaChat-3-Ultra",
-        "messages": messages,
-        "temperature": 0.5
-    }
+    data = {"model": "GigaChat-3-Ultra", "messages": messages, "temperature": 0.5}
     try:
         r = requests.post(url, headers=headers, json=data, verify=False, timeout=60)
         result = r.json()
@@ -466,7 +412,6 @@ def ask_gigachat(chat_id, question, mode):
     except Exception as e:
         return f"❌ Ошибка: {e}"
 
-# === СООБЩЕНИЯ В ЧАТЕ ===
 @bot.message_handler(func=lambda m: True)
 def handle_message(message):
     tokens, state, mode = get_user(message.chat.id)
@@ -488,11 +433,8 @@ def handle_message(message):
         bot.delete_message(message.chat.id, message.message_id)
     except Exception:
         pass
-
     add_tokens(message.chat.id, -1)
-
     stop_typing = threading.Event()
-
     def keep_typing():
         while not stop_typing.is_set():
             try:
@@ -500,17 +442,13 @@ def handle_message(message):
             except Exception:
                 pass
             stop_typing.wait(3)
-
     typing_thread = threading.Thread(target=keep_typing)
     typing_thread.daemon = True
     typing_thread.start()
-
     answer = ask_gigachat(message.chat.id, message.text, mode)
     tokens_left, _, _ = get_user(message.chat.id)
-
     stop_typing.set()
     typing_thread.join(timeout=2)
-
     if "```" in answer:
         parts = answer.split("```")
         for i, part in enumerate(parts):
@@ -524,12 +462,7 @@ def handle_message(message):
                     copy_btn = telebot.types.InlineKeyboardButton(text="📋 Скопировать код", copy_text=clean_code)
                     markup = telebot.types.InlineKeyboardMarkup()
                     markup.add(copy_btn)
-                    sent = bot.send_message(
-                        message.chat.id,
-                        f"<pre><code>{safe_code}</code></pre>",
-                        parse_mode='HTML',
-                        reply_markup=markup
-                    )
+                    sent = bot.send_message(message.chat.id, f"<pre><code>{safe_code}</code></pre>", parse_mode='HTML', reply_markup=markup)
                     remember(message.chat.id, sent.message_id)
                 except Exception:
                     sent = bot.send_message(message.chat.id, clean_code)
@@ -541,31 +474,16 @@ def handle_message(message):
                 except Exception:
                     sent = bot.send_message(message.chat.id, part)
                 remember(message.chat.id, sent.message_id)
-
-        sent = bot.send_message(
-            message.chat.id,
-            f"──────────\n💰 Осталось: {tokens_left}",
-            reply_markup=mode_menu()
-        )
+        sent = bot.send_message(message.chat.id, f"──────────\n💰 Осталось: {tokens_left}", reply_markup=mode_menu())
         remember(message.chat.id, sent.message_id)
     else:
         safe_answer = escape_html(answer)
         try:
-            sent = bot.send_message(
-                message.chat.id,
-                f"{safe_answer}\n\n──────────\n💰 Осталось: {tokens_left}",
-                parse_mode='HTML',
-                reply_markup=mode_menu()
-            )
+            sent = bot.send_message(message.chat.id, f"{safe_answer}\n\n──────────\n💰 Осталось: {tokens_left}", parse_mode='HTML', reply_markup=mode_menu())
         except Exception:
-            sent = bot.send_message(
-                message.chat.id,
-                f"{answer}\n\n──────────\n💰 Осталось: {tokens_left}",
-                reply_markup=mode_menu()
-            )
+            sent = bot.send_message(message.chat.id, f"{answer}\n\n──────────\n💰 Осталось: {tokens_left}", reply_markup=mode_menu())
         remember(message.chat.id, sent.message_id)
 
-# === СТРАНИЦА ОПЛАТЫ ===
 @app.route('/pay/<amount>/<label>')
 def pay_page(amount, label):
     html = f'''
@@ -584,42 +502,28 @@ def pay_page(amount, label):
     '''
     return html
 
-# === ВЕБХУК (С ПРАВИЛЬНОЙ ПРОВЕРКОЙ ПОДПИСИ sign) ===
+# === ВЕБХУК С ПРАВИЛЬНОЙ ПРОВЕРКОЙ ПОДПИСИ sign ===
 @app.route('/webhook', methods=['POST'])
 def yoomoney_webhook():
     data = request.form.to_dict()
-
-    # === НОВАЯ ПРОВЕРКА ПОДПИСИ sign (HMAC-SHA256) ===
     received_sign = data.pop('sign', '')
 
     if received_sign:
-        # Сортируем оставшиеся параметры по алфавиту
+        # Сортировка по алфавиту и URL-кодирование (RFC 3986)
         sorted_items = sorted(data.items())
-        # Формируем строку с URL-кодированием значений
-        check_string = '&'.join(
-            f"{k}={urllib.parse.quote(str(v), safe='')}"
-            for k, v in sorted_items
-        )
-        # Вычисляем HMAC-SHA256
-        calculated_sign = hmac.new(
-            YOOMONEY_SECRET.encode('utf-8'),
-            check_string.encode('utf-8'),
-            sha256
-        ).hexdigest()
-
+        check_string = '&'.join(f"{k}={urllib.parse.quote(str(v), safe='')}" for k, v in sorted_items)
+        # HMAC-SHA256
+        calculated_sign = hmac.new(YOOMONEY_SECRET.encode('utf-8'), check_string.encode('utf-8'), sha256).hexdigest()
         if not hmac.compare_digest(calculated_sign, received_sign):
             return jsonify({"status": "error", "message": "Invalid sign"}), 403
     else:
-        # Если sign нет — проверяем старый sha1_hash (на переходный период)
+        # Старый sha1_hash на переходный период
         received_hash = data.pop('sha1_hash', '')
         if received_hash:
-            check_string = '&'.join([f"{k}={v}" for k, v in sorted(data.items())])
-            check_string += YOOMONEY_SECRET
-            calculated_hash = hashlib.sha1(check_string.encode('utf-8')).hexdigest()
-            if calculated_hash != received_hash:
+            check_string = '&'.join([f"{k}={v}" for k, v in sorted(data.items())]) + YOOMONEY_SECRET
+            if hashlib.sha1(check_string.encode('utf-8')).hexdigest() != received_hash:
                 return jsonify({"status": "error", "message": "Invalid sha1"}), 403
 
-    # === ОБРАБОТКА ПЛАТЕЖА ===
     label = data.get('label', '')
     amount = data.get('amount', '')
     order = get_order(label)
@@ -630,18 +534,13 @@ def yoomoney_webhook():
         clear_old_messages(chat_id)
         sent = bot.send_message(
             chat_id,
-            f"✅ <b>Оплата прошла!</b>\n\n"
-            f"🧾 Счёт: <code>{label}</code>\n"
-            f"💰 Сумма: {amount} ₽\n"
-            f"🎫 Токенов: <b>{tokens}</b>\n"
-            f"💎 Баланс: <b>{new_balance}</b>",
+            f"✅ <b>Оплата прошла!</b>\n\n🧾 Счёт: <code>{label}</code>\n💰 Сумма: {amount} ₽\n🎫 Токенов: <b>{tokens}</b>\n💎 Баланс: <b>{new_balance}</b>",
             parse_mode='HTML',
             reply_markup=main_menu()
         )
         remember(chat_id, sent.message_id)
     return jsonify({"status": "ok"}), 200
 
-# === ЗАПУСК ===
 def run_flask():
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 3000)))
 
