@@ -188,7 +188,7 @@ def emoji(chat_id, key):
     icons = {"buy": "💳 ", "chat": "🤖 ", "balance": "💰 ", "support": "🆘 ", "settings": "⚙️ ", "back": "⬅️ "}
     return icons.get(key, "")
 
-# === МЕНЮ ===
+# === ГЛАВНОЕ МЕНЮ ===
 def main_menu(chat_id):
     e = lambda k: emoji(chat_id, k)
     markup = telebot.types.InlineKeyboardMarkup()
@@ -210,6 +210,7 @@ def buy_menu():
     return markup
 
 def mode_menu():
+    """7 режимов + настройки + назад"""
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("🤖 Обычный ИИ", callback_data="mode_regular"))
     markup.add(telebot.types.InlineKeyboardButton("💻 Кодер", callback_data="mode_coder"))
@@ -218,6 +219,7 @@ def mode_menu():
     markup.add(telebot.types.InlineKeyboardButton("✍️ Редактор", callback_data="mode_editor"))
     markup.add(telebot.types.InlineKeyboardButton("📝 Резюме", callback_data="mode_summary"))
     markup.add(telebot.types.InlineKeyboardButton("⚖️ Юрист", callback_data="mode_lawyer"))
+    markup.add(telebot.types.InlineKeyboardButton("⚙️ Настройки", callback_data="settings_from_chat"))
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
     return markup
 
@@ -245,6 +247,7 @@ def send_main_menu(chat_id):
     sent = bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=main_menu(chat_id))
     remember(chat_id, sent.message_id)
 
+# === /start ===
 @bot.message_handler(commands=['start'])
 def start(message):
     try:
@@ -254,6 +257,7 @@ def start(message):
     clear_old_messages(message.chat.id)
     send_main_menu(message.chat.id)
 
+# === НАЗАД ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_main")
 def back_to_main(call):
     try:
@@ -264,6 +268,7 @@ def back_to_main(call):
     send_main_menu(call.message.chat.id)
     bot.answer_callback_query(call.id)
 
+# === КУПИТЬ ТОКЕНЫ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_buy")
 def buy_tokens(call):
     try:
@@ -275,6 +280,7 @@ def buy_tokens(call):
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
+# === ПАКЕТЫ ===
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pack_"))
 def pack_selected(call):
     parts = call.data.split("_")
@@ -288,6 +294,7 @@ def pack_selected(call):
     create_invoice(call.message.chat.id, amount, tokens)
     bot.answer_callback_query(call.id)
 
+# === СВОЯ СУММА ===
 @bot.callback_query_handler(func=lambda call: call.data == "custom_amount")
 def custom_amount(call):
     bot.answer_callback_query(call.id)
@@ -321,6 +328,7 @@ def custom_tokens(message):
         sent = bot.send_message(message.chat.id, "❌ Введи число.", reply_markup=back_menu())
         remember(message.chat.id, sent.message_id)
 
+# === СЧЁТ ===
 def create_invoice(chat_id, amount, tokens):
     order_id = f"ORD-{chat_id}-{tokens}-{amount}"
     save_order(order_id, chat_id, tokens)
@@ -336,6 +344,7 @@ def create_invoice(chat_id, amount, tokens):
     )
     remember(chat_id, sent.message_id)
 
+# === БАЛАНС ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_balance")
 def show_balance(call):
     try:
@@ -349,7 +358,7 @@ def show_balance(call):
     bot.answer_callback_query(call.id)
 
 # === НАСТРОЙКИ ===
-@bot.callback_query_handler(func=lambda call: call.data == "menu_settings")
+@bot.callback_query_handler(func=lambda call: call.data in ["menu_settings", "settings_from_chat"])
 def open_settings(call):
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -447,6 +456,7 @@ def enter_chat(call):
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
+# === РЕЖИМЫ (КНОПКИ) ===
 @bot.callback_query_handler(func=lambda call: call.data.startswith("mode_"))
 def set_mode(call):
     mode = call.data.replace("mode_", "")
@@ -454,6 +464,7 @@ def set_mode(call):
     mode_name = {"regular": "🤖 Обычный ИИ", "coder": "💻 Кодер", "explainer": "📖 Объяснятор", "translator": "🌍 Переводчик", "editor": "✍️ Редактор", "summary": "📝 Резюме", "lawyer": "⚖️ Юрист"}.get(mode, "🤖 Обычный ИИ")
     bot.answer_callback_query(call.id, f"Режим: {mode_name}")
 
+# === ПОДДЕРЖКА ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_support")
 def support(call):
     try:
@@ -496,7 +507,7 @@ SYSTEM_PROMPTS = {
     "translator": BASE_PROMPT + "РЕЖИМ: ПЕРЕВОДЧИК. Переводи тексты. Русский ↔ английский. Только перевод.",
     "editor": BASE_PROMPT + "РЕЖИМ: РЕДАКТОР. Исправляй ошибки, улучшай стиль. Выводи: 'Исправленный текст:' и 'Что исправлено:' со списком.",
     "summary": BASE_PROMPT + "РЕЖИМ: РЕЗЮМЕ. Сделай краткое содержание текста в 5 предложениях.",
-    "lawyer": BASE_PROMPT + "РЕЖИМ: ЮРИСТ. Объясняй юридические вопросы простым языком. Если вопрос серьёзный (суд, увольнение, алименты, уголовное) — добавь: '⚠️ Это не юридическая консультация. Обратитесь к профессиональному юристу.'"
+    "lawyer": BASE_PROMPT + "РЕЖИМ: ЮРИСТ. Объясняй юридические вопросы простым языком. Если вопрос серьёзный — добавь: '⚠️ Это не юридическая консультация. Обратитесь к профессиональному юристу.'"
 }
 
 def detect_mode_request(text):
@@ -572,22 +583,14 @@ def handle_message(message):
         return
 
     # === ПЕРЕКЛЮЧЕНИЕ РЕЖИМА + ОТВЕТ В ОДНОМ СООБЩЕНИИ ===
+    prefix = ""
     if message.text:
         new_mode = detect_mode_request(message.text)
         if new_mode:
             update_user(message.chat.id, 'mode', new_mode)
             mode_name = {"regular": "🤖 Обычный ИИ", "coder": "💻 Кодер", "explainer": "📖 Объяснятор", "translator": "🌍 Переводчик", "editor": "✍️ Редактор", "summary": "📝 Резюме", "lawyer": "⚖️ Юрист"}.get(new_mode, "🤖 Обычный ИИ")
-            # Очищаем от фразы переключения
-            for phrase in ["переключись на ", "стань ", "смени режим на ", "включи режим "]:
-                if phrase in message.text.lower():
-                    idx = message.text.lower().find(phrase)
-                    message.text = message.text[:idx] + message.text[idx+len(phrase):].split(" ", 1)[-1] if " " in message.text[idx+len(phrase):] else ""
             prefix = f"✅ Переключился на режим {mode_name}.\n\n"
             mode = new_mode
-        else:
-            prefix = ""
-    else:
-        prefix = ""
 
     # === РЕЖИМ РЕЗЮМЕ — проверка длины ===
     if mode == "summary" and message.text:
@@ -626,10 +629,11 @@ def handle_message(message):
     tokens_left, _, _, _, _, _, _ = get_user(message.chat.id)
     full_answer = prefix + answer
 
-    # === НОЧНОЙ РЕЖИМ — кратко, без эмодзи ===
+    # === НОЧНОЙ РЕЖИМ ===
     now_hour = time.localtime().tm_hour
     if night and 0 <= now_hour < 6:
-        full_answer = full_answer[:200] + "..." if len(full_answer) > 200 else full_answer
+        if len(full_answer) > 200:
+            full_answer = full_answer[:200] + "..."
         full_answer = full_answer.replace("🤖", "").replace("✅", "").replace("💰", "")
 
     if "```" in full_answer or "def " in full_answer or "import " in full_answer or "class " in full_answer:
@@ -639,6 +643,7 @@ def handle_message(message):
             copy_btn = telebot.types.InlineKeyboardButton(text="📋 Скопировать код", copy_text=clean_code)
             markup = telebot.types.InlineKeyboardMarkup()
             markup.add(copy_btn)
+            markup.add(telebot.types.InlineKeyboardButton("⚙️ Настройки", callback_data="settings_from_chat"))
             markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
             sent = bot.send_message(message.chat.id, f"<pre><code>{safe_code}</code></pre>\n\n──────────\n💰 Осталось: {tokens_left}", parse_mode='HTML', reply_markup=markup)
         except Exception:
