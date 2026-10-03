@@ -503,14 +503,14 @@ def pay_page(amount, label):
     '''
     return html
 
-# === ВЕБХУК С ПОДДЕРЖКОЙ sign И sha1_hash ===
+# === ВЕБХУК С ПРАВИЛЬНОЙ ПРОВЕРКОЙ ПОДПИСИ sign ===
 @app.route('/webhook', methods=['POST'])
 def yoomoney_webhook():
     data = request.form.to_dict()
     received_sign = data.pop('sign', '')
 
     if received_sign:
-        # Новый формат: HMAC-SHA256 (согласно документации ЮMoney [citation:17])
+        # Новый формат: HMAC-SHA256 (согласно документации ЮMoney [citation:6][citation:18])
         sorted_items = sorted(data.items())
         check_string = '&'.join(f"{k}={urllib.parse.quote_plus(str(v))}" for k, v in sorted_items)
         calculated_sign = hmac.new(
@@ -521,7 +521,7 @@ def yoomoney_webhook():
         if not hmac.compare_digest(calculated_sign, received_sign):
             return jsonify({"status": "error", "message": "Invalid sign"}), 403
     else:
-        # Старый формат: sha1_hash (устареет с 18 мая 2026) [citation:11]
+        # Старый формат: sha1_hash (устареет с 18 мая 2026 [citation:6])
         received_hash = data.pop('sha1_hash', '')
         if received_hash:
             check_string = '&'.join([f"{k}={v}" for k, v in sorted(data.items())]) + YOOMONEY_SECRET
