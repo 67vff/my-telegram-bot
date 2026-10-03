@@ -27,7 +27,7 @@ TRIAL_PRICE = 10
 TRIAL_TOKENS = 2
 TRIAL_WINDOW = 3600
 SPAM_WINDOW = 3
-SPAM_LIMIT = 5
+SPAM_LIMIT = 10
 
 spam_tracker = {}
 spam_warned = {}
@@ -51,12 +51,18 @@ def is_spamming(chat_id):
 
 def spam_warning(call):
     bot.answer_callback_query(call.id, "🛑 Хватит спамить!")
+    warn_msg = None
     try:
-        bot.send_message(call.message.chat.id, "🛑 <b>Хватит спамить!</b>", parse_mode='HTML')
+        warn_msg = bot.send_message(call.message.chat.id, "🛑 <b>Хватит спамить!</b>", parse_mode='HTML')
     except Exception:
         pass
     def reopen():
         time.sleep(2)
+        if warn_msg:
+            try:
+                bot.delete_message(call.message.chat.id, warn_msg.message_id)
+            except Exception:
+                pass
         try:
             clear_old_messages(call.message.chat.id)
             send_main_menu(call.message.chat.id)
@@ -211,11 +217,9 @@ def main_menu():
     return markup
 
 def buy_menu(chat_id):
-    """Обычное меню тарифов. Если подарок ещё доступен — показываем кнопку подарка."""
     markup = telebot.types.InlineKeyboardMarkup()
     _, _, _, trial_started, trial_used = get_user(chat_id)
     now = int(time.time())
-    # Если подарок ещё не использован и время не истекло — показываем кнопку подарка
     if not trial_used and trial_started > 0 and (now - trial_started) < TRIAL_WINDOW:
         left = TRIAL_WINDOW - (now - trial_started)
         minutes = left // 60
@@ -231,7 +235,6 @@ def buy_menu(chat_id):
     return markup
 
 def gift_menu():
-    """Меню подарка на весь экран."""
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("✅ Приобрести", callback_data="pack_trial"))
     markup.add(telebot.types.InlineKeyboardButton("❌ Не надо", callback_data="decline_gift"))
@@ -318,7 +321,6 @@ def buy_tokens(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == "decline_gift")
 def decline_gift(call):
-    """Пользователь нажал 'Не надо' — показываем обычные тарифы с кнопкой подарка."""
     if is_spamming(call.message.chat.id):
         spam_warning(call)
         return
