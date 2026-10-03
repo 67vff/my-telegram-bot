@@ -20,6 +20,8 @@ YOOMONEY_RECEIVER = os.getenv('YOOMONEY_RECEIVER')
 YOOMONEY_SECRET = os.getenv('YOOMONEY_SECRET')
 GIGACHAT_AUTH_KEY = os.getenv('GIGACHAT_AUTH_KEY')
 
+ADMIN_ID = 8000630493   # ← Твой ID
+
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
@@ -37,12 +39,12 @@ def init_db():
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS users (
         chat_id INTEGER PRIMARY KEY,
-        tokens INTEGER DEFAULT 1000,
+        tokens INTEGER DEFAULT 0,
         state TEXT DEFAULT 'idle',
         mode TEXT DEFAULT 'regular',
         trial_started INTEGER DEFAULT 0,
         trial_used INTEGER DEFAULT 0,
-        lang TEXT DEFAULT 'ru',
+        username TEXT DEFAULT '',
         theme TEXT DEFAULT 'bright',
         night_mode INTEGER DEFAULT 1,
         notifications INTEGER DEFAULT 1
@@ -64,12 +66,23 @@ def init_db():
         tokens_spent INTEGER,
         timestamp INTEGER
     )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS tickets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER,
+        username TEXT,
+        message TEXT,
+        photo_id TEXT,
+        status TEXT DEFAULT 'open',
+        answer TEXT,
+        created INTEGER,
+        answered INTEGER
+    )''')
     conn.commit()
     for col, definition in [
         ("mode", "TEXT DEFAULT 'regular'"),
         ("trial_started", "INTEGER DEFAULT 0"),
         ("trial_used", "INTEGER DEFAULT 0"),
-        ("lang", "TEXT DEFAULT 'ru'"),
+        ("username", "TEXT DEFAULT ''"),
         ("theme", "TEXT DEFAULT 'bright'"),
         ("night_mode", "INTEGER DEFAULT 1"),
         ("notifications", "INTEGER DEFAULT 1"),
@@ -87,19 +100,19 @@ def get_user(chat_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     try:
-        c.execute("SELECT tokens, state, mode, trial_started, trial_used, lang, theme, night_mode, notifications FROM users WHERE chat_id=?", (chat_id,))
+        c.execute("SELECT tokens, state, mode, trial_started, trial_used, username, theme, night_mode, notifications FROM users WHERE chat_id=?", (chat_id,))
         row = c.fetchone()
     except sqlite3.OperationalError:
         conn.close()
         init_db()
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("SELECT tokens, state, mode, trial_started, trial_used, lang, theme, night_mode, notifications FROM users WHERE chat_id=?", (chat_id,))
+        c.execute("SELECT tokens, state, mode, trial_started, trial_used, username, theme, night_mode, notifications FROM users WHERE chat_id=?", (chat_id,))
         row = c.fetchone()
     if not row:
         c.execute("INSERT INTO users (chat_id) VALUES (?)", (chat_id,))
         conn.commit()
-        row = (1000, 'idle', 'regular', 0, 0, 'ru', 'bright', 1, 1)
+        row = (0, 'idle', 'regular', 0, 0, '', 'bright', 1, 1)
     conn.close()
     return row
 
@@ -109,9 +122,6 @@ def update_user(chat_id, field, value):
     c.execute(f"UPDATE users SET {field}=? WHERE chat_id=?", (value, chat_id))
     conn.commit()
     conn.close()
-
-def set_trial_used(chat_id):
-    update_user(chat_id, 'trial_used', 1)
 
 def add_tokens(chat_id, count):
     conn = sqlite3.connect(DB_PATH)
@@ -177,6 +187,49 @@ def clear_history(chat_id):
     conn.commit()
     conn.close()
 
+# === ТИКЕТЫ ===
+def create_ticket(chat_id, username, message, photo_id=None):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO tickets (chat_id, username, message, photo_id, created) VALUES (?, ?, ?, ?, ?)",
+              (chat_id, username, message, photo_id, int(time.time())))
+    conn.commit()
+    ticket_id = c.lastrowid
+    conn.close()
+    return ticket_id
+
+def get_open_tickets():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, chat_id, username, message, photo_id, created FROM tickets WHERE status='open' ORDER BY id ASC")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def get_ticket(ticket_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, chat_id, username, message, photo_id, status FROM tickets WHERE id=?", (ticket_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+def answer_ticket(ticket_id, answer):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE tickets SET status='closed', answer=?, answered=? WHERE id=?", (answer, int(time.time()), ticket_id))
+    conn.commit()
+    conn.close()
+
+def get_user_tickets(chat_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, message, answer, status FROM tickets WHERE chat_id=? ORDER BY id DESC LIMIT 10", (chat_id,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+# === УДАЛЕНИЕ СТАРЫХ СООБЩЕНИЙ ===
 last_messages = {}
 
 def clear_old_messages(chat_id):
@@ -191,14 +244,24 @@ def remember(chat_id, msg_id):
     last_messages.setdefault(chat_id, []).append(msg_id)
 
 # === МЕНЮ ===
-def main_menu():
+def main_menu(chat_id=None):
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("💳 Купить токены", callback_data="menu_buy"))
     markup.add(telebot.types.InlineKeyboardButton("🤖 Чат с ИИ", callback_data="menu_chat"))
     markup.add(telebot.types.InlineKeyboardButton("📜 История чата", callback_data="menu_history"))
     markup.add(telebot.types.InlineKeyboardButton("💰 Мой баланс", callback_data="menu_balance"))
-    markup.add(telebot.types.InlineKeyboardButton("⚙️ Настройки", callback_data="menu_settings"))
     markup.add(telebot.types.InlineKeyboardButton("🆘 Поддержка", callback_data="menu_support"))
+    if chat_id == ADMIN_ID:
+        markup.add(telebot.types.InlineKeyboardButton("👑 Админ-меню", callback_data="menu_admin"))
+    return markup
+
+def admin_menu():
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("📋 Тикеты", callback_data="admin_tickets"))
+    markup.add(telebot.types.InlineKeyboardButton("💰 Начислить токены", callback_data="admin_give"))
+    markup.add(telebot.types.InlineKeyboardButton("👥 Список пользователей", callback_data="admin_users"))
+    markup.add(telebot.types.InlineKeyboardButton("📢 Рассылка", callback_data="admin_broadcast"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
     return markup
 
 def buy_menu(chat_id):
@@ -235,17 +298,6 @@ def mode_menu():
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
     return markup
 
-def settings_menu(chat_id):
-    _, _, _, _, _, _, _, theme, night, notif = get_user(chat_id)
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton(f"🌙 Ночной режим: {'ВКЛ' if night else 'ВЫКЛ'}", callback_data="set_night"))
-    markup.add(telebot.types.InlineKeyboardButton(f"🎨 Тема: {'Яркая' if theme == 'bright' else 'Минимализм'}", callback_data="set_theme"))
-    markup.add(telebot.types.InlineKeyboardButton(f"🔔 Уведомления: {'ВКЛ' if notif else 'ВЫКЛ'}", callback_data="set_notif"))
-    markup.add(telebot.types.InlineKeyboardButton("📊 Статистика", callback_data="set_stats"))
-    markup.add(telebot.types.InlineKeyboardButton("📜 Очистить историю", callback_data="set_clear"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
-    return markup
-
 def back_menu():
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
@@ -255,12 +307,15 @@ def send_main_menu(chat_id):
     tokens = get_user(chat_id)[0]
     update_user(chat_id, 'state', 'idle')
     text = f"👋 <b>Главное меню</b>\n💰 Токенов: <b>{tokens}</b>\n────────────────\nВыбери действие:"
-    sent = bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=main_menu())
+    sent = bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=main_menu(chat_id))
     remember(chat_id, sent.message_id)
 
 # === /start ===
 @bot.message_handler(commands=['start'])
 def start(message):
+    # Сохраняем username
+    if message.from_user.username:
+        update_user(message.chat.id, 'username', f"@{message.from_user.username}")
     try:
         bot.delete_message(message.chat.id, message.message_id)
     except Exception:
@@ -345,7 +400,7 @@ def pack_trial(call):
     except Exception:
         pass
     clear_old_messages(call.message.chat.id)
-    set_trial_used(call.message.chat.id)
+    update_user(call.message.chat.id, 'trial_used', 1)
     create_invoice(call.message.chat.id, TRIAL_PRICE, TRIAL_TOKENS)
     bot.answer_callback_query(call.id)
 
@@ -452,63 +507,263 @@ def show_history(call):
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-# === НАСТРОЙКИ ===
-@bot.callback_query_handler(func=lambda call: call.data in ["menu_settings", "settings_from_chat"])
-def open_settings(call):
+# === ПОДДЕРЖКА ===
+@bot.callback_query_handler(func=lambda call: call.data == "menu_support")
+def support(call):
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
     except Exception:
         pass
     clear_old_messages(call.message.chat.id)
-    sent = bot.send_message(call.message.chat.id, "⚙️ <b>Настройки</b>\n────────────────\nВыбери параметр:", parse_mode='HTML', reply_markup=settings_menu(call.message.chat.id))
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("📝 Написать тикет", callback_data="ticket_new"))
+    markup.add(telebot.types.InlineKeyboardButton("📋 Мои тикеты", callback_data="ticket_my"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
+    sent = bot.send_message(call.message.chat.id, "🆘 <b>Поддержка</b>\n────────────────\nЧто вы хотите сделать?", parse_mode='HTML', reply_markup=markup)
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-@bot.callback_query_handler(func=lambda call: call.data == "set_night")
-def set_night(call):
-    night = get_user(call.message.chat.id)[8]
-    update_user(call.message.chat.id, 'night_mode', 0 if night else 1)
-    bot.answer_callback_query(call.id, f"Ночной режим: {'ВКЛ' if not night else 'ВЫКЛ'}")
+@bot.callback_query_handler(func=lambda call: call.data == "ticket_new")
+def ticket_new(call):
     try:
-        bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=settings_menu(call.message.chat.id))
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
+    clear_old_messages(call.message.chat.id)
+    sent = bot.send_message(call.message.chat.id, "📝 Напишите ваш вопрос (можно прикрепить фото):", reply_markup=back_menu())
+    remember(call.message.chat.id, sent.message_id)
+    bot.register_next_step_handler(sent, ticket_save)
+
+def ticket_save(message):
+    if message.text == "⬅️ Назад":
+        back_to_main(message)
+        return
+    user = get_user(message.chat.id)
+    username = user[5] if user[5] else f"ID:{message.chat.id}"
+    text = message.text if message.text else (message.caption if message.caption else "[без текста]")
+    photo_id = None
+    if message.photo:
+        photo_id = message.photo[-1].file_id
+    ticket_id = create_ticket(message.chat.id, username, text, photo_id)
+    try:
+        bot.delete_message(message.chat.id, message.message_id)
+    except Exception:
+        pass
+    sent = bot.send_message(
+        message.chat.id,
+        f"✅ <b>Тикет #{ticket_id} создан.</b>\nАдминистратор ответит в ближайшее время.",
+        parse_mode='HTML',
+        reply_markup=back_menu()
+    )
+    remember(message.chat.id, sent.message_id)
+    # Уведомляем админа
+    try:
+        if photo_id:
+            bot.send_photo(ADMIN_ID, photo_id, caption=f"🔔 Новый тикет #{ticket_id} от {username}\n\n{text}")
+        else:
+            bot.send_message(ADMIN_ID, f"🔔 Новый тикет #{ticket_id} от {username}\n\n{text}")
     except Exception:
         pass
 
-@bot.callback_query_handler(func=lambda call: call.data == "set_theme")
-def set_theme(call):
-    theme = get_user(call.message.chat.id)[7]
-    new_theme = 'minimal' if theme == 'bright' else 'bright'
-    update_user(call.message.chat.id, 'theme', new_theme)
-    bot.answer_callback_query(call.id, f"Тема: {'Минимализм' if new_theme == 'minimal' else 'Яркая'}")
-    try:
-        bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=settings_menu(call.message.chat.id))
-    except Exception:
-        pass
-
-@bot.callback_query_handler(func=lambda call: call.data == "set_notif")
-def set_notif(call):
-    notif = get_user(call.message.chat.id)[9]
-    update_user(call.message.chat.id, 'notifications', 0 if notif else 1)
-    bot.answer_callback_query(call.id, f"Уведомления: {'ВКЛ' if not notif else 'ВЫКЛ'}")
-    try:
-        bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=settings_menu(call.message.chat.id))
-    except Exception:
-        pass
-
-@bot.callback_query_handler(func=lambda call: call.data == "set_stats")
-def show_stats(call):
-    day, week, month = get_stats(call.message.chat.id)
-    text = f"📊 <b>Статистика</b>\n────────────────\nЗа сегодня: <b>{day}</b> токенов\nЗа неделю: <b>{week}</b> токенов\nЗа месяц: <b>{month}</b> токенов"
+@bot.callback_query_handler(func=lambda call: call.data == "ticket_my")
+def ticket_my(call):
+    tickets = get_user_tickets(call.message.chat.id)
+    if not tickets:
+        bot.answer_callback_query(call.id, "У вас нет тикетов.")
+        return
+    text = "📋 <b>Ваши тикеты:</b>\n\n"
+    for tid, msg, ans, status in tickets:
+        st = "✅ отвечен" if status == "closed" else "⏳ ожидает"
+        text += f"<b>#{tid}</b> ({st})\n{escape_html(msg[:80])}\n"
+        if ans:
+            text += f"💬 Ответ: {escape_html(ans[:80])}\n"
+        text += "\n"
     try:
         bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode='HTML', reply_markup=back_menu())
     except Exception:
-        pass
+        sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=back_menu())
+        remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-@bot.callback_query_handler(func=lambda call: call.data == "set_clear")
-def clear_chat(call):
-    clear_history(call.message.chat.id)
-    bot.answer_callback_query(call.id, "📜 История чата очищена.")
+# === АДМИН-МЕНЮ ===
+@bot.callback_query_handler(func=lambda call: call.data == "menu_admin")
+def admin_panel(call):
+    if call.message.chat.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "❌ Доступ запрещён.")
+        return
+    try:
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
+    sent = bot.send_message(call.message.chat.id, "👑 <b>Админ-меню</b>", parse_mode='HTML', reply_markup=admin_menu())
+    remember(call.message.chat.id, sent.message_id)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_tickets")
+def admin_tickets(call):
+    if call.message.chat.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "❌ Доступ запрещён.")
+        return
+    tickets = get_open_tickets()
+    if not tickets:
+        try:
+            bot.edit_message_text("📋 Нет открытых тикетов.", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=admin_menu())
+        except Exception:
+            sent = bot.send_message(call.message.chat.id, "📋 Нет открытых тикетов.", reply_markup=admin_menu())
+            remember(call.message.chat.id, sent.message_id)
+        bot.answer_callback_query(call.id)
+        return
+    markup = telebot.types.InlineKeyboardMarkup()
+    for tid, uid, uname, msg, photo, created in tickets:
+        label = f"#{tid} — {uname[:20]} — {msg[:30]}"
+        markup.add(telebot.types.InlineKeyboardButton(label, callback_data=f"admin_view_{tid}"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_admin"))
+    try:
+        bot.edit_message_text("📋 <b>Открытые тикеты:</b>", chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode='HTML', reply_markup=markup)
+    except Exception:
+        sent = bot.send_message(call.message.chat.id, "📋 <b>Открытые тикеты:</b>", parse_mode='HTML', reply_markup=markup)
+        remember(call.message.chat.id, sent.message_id)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_view_"))
+def admin_view_ticket(call):
+    if call.message.chat.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "❌ Доступ запрещён.")
+        return
+    ticket_id = int(call.data.replace("admin_view_", ""))
+    ticket = get_ticket(ticket_id)
+    if not ticket:
+        bot.answer_callback_query(call.id, "Тикет не найден.")
+        return
+    tid, uid, uname, msg, photo, status = ticket
+    text = f"📋 <b>Тикет #{tid}</b>\n👤 {uname} (ID: {uid})\n\n💬 {escape_html(msg)}"
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("✍️ Ответить", callback_data=f"admin_reply_{tid}"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="admin_tickets"))
+    try:
+        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode='HTML', reply_markup=markup)
+    except Exception:
+        sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=markup)
+        remember(call.message.chat.id, sent.message_id)
+    if photo:
+        try:
+            bot.send_photo(call.message.chat.id, photo, caption=f"Фото к тикету #{tid}")
+        except Exception:
+            pass
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_reply_"))
+def admin_reply(call):
+    if call.message.chat.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "❌ Доступ запрещён.")
+        return
+    ticket_id = int(call.data.replace("admin_reply_", ""))
+    sent = bot.send_message(call.message.chat.id, f"✍️ Напишите ответ на тикет #{ticket_id} (можно фото):", reply_markup=back_menu())
+    bot.register_next_step_handler(sent, admin_send_reply, ticket_id)
+    bot.answer_callback_query(call.id)
+
+def admin_send_reply(message, ticket_id):
+    if message.text == "⬅️ Назад":
+        back_to_main(message)
+        return
+    ticket = get_ticket(ticket_id)
+    if not ticket:
+        bot.send_message(message.chat.id, "Тикет не найден.")
+        return
+    _, uid, uname, _, _, _ = ticket
+    text = message.text if message.text else (message.caption if message.caption else "")
+    photo_id = message.photo[-1].file_id if message.photo else None
+    answer_ticket(ticket_id, text)
+    try:
+        if photo_id:
+            bot.send_photo(uid, photo_id, caption=f"💬 <b>Ответ от поддержки</b> (тикет #{ticket_id}):\n\n{text}", parse_mode='HTML')
+        else:
+            bot.send_message(uid, f"💬 <b>Ответ от поддержки</b> (тикет #{ticket_id}):\n\n{text}", parse_mode='HTML')
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Не удалось отправить: {e}")
+        return
+    try:
+        bot.delete_message(message.chat.id, message.message_id)
+    except Exception:
+        pass
+    sent = bot.send_message(message.chat.id, f"✅ Ответ отправлен по тикету #{ticket_id}.", reply_markup=admin_menu())
+    remember(message.chat.id, sent.message_id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_give")
+def admin_give(call):
+    if call.message.chat.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "❌ Доступ запрещён.")
+        return
+    sent = bot.send_message(call.message.chat.id, "💰 Введите ID пользователя и количество токенов через пробел:\nНапример: `8000630493 50`", parse_mode='Markdown', reply_markup=back_menu())
+    bot.register_next_step_handler(sent, admin_give_process)
+    bot.answer_callback_query(call.id)
+
+def admin_give_process(message):
+    if message.text == "⬅️ Назад":
+        back_to_main(message)
+        return
+    try:
+        parts = message.text.split()
+        uid = int(parts[0])
+        cnt = int(parts[1])
+        add_tokens(uid, cnt)
+        bot.send_message(message.chat.id, f"✅ Начислено {cnt} токенов пользователю {uid}.", reply_markup=admin_menu())
+        try:
+            bot.send_message(uid, f"🎁 Вам начислено <b>{cnt}</b> токенов!", parse_mode='HTML')
+        except Exception:
+            pass
+    except Exception:
+        bot.send_message(message.chat.id, "❌ Неверный формат. Введите: `ID количество`", parse_mode='Markdown', reply_markup=admin_menu())
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_users")
+def admin_users(call):
+    if call.message.chat.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "❌ Доступ запрещён.")
+        return
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT chat_id, username, tokens FROM users ORDER BY tokens DESC LIMIT 50")
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        bot.answer_callback_query(call.id, "Пользователей нет.")
+        return
+    text = "👥 <b>Пользователи (топ-50):</b>\n\n"
+    for uid, uname, tokens in rows:
+        text += f"• <code>{uid}</code> — {uname or '—'} — <b>{tokens}</b> токенов\n"
+    try:
+        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode='HTML', reply_markup=admin_menu())
+    except Exception:
+        sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=admin_menu())
+        remember(call.message.chat.id, sent.message_id)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_broadcast")
+def admin_broadcast(call):
+    if call.message.chat.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "❌ Доступ запрещён.")
+        return
+    sent = bot.send_message(call.message.chat.id, "📢 Введите текст для рассылки:", reply_markup=back_menu())
+    bot.register_next_step_handler(sent, admin_broadcast_send)
+    bot.answer_callback_query(call.id)
+
+def admin_broadcast_send(message):
+    if message.text == "⬅️ Назад":
+        back_to_main(message)
+        return
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT chat_id FROM users")
+    rows = c.fetchall()
+    conn.close()
+    sent_count = 0
+    for (uid,) in rows:
+        try:
+            bot.send_message(uid, f"📢 <b>Сообщение от администрации:</b>\n\n{escape_html(message.text)}", parse_mode='HTML')
+            sent_count += 1
+        except Exception:
+            pass
+    bot.send_message(message.chat.id, f"✅ Рассылка завершена. Отправлено: {sent_count}.", reply_markup=admin_menu())
 
 # === ЧАТ С ИИ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_chat")
@@ -533,14 +788,13 @@ def enter_chat(call):
         call.message.chat.id,
         f"🤖 <b>Вы в чате с ИИ.</b>\n💰 Баланс: {tokens} токенов.\nРежим: <b>{mode_name}</b>\n\n"
         f"Задайте вопрос или отправьте фото — 1 запрос = 1 токен.\n"
-        f"💡 Если хотите сменить режим — просто напишите «смени режим на кодера».",
+        f"💡 Если хотите сменить режим — напишите «смени режим на кодера».",
         parse_mode='HTML',
         reply_markup=mode_menu()
     )
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-# === РЕЖИМ (КНОПКА) ===
 @bot.callback_query_handler(func=lambda call: call.data.startswith("mode_"))
 def set_mode(call):
     mode = call.data.replace("mode_", "")
@@ -557,18 +811,6 @@ def set_mode(call):
         )
     except Exception:
         pass
-
-# === ПОДДЕРЖКА ===
-@bot.callback_query_handler(func=lambda call: call.data == "menu_support")
-def support(call):
-    try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
-        pass
-    clear_old_messages(call.message.chat.id)
-    sent = bot.send_message(call.message.chat.id, "🆘 Напишите: @твой_юзернейм", reply_markup=back_menu())
-    remember(call.message.chat.id, sent.message_id)
-    bot.answer_callback_query(call.id)
 
 # === GIGACHAT ===
 def get_gigachat_token():
@@ -597,10 +839,10 @@ BASE_PROMPT = (
 )
 
 SYSTEM_PROMPTS = {
-    "regular": BASE_PROMPT + "РЕЖИМ: ОБЫЧНЫЙ ИИ. Отвечай на любые вопросы. Помогай с чем угодно.",
+    "regular": BASE_PROMPT + "РЕЖИМ: ОБЫЧНЫЙ ИИ. Отвечай на любые вопросы.",
     "coder": BASE_PROMPT + "РЕЖИМ: КОДЕР. Пиши ТОЛЬКО код. Формат: ```python ... ``` + одно короткое пояснение.",
-    "explainer": BASE_PROMPT + "РЕЖИМ: ОБЪЯСНЯТОР. Объясняй сложные вещи простыми словами, с примерами.",
-    "translator": BASE_PROMPT + "РЕЖИМ: ПЕРЕВОДЧИК. Переводи тексты. Русский ↔ английский. Только перевод."
+    "explainer": BASE_PROMPT + "РЕЖИМ: ОБЪЯСНЯТОР. Объясняй сложные вещи простыми словами.",
+    "translator": BASE_PROMPT + "РЕЖИМ: ПЕРЕВОДЧИК. Переводи тексты. Русский ↔ английский."
 }
 
 def detect_mode_request(text):
@@ -609,7 +851,7 @@ def detect_mode_request(text):
         "coder": ["кодер", "программист", "code", "coder"],
         "explainer": ["объясн", "учитель", "explain"],
         "translator": ["перевод", "translate", "translator"],
-        "regular": ["обычный", "regular", "обычный ии"],
+        "regular": ["обычный", "regular"],
     }
     trigger_words = ["переключ", "стань", "режим", "смени", "включи", "сменить"]
     for key, words in mode_words.items():
@@ -623,34 +865,20 @@ def ask_gigachat(chat_id, question, mode, image_base64=None):
     if not access_token:
         return "❌ Не удалось получить доступ к ИИ."
     url = "https://api.giga.chat/v1/chat/completions"
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Authorization": f"Bearer {access_token}"
-    }
+    headers = {"Content-Type": "application/json", "Accept": "application/json", "Authorization": f"Bearer {access_token}"}
     system_prompt = SYSTEM_PROMPTS.get(mode, SYSTEM_PROMPTS["regular"])
     messages = [{"role": "system", "content": system_prompt}]
     history = get_history(chat_id, limit=20)
     for role, content in history:
         messages.append({"role": role, "content": content})
-
     if image_base64:
-        messages.append({
-            "role": "user",
-            "content": [
-                {"type": "text", "text": question if question else "Что на этой картинке?"},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
-            ]
-        })
+        messages.append({"role": "user", "content": [
+            {"type": "text", "text": question if question else "Что на этой картинке?"},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
+        ]})
     else:
         messages.append({"role": "user", "content": question})
-
-    data = {
-        "model": "GigaChat-3-Ultra",
-        "messages": messages,
-        "temperature": 0.7,
-        "max_tokens": 2000
-    }
+    data = {"model": "GigaChat-3-Ultra", "messages": messages, "temperature": 0.7, "max_tokens": 2000}
     try:
         r = requests.post(url, headers=headers, json=data, verify=False, timeout=90)
         result = r.json()
@@ -663,9 +891,9 @@ def ask_gigachat(chat_id, question, mode, image_base64=None):
     except Exception as e:
         return f"❌ Ошибка: {e}"
 
-# === СООБЩЕНИЯ В ЧАТЕ ===
 @bot.message_handler(content_types=['text', 'photo'])
 def handle_message(message):
+    # === ЕСЛИ ЭТО АДМИН И ОН ОТВЕЧАЕТ НА ТИКЕТ — игнорируем (обрабатывается через next_step) ===
     tokens, state, mode, _, _, _, _, _, _ = get_user(message.chat.id)
     if state != 'chat':
         return
@@ -682,7 +910,6 @@ def handle_message(message):
         remember(message.chat.id, sent.message_id)
         return
 
-    # === СМЕНА РЕЖИМА + ОТВЕТ В ОДНОМ СООБЩЕНИИ ===
     prefix = ""
     if message.text:
         new_mode = detect_mode_request(message.text)
@@ -697,10 +924,7 @@ def handle_message(message):
                     idx = text.lower().find(phrase)
                     rest = text[idx + len(phrase):]
                     parts = rest.split(" ", 1)
-                    if len(parts) > 1:
-                        text = parts[1]
-                    else:
-                        text = ""
+                    text = parts[1] if len(parts) > 1 else ""
                     break
             message.text = text if text else "Привет"
 
@@ -733,35 +957,16 @@ def handle_message(message):
             copy_btn = telebot.types.InlineKeyboardButton(text="📋 Скопировать код", copy_text=clean_code)
             markup = telebot.types.InlineKeyboardMarkup()
             markup.add(copy_btn)
-            markup.add(telebot.types.InlineKeyboardButton("⚙️ Настройки", callback_data="settings_from_chat"))
             markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
-            sent = bot.send_message(
-                message.chat.id,
-                f"<pre><code>{safe_code}</code></pre>\n\n──────────\n💰 Осталось: {tokens_left}",
-                parse_mode='HTML',
-                reply_markup=markup
-            )
+            sent = bot.send_message(message.chat.id, f"<pre><code>{safe_code}</code></pre>\n\n──────────\n💰 Осталось: {tokens_left}", parse_mode='HTML', reply_markup=markup)
         except Exception:
-            sent = bot.send_message(
-                message.chat.id,
-                f"{full_answer}\n\n──────────\n💰 Осталось: {tokens_left}",
-                reply_markup=mode_menu()
-            )
+            sent = bot.send_message(message.chat.id, f"{full_answer}\n\n──────────\n💰 Осталось: {tokens_left}", reply_markup=mode_menu())
     else:
         safe_answer = escape_html(full_answer)
         try:
-            sent = bot.send_message(
-                message.chat.id,
-                f"{safe_answer}\n\n──────────\n💰 Осталось: {tokens_left}",
-                parse_mode='HTML',
-                reply_markup=mode_menu()
-            )
+            sent = bot.send_message(message.chat.id, f"{safe_answer}\n\n──────────\n💰 Осталось: {tokens_left}", parse_mode='HTML', reply_markup=mode_menu())
         except Exception:
-            sent = bot.send_message(
-                message.chat.id,
-                f"{full_answer}\n\n──────────\n💰 Осталось: {tokens_left}",
-                reply_markup=mode_menu()
-            )
+            sent = bot.send_message(message.chat.id, f"{full_answer}\n\n──────────\n💰 Осталось: {tokens_left}", reply_markup=mode_menu())
     remember(message.chat.id, sent.message_id)
 
 # === СТРАНИЦА ОПЛАТЫ ===
@@ -814,7 +1019,7 @@ def yoomoney_webhook():
             chat_id,
             f"✅ <b>Оплата прошла!</b>\n\n🧾 Счёт: <code>{label}</code>\n💰 Сумма: {real_amount} ₽\n🎫 Токенов: <b>{tokens}</b>\n💎 Баланс: <b>{new_balance}</b>",
             parse_mode='HTML',
-            reply_markup=main_menu()
+            reply_markup=main_menu(chat_id)
         )
         remember(chat_id, sent.message_id)
     return jsonify({"status": "ok"}), 200
