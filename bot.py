@@ -182,10 +182,16 @@ def back_menu():
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
     return markup
 
-def send_main_menu(chat_id):
+def send_main_menu(chat_id, edit_message_id=None):
     tokens, _, _ = get_user(chat_id)
     update_state(chat_id, 'idle')
     text = f"👋 <b>Главное меню</b>\n💰 Токенов: <b>{tokens}</b>\n────────────────\nВыбери действие:"
+    if edit_message_id:
+        try:
+            bot.edit_message_text(text, chat_id=chat_id, message_id=edit_message_id, parse_mode='HTML', reply_markup=main_menu())
+            return
+        except Exception:
+            pass
     sent = bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=main_menu())
     remember(chat_id, sent.message_id)
 
@@ -200,30 +206,28 @@ def start(message):
     clear_old_messages(message.chat.id)
     send_main_menu(message.chat.id)
 
-# === НАЗАД ===
+# === НАЗАД (редактируем сообщение) ===
 @bot.callback_query_handler(func=lambda call: call.data in ["menu_main", "menu_chat"])
 def back_to_main(call):
     log_to_file(f"BACK: {call.data}")
     update_state(call.message.chat.id, 'idle')
-    try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
-        pass
-    clear_old_messages(call.message.chat.id)
-    send_main_menu(call.message.chat.id)
+    send_main_menu(call.message.chat.id, edit_message_id=call.message.message_id)
     bot.answer_callback_query(call.id)
 
-# === КУПИТЬ ===
+# === КУПИТЬ (редактируем сообщение) ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_buy")
 def buy_tokens(call):
     log_to_file("BUY")
     try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
-        pass
-    clear_old_messages(call.message.chat.id)
-    sent = bot.send_message(call.message.chat.id, "💳 <b>Покупка токенов</b>\n────────────────\nВыбери пакет:", parse_mode='HTML', reply_markup=buy_menu())
-    remember(call.message.chat.id, sent.message_id)
+        bot.edit_message_text(
+            "💳 <b>Покупка токенов</b>\n────────────────\nВыбери пакет:",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode='HTML',
+            reply_markup=buy_menu()
+        )
+    except Exception as e:
+        log_to_file(f"BUY EDIT ERROR: {e}")
     bot.answer_callback_query(call.id)
 
 # === ПАКЕТЫ ===
@@ -233,10 +237,6 @@ def pack_selected(call):
     parts = call.data.split("_")
     amount = int(parts[1])
     tokens = int(parts[2])
-    try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
-        pass
     clear_old_messages(call.message.chat.id)
     create_invoice(call.message.chat.id, amount, tokens)
     bot.answer_callback_query(call.id)
@@ -246,11 +246,6 @@ def pack_selected(call):
 def custom_amount(call):
     log_to_file("CUSTOM")
     bot.answer_callback_query(call.id)
-    try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
-        pass
-    clear_old_messages(call.message.chat.id)
     sent = bot.send_message(call.message.chat.id, "✏️ Введи количество токенов (минимум 20):", reply_markup=back_menu())
     remember(call.message.chat.id, sent.message_id)
     bot.register_next_step_handler(sent, custom_tokens)
@@ -292,33 +287,38 @@ def create_invoice(chat_id, amount, tokens):
     )
     remember(chat_id, sent.message_id)
 
-# === БАЛАНС ===
+# === БАЛАНС (редактируем сообщение) ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_balance")
 def show_balance(call):
     log_to_file("BALANCE")
-    try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
-        pass
-    clear_old_messages(call.message.chat.id)
     tokens, _, _ = get_user(call.message.chat.id)
-    sent = bot.send_message(call.message.chat.id, f"💰 <b>Ваш баланс:</b> {tokens} токенов", parse_mode='HTML', reply_markup=back_menu())
-    remember(call.message.chat.id, sent.message_id)
+    try:
+        bot.edit_message_text(
+            f"💰 <b>Ваш баланс:</b> {tokens} токенов",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode='HTML',
+            reply_markup=back_menu()
+        )
+    except Exception as e:
+        log_to_file(f"BALANCE EDIT ERROR: {e}")
     bot.answer_callback_query(call.id)
 
-# === ИСТОРИЯ ===
+# === ИСТОРИЯ (редактируем сообщение) ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_history")
 def show_history(call):
     log_to_file("HISTORY")
-    try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
-        pass
-    clear_old_messages(call.message.chat.id)
     history = get_history(call.message.chat.id, limit=50)
     if not history:
-        sent = bot.send_message(call.message.chat.id, "📜 История чата пуста.", reply_markup=back_menu())
-        remember(call.message.chat.id, sent.message_id)
+        try:
+            bot.edit_message_text(
+                "📜 История чата пуста.",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=back_menu()
+            )
+        except Exception:
+            pass
         bot.answer_callback_query(call.id)
         return
     text = "📜 <b>Ваша история чата:</b>\n\n"
@@ -329,50 +329,49 @@ def show_history(call):
         text += f"{prefix}: {safe_short}\n\n"
     if len(text) > 4000:
         text = text[:4000] + "\n\n...и другие сообщения"
-    sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=back_menu())
-    remember(call.message.chat.id, sent.message_id)
+    try:
+        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode='HTML', reply_markup=back_menu())
+    except Exception as e:
+        log_to_file(f"HISTORY EDIT ERROR: {e}")
     bot.answer_callback_query(call.id)
 
-# === ЧАТ С ИИ (С ОТЛАДКОЙ) ===
+# === ЧАТ С ИИ (РЕДАКТИРУЕМ СООБЩЕНИЕ, НЕ УДАЛЯЕМ) ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_chat")
 def enter_chat(call):
-    log_to_file(f"CHAT PRESSED: chat_id={call.message.chat.id}")
-    try:
-        tokens, _, mode = get_user(call.message.chat.id)
-        log_to_file(f"CHAT: tokens={tokens}, mode={mode}")
+    log_to_file(f"CHAT PRESSED: {call.message.chat.id}")
+    tokens, _, mode = get_user(call.message.chat.id)
+    log_to_file(f"CHAT: tokens={tokens}, mode={mode}")
+    if tokens < 1:
         try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
+            bot.edit_message_text(
+                "❌ У вас нет токенов. Купите токены, чтобы использовать ИИ.",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=telebot.types.InlineKeyboardMarkup().add(
+                    telebot.types.InlineKeyboardButton("💳 Купить токены", callback_data="menu_buy"),
+                    telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main")
+                )
+            )
         except Exception as e:
-            log_to_file(f"CHAT DELETE ERROR: {e}")
-        clear_old_messages(call.message.chat.id)
-        if tokens < 1:
-            markup = telebot.types.InlineKeyboardMarkup()
-            markup.add(telebot.types.InlineKeyboardButton("💳 Купить токены", callback_data="menu_buy"))
-            markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
-            sent = bot.send_message(call.message.chat.id, "❌ У вас нет токенов.", reply_markup=markup)
-            remember(call.message.chat.id, sent.message_id)
-            bot.answer_callback_query(call.id)
-            log_to_file("CHAT: NO TOKENS")
-            return
-        update_state(call.message.chat.id, 'chat')
-        mode_name = {"coder": "💻 Кодер", "explainer": "📖 Объяснятор", "translator": "🌍 Переводчик"}.get(mode, "💻 Кодер")
-        sent = bot.send_message(
-            call.message.chat.id,
+            log_to_file(f"CHAT NO-TOKENS ERROR: {e}")
+        bot.answer_callback_query(call.id)
+        return
+    update_state(call.message.chat.id, 'chat')
+    mode_name = {"coder": "💻 Кодер", "explainer": "📖 Объяснятор", "translator": "🌍 Переводчик"}.get(mode, "💻 Кодер")
+    try:
+        bot.edit_message_text(
             f"🤖 <b>Привет, я Боб!</b>\n💰 Баланс: {tokens} токенов.\nРежим: <b>{mode_name}</b>\n\n"
             f"Задайте вопрос — 1 запрос = 1 токен.\n"
             f"💡 Если хотите сменить режим — просто напишите «переключись на кодера» или «стань переводчиком».",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
             parse_mode='HTML',
             reply_markup=mode_menu()
         )
-        remember(call.message.chat.id, sent.message_id)
-        bot.answer_callback_query(call.id)
         log_to_file("CHAT: SUCCESS")
     except Exception as e:
-        log_to_file(f"CHAT ERROR: {e}")
-        try:
-            bot.answer_callback_query(call.id, f"Ошибка: {e}")
-        except Exception:
-            pass
+        log_to_file(f"CHAT EDIT ERROR: {e}")
+    bot.answer_callback_query(call.id)
 
 # === РЕЖИМ ===
 @bot.callback_query_handler(func=lambda call: call.data.startswith("mode_"))
@@ -393,17 +392,19 @@ def set_mode(call):
     except Exception:
         pass
 
-# === ПОДДЕРЖКА ===
+# === ПОДДЕРЖКА (редактируем) ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_support")
 def support(call):
     log_to_file("SUPPORT")
     try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
+        bot.edit_message_text(
+            "🆘 Напишите: @твой_юзернейм",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=back_menu()
+        )
     except Exception:
         pass
-    clear_old_messages(call.message.chat.id)
-    sent = bot.send_message(call.message.chat.id, "🆘 Напишите: @твой_юзернейм", reply_markup=back_menu())
-    remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
 # === GIGACHAT ===
@@ -433,27 +434,24 @@ BASE_PROMPT = (
     "1. 💻 КОДЕР — пишешь только код на Python.\n"
     "2. 📖 ОБЪЯСНЯТОР — объясняешь сложные вещи простыми словами.\n"
     "3. 🌍 ПЕРЕВОДЧИК — переводишь тексты (русский ↔ английский).\n\n"
-    "Если пользователь просит переключить режим — ты должен ответить: "
-    "'✅ Переключаюсь на режим [название].' И дальше отвечать в этом режиме.\n\n"
+    "Если пользователь просит переключить режим — ответь: '✅ Переключаюсь на режим [название].'\n\n"
 )
 
 SYSTEM_PROMPTS = {
     "coder": BASE_PROMPT + (
         "ТЕКУЩИЙ РЕЖИМ: 💻 КОДЕР.\n"
-        "Ты пишешь ТОЛЬКО код на Python. Формат ответа: сначала блок ```python ... ```, "
-        "потом одно короткое предложение пояснения (не больше 2 строк). "
-        "Никаких 'Конечно!', 'Вот ваш код:', 'Надеюсь, это поможет'. Только код и краткое пояснение."
+        "Ты пишешь ТОЛЬКО код на Python. Формат: сначала блок ```python ... ```, "
+        "потом одно короткое предложение пояснения. Никаких 'Конечно!'. Только код."
     ),
     "explainer": BASE_PROMPT + (
         "ТЕКУЩИЙ РЕЖИМ: 📖 ОБЪЯСНЯТОР.\n"
         "Ты объясняешь сложные вещи простыми словами. Приводишь примеры из жизни. "
-        "Пиши дружелюбно, но без воды. Не используй сложные термины без объяснения. "
-        "Старайся отвечать структурированно: сначала краткий ответ, потом пояснение."
+        "Пиши дружелюбно, но без воды."
     ),
     "translator": BASE_PROMPT + (
         "ТЕКУЩИЙ РЕЖИМ: 🌍 ПЕРЕВОДЧИК.\n"
         "Ты переводишь тексты. Если пользователь пишет на русском — переводи на английский. "
-        "Если на английском — переводи на русский. Отвечай ТОЛЬКО переводом, без пояснений."
+        "Если на английском — переводи на русский. Отвечай ТОЛЬКО переводом."
     )
 }
 
