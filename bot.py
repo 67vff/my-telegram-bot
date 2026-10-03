@@ -271,7 +271,7 @@ def clear_old_messages(chat_id):
 def remember(chat_id, msg_id):
     last_messages.setdefault(chat_id, []).append(msg_id)
 
-# === "ПЕЧАТАЕТ" (интервал 2 сек) ===
+# === "ПЕЧАТАЕТ" ===
 def start_typing(chat_id):
     stop = threading.Event()
     def loop():
@@ -1287,13 +1287,32 @@ AI_MODE_PROMPTS = {
 
 def detect_mode_request(text):
     text_lower = text.lower()
-    if ("кодер" in text_lower or "coder" in text_lower) and any(w in text_lower for w in ["переключ", "стань", "смени", "включи", "сменить"]):
-        return "coder"
-    if ("объясн" in text_lower) and any(w in text_lower for w in ["переключ", "стань", "смени", "включи", "сменить"]):
-        return "explainer"
-    if ("перевод" in text_lower or "translate" in text_lower) and any(w in text_lower for w in ["переключ", "стань", "смени", "включи", "сменить"]):
-        return "translator"
-    return None
+    mode = None
+    ai_mode = None
+
+    trigger_words = ["переключ", "стань", "смени", "включи", "сменить", "переключи", "переведи"]
+    has_trigger = any(w in text_lower for w in trigger_words)
+
+    if has_trigger:
+        if "кодер" in text_lower or "coder" in text_lower:
+            mode = "coder"
+        elif "объясн" in text_lower:
+            mode = "explainer"
+        elif "перевод" in text_lower or "translate" in text_lower:
+            mode = "translator"
+        elif "обычн" in text_lower and "режим" in text_lower:
+            mode = "regular"
+
+        if "без цензуры" in text_lower or "без цензур" in text_lower:
+            ai_mode = "uncensored"
+        elif "откровенн" in text_lower:
+            ai_mode = "open"
+        elif "умн" in text_lower:
+            ai_mode = "smart"
+        elif "обычн" in text_lower and "поведен" in text_lower:
+            ai_mode = "regular"
+
+    return mode, ai_mode
 
 def ask_gigachat(chat_id, question, mode, ai_mode):
     access_token = get_gigachat_token()
@@ -1367,14 +1386,21 @@ def handle_message(message):
         return
 
     prefix = ""
-    new_mode = detect_mode_request(message.text)
-    if new_mode:
-        update_user(message.chat.id, 'mode', new_mode)
-        mode = new_mode
-        mode_name = {"regular": "🤖 Обычный ИИ", "coder": "💻 Кодер", "explainer": "📖 Объяснятор", "translator": "🌍 Переводчик"}.get(new_mode, "🤖 Обычный ИИ")
-        prefix = f"✅ <b>Переключился на режим {mode_name}.</b>\n\n"
+    new_mode, new_ai_mode = detect_mode_request(message.text)
+    if new_mode or new_ai_mode:
+        if new_mode:
+            update_user(message.chat.id, 'mode', new_mode)
+            mode = new_mode
+        if new_ai_mode:
+            update_user(message.chat.id, 'ai_mode', new_ai_mode)
+            ai_mode = new_ai_mode
+
+        mode_name = {"regular": "🤖 Обычный ИИ", "coder": "💻 Кодер", "explainer": "📖 Объяснятор", "translator": "🌍 Переводчик"}.get(mode, "🤖 Обычный ИИ")
+        ai_name = {"regular": "🤖 Обычный", "smart": "🧠 Умный", "open": "💬 Откровенный", "uncensored": "🔥 Без цензуры"}.get(ai_mode, "🤖 Обычный")
+        prefix = f"✅ <b>Переключился.</b>\nРежим: <b>{mode_name}</b>\nПоведение: <b>{ai_name}</b>\n\n"
+
         text = message.text
-        for phrase in ["переключись на режим ", "переключись на ", "смени режим на ", "смени на ", "стань ", "включи режим "]:
+        for phrase in ["переключись на режим ", "переключи режим ", "переключись на ", "смени режим на ", "смени на ", "стань ", "включи режим "]:
             if phrase in text.lower():
                 idx = text.lower().find(phrase)
                 rest = text[idx + len(phrase):]
@@ -1386,7 +1412,7 @@ def handle_message(message):
                 else:
                     text = ""
                 break
-        message.text = text if text.strip() else "Напиши пример кода"
+        message.text = text if text.strip() else "Привет"
 
     try:
         bot.delete_message(message.chat.id, message.message_id)
@@ -1423,34 +1449,89 @@ def handle_message(message):
         code_text = "\n\n".join(code_parts)
 
     if is_code and code_text:
-        safe_code = escape_html(code_text)
-        try:
-            sent = bot.send_message(
-                message.chat.id,
-                f"{prefix}<pre><code>{safe_code}</code></pre>\n\n──────────\n💰 Осталось: {tokens_left}",
-                parse_mode='HTML'
-            )
-        except Exception:
-            sent = bot.send_message(
-                message.chat.id,
-                f"{prefix}{code_text}\n\n──────────\n💰 Осталось: {tokens_left}"
-            )
+        if len(code_text) > 3500:
+            try:
+                filename = f"script_{int(time.time())}.txt"
+                with open(f"/tmp/{filename}", "w", encoding="utf-8") as f:
+                    f.write(code_text)
+                with open(f"/tmp/{filename}", "rb") as f:
+                    sent = bot.send_document(
+                        message.chat.id,
+                        f,
+                        caption=f"{prefix}📄 Код во вложении",
+                        parse_mode='HTML'
+                    )
+                remember(message.chat.id, sent.message_id)
+                try:
+                    os.remove(f"/tmp/{filename}")
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"FILE SEND ERROR: {e}")
+                sent = bot.send_message(message.chat.id, f"{prefix}❌ Не удалось отправить файл.", parse_mode='HTML')
+                remember(message.chat.id, sent.message_id)
+            sent = bot.send_message(message.chat.id, f"──────────\n💰 Осталось: {tokens_left}", reply_markup=chat_menu())
+            remember(message.chat.id, sent.message_id)
+        else:
+            safe_code = escape_html(code_text)
+            try:
+                sent = bot.send_message(
+                    message.chat.id,
+                    f"{prefix}<pre><code>{safe_code}</code></pre>\n\n──────────\n💰 Осталось: {tokens_left}",
+                    parse_mode='HTML',
+                    reply_markup=chat_menu()
+                )
+            except Exception:
+                sent = bot.send_message(
+                    message.chat.id,
+                    f"{prefix}{code_text}\n\n──────────\n💰 Осталось: {tokens_left}",
+                    reply_markup=chat_menu()
+                )
+            remember(message.chat.id, sent.message_id)
     else:
-        safe_answer = escape_html(full_answer)
-        try:
-            sent = bot.send_message(
-                message.chat.id,
-                f"{safe_answer}\n\n──────────\n💰 Осталось: {tokens_left}",
-                parse_mode='HTML',
-                reply_markup=chat_menu()
-            )
-        except Exception:
-            sent = bot.send_message(
-                message.chat.id,
-                f"{full_answer}\n\n──────────\n💰 Осталось: {tokens_left}",
-                reply_markup=chat_menu()
-            )
-    remember(message.chat.id, sent.message_id)
+        if len(full_answer) > 4000:
+            def split_text(text, size=4000):
+                parts = []
+                current = ""
+                for line in text.split("\n"):
+                    if len(current) + len(line) + 1 > size:
+                        parts.append(current)
+                        current = line + "\n"
+                    else:
+                        current += line + "\n"
+                if current.strip():
+                    parts.append(current)
+                return parts
+            text_chunks = split_text(full_answer, 4000)
+            for idx, chunk in enumerate(text_chunks):
+                safe_chunk = escape_html(chunk)
+                if idx == len(text_chunks) - 1:
+                    try:
+                        sent = bot.send_message(message.chat.id, f"{safe_chunk}\n\n──────────\n💰 Осталось: {tokens_left}", parse_mode='HTML', reply_markup=chat_menu())
+                    except Exception:
+                        sent = bot.send_message(message.chat.id, f"{chunk}\n\n──────────\n💰 Осталось: {tokens_left}", reply_markup=chat_menu())
+                else:
+                    try:
+                        sent = bot.send_message(message.chat.id, safe_chunk, parse_mode='HTML')
+                    except Exception:
+                        sent = bot.send_message(message.chat.id, chunk)
+                remember(message.chat.id, sent.message_id)
+        else:
+            safe_answer = escape_html(full_answer)
+            try:
+                sent = bot.send_message(
+                    message.chat.id,
+                    f"{safe_answer}\n\n──────────\n💰 Осталось: {tokens_left}",
+                    parse_mode='HTML',
+                    reply_markup=chat_menu()
+                )
+            except Exception:
+                sent = bot.send_message(
+                    message.chat.id,
+                    f"{full_answer}\n\n──────────\n💰 Осталось: {tokens_left}",
+                    reply_markup=chat_menu()
+                )
+            remember(message.chat.id, sent.message_id)
 
 # === СТРАНИЦА ОПЛАТЫ ===
 @app.route('/pay/<amount>/<label>')
