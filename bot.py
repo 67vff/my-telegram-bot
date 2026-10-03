@@ -510,7 +510,7 @@ def yoomoney_webhook():
     received_sign = data.pop('sign', '')
 
     if received_sign:
-        # Новый формат: HMAC-SHA256 (кодируем ТОЛЬКО значения)
+        # Новый формат: HMAC-SHA256 (согласно документации ЮMoney [citation:17])
         sorted_items = sorted(data.items())
         check_string = '&'.join(f"{k}={urllib.parse.quote_plus(str(v))}" for k, v in sorted_items)
         calculated_sign = hmac.new(
@@ -521,7 +521,7 @@ def yoomoney_webhook():
         if not hmac.compare_digest(calculated_sign, received_sign):
             return jsonify({"status": "error", "message": "Invalid sign"}), 403
     else:
-        # Старый формат: sha1_hash
+        # Старый формат: sha1_hash (устареет с 18 мая 2026) [citation:11]
         received_hash = data.pop('sha1_hash', '')
         if received_hash:
             check_string = '&'.join([f"{k}={v}" for k, v in sorted(data.items())]) + YOOMONEY_SECRET
