@@ -484,6 +484,7 @@ def handle_message(message):
             sent = bot.send_message(message.chat.id, f"{answer}\n\n──────────\n💰 Осталось: {tokens_left}", reply_markup=mode_menu())
         remember(message.chat.id, sent.message_id)
 
+# === СТРАНИЦА ОПЛАТЫ (КАК В СТАРОМ РАБОЧЕМ ВАРИАНТЕ) ===
 @app.route('/pay/<amount>/<label>')
 def pay_page(amount, label):
     html = f'''
@@ -502,22 +503,25 @@ def pay_page(amount, label):
     '''
     return html
 
-# === ВЕБХУК С ПРАВИЛЬНОЙ ПРОВЕРКОЙ ПОДПИСИ sign ===
+# === ВЕБХУК С ПОДДЕРЖКОЙ sign И sha1_hash ===
 @app.route('/webhook', methods=['POST'])
 def yoomoney_webhook():
     data = request.form.to_dict()
     received_sign = data.pop('sign', '')
 
     if received_sign:
-        # Сортировка по алфавиту и URL-кодирование (RFC 3986)
+        # Новый формат: HMAC-SHA256 (кодируем ТОЛЬКО значения)
         sorted_items = sorted(data.items())
-        check_string = '&'.join(f"{k}={urllib.parse.quote(str(v), safe='')}" for k, v in sorted_items)
-        # HMAC-SHA256
-        calculated_sign = hmac.new(YOOMONEY_SECRET.encode('utf-8'), check_string.encode('utf-8'), sha256).hexdigest()
+        check_string = '&'.join(f"{k}={urllib.parse.quote_plus(str(v))}" for k, v in sorted_items)
+        calculated_sign = hmac.new(
+            YOOMONEY_SECRET.encode('utf-8'),
+            check_string.encode('utf-8'),
+            sha256
+        ).hexdigest()
         if not hmac.compare_digest(calculated_sign, received_sign):
             return jsonify({"status": "error", "message": "Invalid sign"}), 403
     else:
-        # Старый sha1_hash на переходный период
+        # Старый формат: sha1_hash
         received_hash = data.pop('sha1_hash', '')
         if received_hash:
             check_string = '&'.join([f"{k}={v}" for k, v in sorted(data.items())]) + YOOMONEY_SECRET
@@ -541,6 +545,7 @@ def yoomoney_webhook():
         remember(chat_id, sent.message_id)
     return jsonify({"status": "ok"}), 200
 
+# === ЗАПУСК ===
 def run_flask():
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 3000)))
 
