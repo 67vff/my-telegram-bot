@@ -20,6 +20,11 @@ app = Flask(__name__)
 
 DB_PATH = "/app/data/users.db"
 
+# === ЭКРАНИРОВАНИЕ HTML ===
+def escape_html(text):
+    """Заменяет спецсимволы, чтобы Telegram не пытался парсить их как HTML"""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 # === БАЗА ДАННЫХ ===
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -42,7 +47,6 @@ def init_db():
         content TEXT
     )''')
     conn.commit()
-    # Миграция: добавляем mode, если её нет
     try:
         c.execute("ALTER TABLE users ADD COLUMN mode TEXT DEFAULT 'coder'")
         conn.commit()
@@ -314,7 +318,8 @@ def show_history(call):
     for role, content in history:
         prefix = "👤 Вы" if role == "user" else "🤖 Боб"
         short = content[:100] + "..." if len(content) > 100 else content
-        text += f"{prefix}: {short}\n\n"
+        safe_short = escape_html(short)
+        text += f"{prefix}: {safe_short}\n\n"
     if len(text) > 4000:
         text = text[:4000] + "\n\n...и другие сообщения"
     sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=back_menu())
@@ -390,7 +395,7 @@ def get_gigachat_token():
         "Content-Type": "application/x-www-form-urlencoded",
         "Accept": "application/json",
         "RqUID": str(uuid.uuid4()),
-        "Authorization": f"Basic {GIGACHAT_AUTH_KEY}"  # ← ИСПРАВЛЕНО: Basic вместо Bearer
+        "Authorization": f"Basic {GIGACHAT_AUTH_KEY}"
     }
     data = {"scope": "GIGACHAT_API_PERS"}
     try:
@@ -400,7 +405,6 @@ def get_gigachat_token():
         print(f"Ошибка GigaChat: {e}")
         return None
 
-# === УСИЛЕННЫЕ ПРОМПТЫ ===
 BASE_PROMPT = (
     "Тебя зовут Боб. Ты — дружелюбный ИИ-помощник. "
     "Если тебя спросят 'какая ты модель', 'кто ты', 'что ты за ИИ' — отвечай: "
@@ -460,7 +464,7 @@ def ask_gigachat(chat_id, question, mode):
     except Exception as e:
         return f"❌ Ошибка: {e}"
 
-# === СООБЩЕНИЯ В ЧАТЕ ===
+# === СООБЩЕНИЯ В ЧАТЕ (С ЭКРАНИРОВАНИЕМ HTML) ===
 @bot.message_handler(func=lambda m: True)
 def handle_message(message):
     tokens, state, mode = get_user(message.chat.id)
@@ -485,7 +489,6 @@ def handle_message(message):
 
     add_tokens(message.chat.id, -1)
 
-    # === ПОСТОЯННЫЙ СТАТУС "ПЕЧАТАЕТ" ===
     stop_typing = threading.Event()
 
     def keep_typing():
@@ -506,7 +509,6 @@ def handle_message(message):
     stop_typing.set()
     typing_thread.join(timeout=2)
 
-    # === ОТПРАВКА КОДА ===
     if "```" in answer:
         parts = answer.split("```")
         for i, part in enumerate(parts):
@@ -515,23 +517,29 @@ def handle_message(message):
                 continue
             if i % 2 == 1:
                 clean_code = part.replace("python", "", 1).strip()
+                safe_code = escape_html(clean_code)
                 try:
                     copy_btn = telebot.types.InlineKeyboardButton(text="📋 Скопировать код", copy_text=clean_code)
                     markup = telebot.types.InlineKeyboardMarkup()
                     markup.add(copy_btn)
                     sent = bot.send_message(
                         message.chat.id,
-                        f"<pre><code>{clean_code}</code></pre>",
+                        f"<pre><code>{safe_code}</code></pre>",
                         parse_mode='HTML',
                         reply_markup=markup
                     )
                     remember(message.chat.id, sent.message_id)
                 except Exception:
-                    sent = bot.send_message(message.chat.id, f"<pre><code>{clean_code}</code></pre>", parse_mode='HTML')
+                    sent = bot.send_message(message.chat.id, clean_code)
                     remember(message.chat.id, sent.message_id)
             else:
-                sent = bot.send_message(message.chat.id, part)
+                safe_text = escape_html(part)
+                try:
+                    sent = bot.send_message(message.chat.id, safe_text, parse_mode='HTML')
+                except Exception:
+                    sent = bot.send_message(message.chat.id, part)
                 remember(message.chat.id, sent.message_id)
+
         sent = bot.send_message(
             message.chat.id,
             f"──────────\n💰 Осталось: {tokens_left}",
@@ -539,11 +547,20 @@ def handle_message(message):
         )
         remember(message.chat.id, sent.message_id)
     else:
-        sent = bot.send_message(
-            message.chat.id,
-            f"{answer}\n\n──────────\n💰 Осталось: {tokens_left}",
-            reply_markup=mode_menu()
-        )
+        safe_answer = escape_html(answer)
+        try:
+            sent = bot.send_message(
+                message.chat.id,
+                f"{safe_answer}\n\n──────────\n💰 Осталось: {tokens_left}",
+                parse_mode='HTML',
+                reply_markup=mode_menu()
+            )
+        except Exception:
+            sent = bot.send_message(
+                message.chat.id,
+                f"{answer}\n\n──────────\n💰 Осталось: {tokens_left}",
+                reply_markup=mode_menu()
+            )
         remember(message.chat.id, sent.message_id)
 
 # === СТРАНИЦА ОПЛАТЫ ===
