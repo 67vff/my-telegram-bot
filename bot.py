@@ -42,6 +42,12 @@ def init_db():
         content TEXT
     )''')
     conn.commit()
+    # Миграция: добавляем mode, если её нет
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN mode TEXT DEFAULT 'coder'")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
     conn.close()
 
 init_db()
@@ -152,12 +158,11 @@ def buy_menu():
     return markup
 
 def mode_menu():
-    """Кнопки выбора режима ИИ"""
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("💻 Кодер", callback_data="mode_coder"))
     markup.add(telebot.types.InlineKeyboardButton("📖 Объяснятор", callback_data="mode_explainer"))
     markup.add(telebot.types.InlineKeyboardButton("🌍 Переводчик", callback_data="mode_translator"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_chat"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
     return markup
 
 def back_menu():
@@ -188,8 +193,9 @@ def start(message):
     send_main_menu(message.chat.id)
 
 # === НАЗАД ===
-@bot.callback_query_handler(func=lambda call: call.data == "menu_main")
+@bot.callback_query_handler(func=lambda call: call.data in ["menu_main", "menu_chat"])
 def back_to_main(call):
+    update_state(call.message.chat.id, 'idle')
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
     except Exception:
@@ -306,7 +312,7 @@ def show_history(call):
         return
     text = "📜 <b>Ваша история чата:</b>\n\n"
     for role, content in history:
-        prefix = "👤 Вы" if role == "user" else "🤖 ИИ"
+        prefix = "👤 Вы" if role == "user" else "🤖 Боб"
         short = content[:100] + "..." if len(content) > 100 else content
         text += f"{prefix}: {short}\n\n"
     if len(text) > 4000:
@@ -336,10 +342,9 @@ def enter_chat(call):
     mode_name = {"coder": "💻 Кодер", "explainer": "📖 Объяснятор", "translator": "🌍 Переводчик"}.get(mode, "💻 Кодер")
     sent = bot.send_message(
         call.message.chat.id,
-        f"🤖 <b>Вы в чате с ИИ.</b>\n💰 Баланс: {tokens} токенов.\n"
+        f"🤖 <b>Привет, я Боб!</b>\n💰 Баланс: {tokens} токенов.\n"
         f"Режим: <b>{mode_name}</b>\n\n"
-        f"Задайте вопрос — 1 запрос = 1 токен.\n"
-        f"Выберите режим:",
+        f"Задайте вопрос — 1 запрос = 1 токен.",
         parse_mode='HTML',
         reply_markup=mode_menu()
     )
@@ -355,7 +360,7 @@ def set_mode(call):
     bot.answer_callback_query(call.id, f"Режим: {mode_name}")
     try:
         bot.edit_message_text(
-            f"🤖 <b>Вы в чате с ИИ.</b>\n"
+            f"🤖 <b>Привет, я Боб!</b>\n"
             f"Режим: <b>{mode_name}</b>\n\n"
             f"Задайте вопрос.",
             chat_id=call.message.chat.id,
@@ -385,7 +390,7 @@ def get_gigachat_token():
         "Content-Type": "application/x-www-form-urlencoded",
         "Accept": "application/json",
         "RqUID": str(uuid.uuid4()),
-        "Authorization": f"Bearer {GIGACHAT_AUTH_KEY}"
+        "Authorization": f"Basic {GIGACHAT_AUTH_KEY}"  # ← ИСПРАВЛЕНО: Basic вместо Bearer
     }
     data = {"scope": "GIGACHAT_API_PERS"}
     try:
@@ -395,20 +400,30 @@ def get_gigachat_token():
         print(f"Ошибка GigaChat: {e}")
         return None
 
+# === УСИЛЕННЫЕ ПРОМПТЫ ===
+BASE_PROMPT = (
+    "Тебя зовут Боб. Ты — дружелюбный ИИ-помощник. "
+    "Если тебя спросят 'какая ты модель', 'кто ты', 'что ты за ИИ' — отвечай: "
+    "'Я Боб, твой ИИ-помощник. Помогаю с кодом, объяснениями и переводами.' "
+    "Никогда не упоминай GigaChat, Сбер, OpenAI и другие компании. Ты просто Боб. "
+)
+
 SYSTEM_PROMPTS = {
-    "coder": (
-        "Ты профессиональный программист. Пишешь чистый, рабочий код на Python. "
-        "Отвечай ТОЛЬКО кодом, без лишних объяснений. "
-        "Если нужно объяснение — пиши его после кода, коротко."
+    "coder": BASE_PROMPT + (
+        "\n\nРЕЖИМ: КОДЕР.\n"
+        "Ты пишешь ТОЛЬКО код на Python. Без приветствий, без объяснений до кода. "
+        "Формат ответа: сначала блок ```python ... ``` с кодом, потом (если нужно) одно короткое предложение пояснения. "
+        "Никаких 'Конечно!', 'Вот ваш код:', 'Надеюсь, это поможет'. Только код и краткое пояснение."
     ),
-    "explainer": (
-        "Ты терпеливый учитель. Объясняешь сложные вещи простыми словами. "
-        "Приводи примеры из жизни. Не используй сложные термины без объяснения."
+    "explainer": BASE_PROMPT + (
+        "\n\nРЕЖИМ: ОБЪЯСНЯТОР.\n"
+        "Ты объясняешь сложные вещи простыми словами. Приводишь примеры из жизни. "
+        "Пиши дружелюбно, но без воды. Не используй сложные термины без объяснения."
     ),
-    "translator": (
-        "Ты профессиональный переводчик. Переводи тексты точно и естественно. "
-        "Если пользователь пишет на русском — переводи на английский. "
-        "Если на английском — переводи на русский."
+    "translator": BASE_PROMPT + (
+        "\n\nРЕЖИМ: ПЕРЕВОДЧИК.\n"
+        "Ты переводишь тексты. Если пользователь пишет на русском — переводи на английский. "
+        "Если на английском — переводи на русский. Отвечай ТОЛЬКО переводом, без пояснений."
     )
 }
 
@@ -431,7 +446,7 @@ def ask_gigachat(chat_id, question, mode):
     data = {
         "model": "GigaChat-3-Ultra",
         "messages": messages,
-        "temperature": 0.7
+        "temperature": 0.5
     }
     try:
         r = requests.post(url, headers=headers, json=data, verify=False, timeout=60)
@@ -445,7 +460,7 @@ def ask_gigachat(chat_id, question, mode):
     except Exception as e:
         return f"❌ Ошибка: {e}"
 
-# === СООБЩЕНИЯ В ЧАТЕ (С ПОСТОЯННЫМ "ПЕЧАТАЕТ") ===
+# === СООБЩЕНИЯ В ЧАТЕ ===
 @bot.message_handler(func=lambda m: True)
 def handle_message(message):
     tokens, state, mode = get_user(message.chat.id)
@@ -479,7 +494,7 @@ def handle_message(message):
                 bot.send_chat_action(message.chat.id, 'typing')
             except Exception:
                 pass
-            stop_typing.wait(4)
+            stop_typing.wait(3)
 
     typing_thread = threading.Thread(target=keep_typing)
     typing_thread.daemon = True
@@ -488,9 +503,8 @@ def handle_message(message):
     answer = ask_gigachat(message.chat.id, message.text, mode)
     tokens_left, _, _ = get_user(message.chat.id)
 
-    # === ОСТАНАВЛИВАЕМ "ПЕЧАТАЕТ" ===
     stop_typing.set()
-    typing_thread.join(timeout=1)
+    typing_thread.join(timeout=2)
 
     # === ОТПРАВКА КОДА ===
     if "```" in answer:
