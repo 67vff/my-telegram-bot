@@ -27,6 +27,13 @@ DB_PATH = "/app/data/users.db"
 def escape_html(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
+def log_to_file(text):
+    try:
+        with open("/app/data/debug.log", "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {text}\n")
+    except Exception:
+        pass
+
 # === БАЗА ДАННЫХ ===
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -185,6 +192,7 @@ def send_main_menu(chat_id):
 # === /start ===
 @bot.message_handler(commands=['start'])
 def start(message):
+    log_to_file(f"START: {message.chat.id}")
     try:
         bot.delete_message(message.chat.id, message.message_id)
     except Exception:
@@ -195,6 +203,7 @@ def start(message):
 # === НАЗАД ===
 @bot.callback_query_handler(func=lambda call: call.data in ["menu_main", "menu_chat"])
 def back_to_main(call):
+    log_to_file(f"BACK: {call.data}")
     update_state(call.message.chat.id, 'idle')
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -207,6 +216,7 @@ def back_to_main(call):
 # === КУПИТЬ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_buy")
 def buy_tokens(call):
+    log_to_file("BUY")
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
     except Exception:
@@ -219,6 +229,7 @@ def buy_tokens(call):
 # === ПАКЕТЫ ===
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pack_"))
 def pack_selected(call):
+    log_to_file(f"PACK: {call.data}")
     parts = call.data.split("_")
     amount = int(parts[1])
     tokens = int(parts[2])
@@ -233,6 +244,7 @@ def pack_selected(call):
 # === СВОЯ СУММА ===
 @bot.callback_query_handler(func=lambda call: call.data == "custom_amount")
 def custom_amount(call):
+    log_to_file("CUSTOM")
     bot.answer_callback_query(call.id)
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -283,6 +295,7 @@ def create_invoice(chat_id, amount, tokens):
 # === БАЛАНС ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_balance")
 def show_balance(call):
+    log_to_file("BALANCE")
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
     except Exception:
@@ -293,9 +306,10 @@ def show_balance(call):
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-# === ИСТОРИЯ ЧАТА ===
+# === ИСТОРИЯ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_history")
 def show_history(call):
+    log_to_file("HISTORY")
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
     except Exception:
@@ -319,39 +333,51 @@ def show_history(call):
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-# === ЧАТ С ИИ ===
+# === ЧАТ С ИИ (С ОТЛАДКОЙ) ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_chat")
 def enter_chat(call):
-    tokens, _, mode = get_user(call.message.chat.id)
+    log_to_file(f"CHAT PRESSED: chat_id={call.message.chat.id}")
     try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
-        pass
-    clear_old_messages(call.message.chat.id)
-    if tokens < 1:
-        markup = telebot.types.InlineKeyboardMarkup()
-        markup.add(telebot.types.InlineKeyboardButton("💳 Купить токены", callback_data="menu_buy"))
-        markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
-        sent = bot.send_message(call.message.chat.id, "❌ У вас нет токенов.", reply_markup=markup)
+        tokens, _, mode = get_user(call.message.chat.id)
+        log_to_file(f"CHAT: tokens={tokens}, mode={mode}")
+        try:
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+        except Exception as e:
+            log_to_file(f"CHAT DELETE ERROR: {e}")
+        clear_old_messages(call.message.chat.id)
+        if tokens < 1:
+            markup = telebot.types.InlineKeyboardMarkup()
+            markup.add(telebot.types.InlineKeyboardButton("💳 Купить токены", callback_data="menu_buy"))
+            markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
+            sent = bot.send_message(call.message.chat.id, "❌ У вас нет токенов.", reply_markup=markup)
+            remember(call.message.chat.id, sent.message_id)
+            bot.answer_callback_query(call.id)
+            log_to_file("CHAT: NO TOKENS")
+            return
+        update_state(call.message.chat.id, 'chat')
+        mode_name = {"coder": "💻 Кодер", "explainer": "📖 Объяснятор", "translator": "🌍 Переводчик"}.get(mode, "💻 Кодер")
+        sent = bot.send_message(
+            call.message.chat.id,
+            f"🤖 <b>Привет, я Боб!</b>\n💰 Баланс: {tokens} токенов.\nРежим: <b>{mode_name}</b>\n\n"
+            f"Задайте вопрос — 1 запрос = 1 токен.\n"
+            f"💡 Если хотите сменить режим — просто напишите «переключись на кодера» или «стань переводчиком».",
+            parse_mode='HTML',
+            reply_markup=mode_menu()
+        )
         remember(call.message.chat.id, sent.message_id)
         bot.answer_callback_query(call.id)
-        return
-    update_state(call.message.chat.id, 'chat')
-    mode_name = {"coder": "💻 Кодер", "explainer": "📖 Объяснятор", "translator": "🌍 Переводчик"}.get(mode, "💻 Кодер")
-    sent = bot.send_message(
-        call.message.chat.id,
-        f"🤖 <b>Привет, я Боб!</b>\n💰 Баланс: {tokens} токенов.\nРежим: <b>{mode_name}</b>\n\n"
-        f"Задайте вопрос — 1 запрос = 1 токен.\n"
-        f"💡 Если хотите сменить режим — просто напишите «переключись на кодера» или «стань переводчиком».",
-        parse_mode='HTML',
-        reply_markup=mode_menu()
-    )
-    remember(call.message.chat.id, sent.message_id)
-    bot.answer_callback_query(call.id)
+        log_to_file("CHAT: SUCCESS")
+    except Exception as e:
+        log_to_file(f"CHAT ERROR: {e}")
+        try:
+            bot.answer_callback_query(call.id, f"Ошибка: {e}")
+        except Exception:
+            pass
 
-# === ВЫБОР РЕЖИМА (кнопка) ===
+# === РЕЖИМ ===
 @bot.callback_query_handler(func=lambda call: call.data.startswith("mode_"))
 def set_mode(call):
+    log_to_file(f"MODE: {call.data}")
     mode = call.data.replace("mode_", "")
     update_mode(call.message.chat.id, mode)
     mode_name = {"coder": "💻 Кодер", "explainer": "📖 Объяснятор", "translator": "🌍 Переводчик"}.get(mode, "💻 Кодер")
@@ -370,6 +396,7 @@ def set_mode(call):
 # === ПОДДЕРЖКА ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_support")
 def support(call):
+    log_to_file("SUPPORT")
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
     except Exception:
@@ -393,10 +420,9 @@ def get_gigachat_token():
         response = requests.post(url, headers=headers, data=data, verify=False, timeout=30)
         return response.json().get("access_token")
     except Exception as e:
-        print(f"Ошибка GigaChat: {e}")
+        log_to_file(f"GIGACHAT TOKEN ERROR: {e}")
         return None
 
-# === УМНЫЕ ПРОМПТЫ С ПОДДЕРЖКОЙ ПЕРЕКЛЮЧЕНИЯ РЕЖИМА ===
 BASE_PROMPT = (
     "Тебя зовут Боб. Ты — очень умный и полезный ИИ-помощник. "
     "Ты умеешь писать код, объяснять сложные вещи простыми словами и переводить тексты. "
@@ -407,11 +433,8 @@ BASE_PROMPT = (
     "1. 💻 КОДЕР — пишешь только код на Python.\n"
     "2. 📖 ОБЪЯСНЯТОР — объясняешь сложные вещи простыми словами.\n"
     "3. 🌍 ПЕРЕВОДЧИК — переводишь тексты (русский ↔ английский).\n\n"
-    "Если пользователь просит переключить режим (например, 'переключись на кодера', "
-    "'стань переводчиком', 'режим объяснятор') — ты должен ответить: "
-    "'✅ Переключаюсь на режим [название]. Теперь я [описание]'. "
-    "И в дальнейшем отвечать в этом режиме. "
-    "\n\n"
+    "Если пользователь просит переключить режим — ты должен ответить: "
+    "'✅ Переключаюсь на режим [название].' И дальше отвечать в этом режиме.\n\n"
 )
 
 SYSTEM_PROMPTS = {
@@ -419,8 +442,7 @@ SYSTEM_PROMPTS = {
         "ТЕКУЩИЙ РЕЖИМ: 💻 КОДЕР.\n"
         "Ты пишешь ТОЛЬКО код на Python. Формат ответа: сначала блок ```python ... ```, "
         "потом одно короткое предложение пояснения (не больше 2 строк). "
-        "Никаких 'Конечно!', 'Вот ваш код:', 'Надеюсь, это поможет'. "
-        "Только код и краткое пояснение. Если код не нужен — отвечай кратко."
+        "Никаких 'Конечно!', 'Вот ваш код:', 'Надеюсь, это поможет'. Только код и краткое пояснение."
     ),
     "explainer": BASE_PROMPT + (
         "ТЕКУЩИЙ РЕЖИМ: 📖 ОБЪЯСНЯТОР.\n"
@@ -431,26 +453,20 @@ SYSTEM_PROMPTS = {
     "translator": BASE_PROMPT + (
         "ТЕКУЩИЙ РЕЖИМ: 🌍 ПЕРЕВОДЧИК.\n"
         "Ты переводишь тексты. Если пользователь пишет на русском — переводи на английский. "
-        "Если на английском — переводи на русский. Отвечай ТОЛЬКО переводом, без пояснений. "
-        "Если просят перевести на конкретный язык — переводи на него."
+        "Если на английском — переводи на русский. Отвечай ТОЛЬКО переводом, без пояснений."
     )
 }
 
-# === ОПРЕДЕЛЕНИЕ ЗАПРОСА НА СМЕНУ РЕЖИМА ===
 def detect_mode_request(text):
-    """Проверяем, просит ли пользователь сменить режим"""
     text_lower = text.lower()
-    # Кодер
-    if any(word in text_lower for word in ["кодер", "программист", "код", "code", "coder"]):
-        if any(word in text_lower for word in ["переключ", "стань", "режим", "смени", "включи"]):
+    if any(w in text_lower for w in ["кодер", "программист", "code", "coder"]):
+        if any(w in text_lower for w in ["переключ", "стань", "режим", "смени", "включи"]):
             return "coder"
-    # Объяснятор
-    if any(word in text_lower for word in ["объясн", "учитель", "explain", "объяснятор"]):
-        if any(word in text_lower for word in ["переключ", "стань", "режим", "смени", "включи"]):
+    if any(w in text_lower for w in ["объясн", "учитель", "explain"]):
+        if any(w in text_lower for w in ["переключ", "стань", "режим", "смени", "включи"]):
             return "explainer"
-    # Переводчик
-    if any(word in text_lower for word in ["перевод", "translate", "translator", "переводчик"]):
-        if any(word in text_lower for word in ["переключ", "стань", "режим", "смени", "включи"]):
+    if any(w in text_lower for w in ["перевод", "translate", "translator"]):
+        if any(w in text_lower for w in ["переключ", "стань", "режим", "смени", "включи"]):
             return "translator"
     return None
 
@@ -498,7 +514,6 @@ def handle_message(message):
         remember(message.chat.id, sent.message_id)
         return
 
-    # === ПРОВЕРКА: не просит ли сменить режим ===
     new_mode = detect_mode_request(message.text)
     if new_mode:
         update_mode(message.chat.id, new_mode)
@@ -631,5 +646,7 @@ def run_flask():
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 3000)))
 
 if __name__ == '__main__':
+    log_to_file("BOT STARTING...")
     threading.Thread(target=run_flask, daemon=True).start()
+    log_to_file("POLLING STARTED")
     bot.polling(none_stop=True)
