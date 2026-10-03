@@ -509,7 +509,7 @@ def show_balance(call):
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
-# === ИСТОРИЯ ЧАТА ===
+# === ИСТОРИЯ ЧАТА (С ВЫДЕЛЕНИЕМ КОДА) ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_history")
 def show_history(call):
     try:
@@ -523,25 +523,60 @@ def show_history(call):
         remember(call.message.chat.id, sent.message_id)
         bot.answer_callback_query(call.id)
         return
-    full_text = "📜 <b>Ваша история чата:</b>\n\n"
+
+    # Собираем полный текст, разбивая на части по 4000 символов
     parts = []
+    current = "📜 <b>Ваша история чата:</b>\n\n"
+
     for role, content in history:
         prefix = "👤 <b>Вы:</b> " if role == "user" else "🤖 <b>Боб:</b> "
-        safe = escape_html(content)
-        block = f"{prefix}{safe}\n\n"
-        if len(full_text) + len(block) > 4000:
-            parts.append(full_text)
-            full_text = block
+
+        # Если есть код — оборачиваем блоки ```...``` в <pre><code>
+        if "```" in content:
+            chunks = content.split("```")
+            block = prefix
+            for i, chunk in enumerate(chunks):
+                if i % 2 == 1:
+                    clean = chunk.strip()
+                    lines = clean.split("\n", 1)
+                    if len(lines) > 1 and lines[0].strip().lower() in [
+                        "python", "py", "lua", "javascript", "js", "html", "css",
+                        "sql", "java", "c++", "c#", "php", "go", "rust", "typescript", "ts"
+                    ]:
+                        clean = lines[1]
+                    block += f"\n<pre><code>{escape_html(clean)}</code></pre>\n"
+                else:
+                    block += escape_html(chunk)
+            block += "\n\n"
         else:
-            full_text += block
-    if full_text:
-        parts.append(full_text)
+            block = f"{prefix}{escape_html(content)}\n\n"
+
+        # Если блок не влезает — сохраняем текущую часть
+        if len(current) + len(block) > 4000:
+            parts.append(current)
+            current = block
+        else:
+            current += block
+
+    if current:
+        parts.append(current)
+
     for i, p in enumerate(parts):
         try:
-            sent = bot.send_message(call.message.chat.id, p, parse_mode='HTML', reply_markup=back_menu() if i == len(parts) - 1 else None)
+            sent = bot.send_message(
+                call.message.chat.id,
+                p,
+                parse_mode='HTML',
+                reply_markup=back_menu() if i == len(parts) - 1 else None
+            )
             remember(call.message.chat.id, sent.message_id)
         except Exception:
-            sent = bot.send_message(call.message.chat.id, p.replace("<b>","").replace("</b>",""), reply_markup=back_menu())
+            # Если HTML сломался — шлём без разметки
+            sent = bot.send_message(
+                call.message.chat.id,
+                p.replace("<b>", "").replace("</b>", "").replace("<pre><code>", "").replace("</code></pre>", ""),
+                reply_markup=back_menu()
+            )
             remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
@@ -734,7 +769,7 @@ def admin_give(call):
     if not users:
         bot.answer_callback_query(call.id, "Пользователей нет.")
         return
-    text = "💰 <b>Начислить токены</b>\n\nНажми на пользователя, чтобы скопировать его ID:\n\n"
+    text = "💰 <b>Начислить токены</b>\n\nНажми на пользователя, чтобы получить его ID:\n\n"
     markup = telebot.types.InlineKeyboardMarkup()
     for uid, uname, tokens in users[:30]:
         markup.add(telebot.types.InlineKeyboardButton(f"🆔 {uid} — {uname or '—'} ({tokens})", callback_data=f"admin_copy_{uid}"))
@@ -1036,11 +1071,15 @@ def handle_message(message):
         for i, part in enumerate(parts):
             if i % 2 == 1:
                 clean = part.strip()
-                if clean.lower().startswith(("python", "py\n", "javascript", "js\n", "html", "css", "sql", "java", "c++", "c#", "php", "go", "rust")):
-                    clean = clean.split("\n", 1)[1] if "\n" in clean else clean
+                lines = clean.split("\n", 1)
+                if len(lines) > 1 and lines[0].strip().lower() in [
+                    "python", "py", "lua", "javascript", "js", "html", "css",
+                    "sql", "java", "c++", "c#", "php", "go", "rust", "typescript", "ts"
+                ]:
+                    clean = lines[1]
                 code_parts.append(clean.strip())
         code_text = "\n\n".join(code_parts)
-    elif mode == "coder" and any(x in full_answer for x in ["def ", "import ", "class ", "print(", "function ", "const ", "let ", "var ", "<?php", "SELECT ", "INSERT ", "CREATE TABLE", "#include", "public class"]):
+    elif mode == "coder" and any(x in full_answer for x in ["def ", "import ", "class ", "print(", "function ", "const ", "let ", "var ", "<?php", "SELECT ", "INSERT ", "CREATE TABLE", "#include", "public class", "local ", "while ", "for "]):
         is_code = True
         code_text = full_answer
 
