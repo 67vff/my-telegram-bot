@@ -77,7 +77,10 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS users (
         chat_id INTEGER PRIMARY KEY,
         tokens INTEGER DEFAULT 1000,
-        state TEXT DEFAULT 'idle'
+        state TEXT DEFAULT 'idle',
+        mode TEXT DEFAULT 'coder',
+        trial_started INTEGER DEFAULT 0,
+        trial_used INTEGER DEFAULT 0
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS orders (
         order_id TEXT PRIMARY KEY,
@@ -91,7 +94,6 @@ def init_db():
         content TEXT
     )''')
     conn.commit()
-    # === МИГРАЦИИ: добавляем колонки, если их нет ===
     for col, definition in [
         ("mode", "TEXT DEFAULT 'coder'"),
         ("trial_started", "INTEGER DEFAULT 0"),
@@ -113,7 +115,6 @@ def get_user(chat_id):
         c.execute("SELECT tokens, state, mode, trial_started, trial_used FROM users WHERE chat_id=?", (chat_id,))
         row = c.fetchone()
     except sqlite3.OperationalError:
-        # Если колонок всё ещё нет — пересоздаём
         conn.close()
         init_db()
         conn = sqlite3.connect(DB_PATH)
