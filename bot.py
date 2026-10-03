@@ -39,7 +39,7 @@ def init_db():
         chat_id INTEGER PRIMARY KEY,
         tokens INTEGER DEFAULT 1000,
         state TEXT DEFAULT 'idle',
-        mode TEXT DEFAULT 'coder',
+        mode TEXT DEFAULT 'regular',
         trial_started INTEGER DEFAULT 0,
         trial_used INTEGER DEFAULT 0,
         lang TEXT DEFAULT 'ru',
@@ -66,7 +66,7 @@ def init_db():
     )''')
     conn.commit()
     for col, definition in [
-        ("mode", "TEXT DEFAULT 'coder'"),
+        ("mode", "TEXT DEFAULT 'regular'"),
         ("trial_started", "INTEGER DEFAULT 0"),
         ("trial_used", "INTEGER DEFAULT 0"),
         ("lang", "TEXT DEFAULT 'ru'"),
@@ -99,7 +99,7 @@ def get_user(chat_id):
     if not row:
         c.execute("INSERT INTO users (chat_id) VALUES (?)", (chat_id,))
         conn.commit()
-        row = (1000, 'idle', 'coder', 0, 0, 'ru', 'bright', 1, 1)
+        row = (1000, 'idle', 'regular', 0, 0, 'ru', 'bright', 1, 1)
     conn.close()
     return row
 
@@ -162,7 +162,7 @@ def add_to_history(chat_id, role, content):
     conn.commit()
     conn.close()
 
-def get_history(chat_id, limit=20):
+def get_history(chat_id, limit=50):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT role, content FROM history WHERE chat_id=? ORDER BY id DESC LIMIT ?", (chat_id, limit))
@@ -195,6 +195,7 @@ def main_menu():
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("💳 Купить токены", callback_data="menu_buy"))
     markup.add(telebot.types.InlineKeyboardButton("🤖 Чат с ИИ", callback_data="menu_chat"))
+    markup.add(telebot.types.InlineKeyboardButton("📜 История чата", callback_data="menu_history"))
     markup.add(telebot.types.InlineKeyboardButton("💰 Мой баланс", callback_data="menu_balance"))
     markup.add(telebot.types.InlineKeyboardButton("⚙️ Настройки", callback_data="menu_settings"))
     markup.add(telebot.types.InlineKeyboardButton("🆘 Поддержка", callback_data="menu_support"))
@@ -226,20 +227,20 @@ def gift_menu():
 
 def mode_menu():
     markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("🤖 Обычный ИИ", callback_data="mode_regular"))
     markup.add(telebot.types.InlineKeyboardButton("💻 Кодер", callback_data="mode_coder"))
     markup.add(telebot.types.InlineKeyboardButton("📖 Объяснятор", callback_data="mode_explainer"))
     markup.add(telebot.types.InlineKeyboardButton("🌍 Переводчик", callback_data="mode_translator"))
+    markup.add(telebot.types.InlineKeyboardButton("⚙️ Настройки", callback_data="settings_from_chat"))
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
     return markup
 
 def settings_menu(chat_id):
-    _, _, _, _, _, _, _, theme, night, notif = (0, 0, 0, 0, 0, 0, 0) + get_user(chat_id)[7:] if False else (0,)*7
-    _, _, _, _, _, _, theme, night, notif = get_user(chat_id)
+    _, _, _, _, _, _, _, theme, night, notif = get_user(chat_id)
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton(f"🌙 Ночной режим: {'ВКЛ' if night else 'ВЫКЛ'}", callback_data="set_night"))
     markup.add(telebot.types.InlineKeyboardButton(f"🎨 Тема: {'Яркая' if theme == 'bright' else 'Минимализм'}", callback_data="set_theme"))
     markup.add(telebot.types.InlineKeyboardButton(f"🔔 Уведомления: {'ВКЛ' if notif else 'ВЫКЛ'}", callback_data="set_notif"))
-    markup.add(telebot.types.InlineKeyboardButton("🌐 Язык: Русский / English", callback_data="set_lang"))
     markup.add(telebot.types.InlineKeyboardButton("📊 Статистика", callback_data="set_stats"))
     markup.add(telebot.types.InlineKeyboardButton("📜 Очистить историю", callback_data="set_clear"))
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
@@ -425,6 +426,32 @@ def show_balance(call):
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
+# === ИСТОРИЯ ЧАТА ===
+@bot.callback_query_handler(func=lambda call: call.data == "menu_history")
+def show_history(call):
+    try:
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
+    clear_old_messages(call.message.chat.id)
+    history = get_history(call.message.chat.id, limit=50)
+    if not history:
+        sent = bot.send_message(call.message.chat.id, "📜 История чата пуста.", reply_markup=back_menu())
+        remember(call.message.chat.id, sent.message_id)
+        bot.answer_callback_query(call.id)
+        return
+    text = "📜 <b>Ваша история чата:</b>\n\n"
+    for role, content in history:
+        prefix = "👤 Вы" if role == "user" else "🤖 Боб"
+        short = content[:100] + "..." if len(content) > 100 else content
+        safe_short = escape_html(short)
+        text += f"{prefix}: {safe_short}\n\n"
+    if len(text) > 4000:
+        text = text[:4000] + "\n\n...и другие сообщения"
+    sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=back_menu())
+    remember(call.message.chat.id, sent.message_id)
+    bot.answer_callback_query(call.id)
+
 # === НАСТРОЙКИ ===
 @bot.callback_query_handler(func=lambda call: call.data in ["menu_settings", "settings_from_chat"])
 def open_settings(call):
@@ -439,7 +466,7 @@ def open_settings(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == "set_night")
 def set_night(call):
-    night = get_user(call.message.chat.id)[7]
+    night = get_user(call.message.chat.id)[8]
     update_user(call.message.chat.id, 'night_mode', 0 if night else 1)
     bot.answer_callback_query(call.id, f"Ночной режим: {'ВКЛ' if not night else 'ВЫКЛ'}")
     try:
@@ -460,20 +487,13 @@ def set_theme(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == "set_notif")
 def set_notif(call):
-    notif = get_user(call.message.chat.id)[8]
+    notif = get_user(call.message.chat.id)[9]
     update_user(call.message.chat.id, 'notifications', 0 if notif else 1)
     bot.answer_callback_query(call.id, f"Уведомления: {'ВКЛ' if not notif else 'ВЫКЛ'}")
     try:
         bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=settings_menu(call.message.chat.id))
     except Exception:
         pass
-
-@bot.callback_query_handler(func=lambda call: call.data == "set_lang")
-def set_lang(call):
-    lang = get_user(call.message.chat.id)[6]
-    new_lang = 'en' if lang == 'ru' else 'ru'
-    update_user(call.message.chat.id, 'lang', new_lang)
-    bot.answer_callback_query(call.id, f"Язык: {'English' if new_lang == 'en' else 'Русский'}")
 
 @bot.callback_query_handler(func=lambda call: call.data == "set_stats")
 def show_stats(call):
@@ -508,7 +528,7 @@ def enter_chat(call):
         bot.answer_callback_query(call.id)
         return
     update_user(call.message.chat.id, 'state', 'chat')
-    mode_name = {"coder": "💻 Кодер", "explainer": "📖 Объяснятор", "translator": "🌍 Переводчик"}.get(mode, "💻 Кодер")
+    mode_name = {"regular": "🤖 Обычный ИИ", "coder": "💻 Кодер", "explainer": "📖 Объяснятор", "translator": "🌍 Переводчик"}.get(mode, "🤖 Обычный ИИ")
     sent = bot.send_message(
         call.message.chat.id,
         f"🤖 <b>Вы в чате с ИИ.</b>\n💰 Баланс: {tokens} токенов.\nРежим: <b>{mode_name}</b>\n\n"
@@ -525,7 +545,7 @@ def enter_chat(call):
 def set_mode(call):
     mode = call.data.replace("mode_", "")
     update_user(call.message.chat.id, 'mode', mode)
-    mode_name = {"coder": "💻 Кодер", "explainer": "📖 Объяснятор", "translator": "🌍 Переводчик"}.get(mode, "💻 Кодер")
+    mode_name = {"regular": "🤖 Обычный ИИ", "coder": "💻 Кодер", "explainer": "📖 Объяснятор", "translator": "🌍 Переводчик"}.get(mode, "🤖 Обычный ИИ")
     bot.answer_callback_query(call.id, f"Режим: {mode_name}")
     try:
         bot.edit_message_text(
@@ -573,9 +593,11 @@ BASE_PROMPT = (
     "сочинять, анализировать, придумывать идеи. "
     "Если тебя спросят 'какая ты модель', 'кто ты' — отвечай: 'Я Боб, твой ИИ-помощник.' "
     "Никогда не упоминай GigaChat, Сбер, OpenAI и другие компании. Ты просто Боб. "
+    "Отвечай на том языке, на котором написал пользователь. "
 )
 
 SYSTEM_PROMPTS = {
+    "regular": BASE_PROMPT + "РЕЖИМ: ОБЫЧНЫЙ ИИ. Отвечай на любые вопросы. Помогай с чем угодно.",
     "coder": BASE_PROMPT + "РЕЖИМ: КОДЕР. Пиши ТОЛЬКО код. Формат: ```python ... ``` + одно короткое пояснение.",
     "explainer": BASE_PROMPT + "РЕЖИМ: ОБЪЯСНЯТОР. Объясняй сложные вещи простыми словами, с примерами.",
     "translator": BASE_PROMPT + "РЕЖИМ: ПЕРЕВОДЧИК. Переводи тексты. Русский ↔ английский. Только перевод."
@@ -587,6 +609,7 @@ def detect_mode_request(text):
         "coder": ["кодер", "программист", "code", "coder"],
         "explainer": ["объясн", "учитель", "explain"],
         "translator": ["перевод", "translate", "translator"],
+        "regular": ["обычный", "regular", "обычный ии"],
     }
     trigger_words = ["переключ", "стань", "режим", "смени", "включи", "сменить"]
     for key, words in mode_words.items():
@@ -605,7 +628,7 @@ def ask_gigachat(chat_id, question, mode, image_base64=None):
         "Accept": "application/json",
         "Authorization": f"Bearer {access_token}"
     }
-    system_prompt = SYSTEM_PROMPTS.get(mode, SYSTEM_PROMPTS["coder"])
+    system_prompt = SYSTEM_PROMPTS.get(mode, SYSTEM_PROMPTS["regular"])
     messages = [{"role": "system", "content": system_prompt}]
     history = get_history(chat_id, limit=20)
     for role, content in history:
@@ -665,10 +688,9 @@ def handle_message(message):
         new_mode = detect_mode_request(message.text)
         if new_mode:
             update_user(message.chat.id, 'mode', new_mode)
-            mode_name = {"coder": "💻 Кодер", "explainer": "📖 Объяснятор", "translator": "🌍 Переводчик"}.get(new_mode, "💻 Кодер")
+            mode_name = {"regular": "🤖 Обычный ИИ", "coder": "💻 Кодер", "explainer": "📖 Объяснятор", "translator": "🌍 Переводчик"}.get(new_mode, "🤖 Обычный ИИ")
             prefix = f"✅ <b>Сменил режим на {mode_name}.</b>\n\n"
             mode = new_mode
-            # Убираем фразу про смену режима из вопроса
             text = message.text
             for phrase in ["смени режим на ", "переключись на ", "стань ", "сменить режим на ", "включи режим "]:
                 if phrase in text.lower():
@@ -701,7 +723,7 @@ def handle_message(message):
     else:
         answer = ask_gigachat(message.chat.id, message.text, mode)
 
-    tokens_left, _, _, _, _, _, _, _, _ = get_user(message.chat.id)
+    tokens_left = get_user(message.chat.id)[0]
     full_answer = prefix + answer
 
     if "```" in full_answer or "def " in full_answer or "import " in full_answer or "class " in full_answer:
