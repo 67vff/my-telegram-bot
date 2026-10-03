@@ -1,6 +1,7 @@
 import os
 import uuid
 import hmac
+import time
 import sqlite3
 import hashlib
 import threading
@@ -22,6 +23,9 @@ bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
 DB_PATH = "/app/data/users.db"
+TRIAL_PRICE = 10
+TRIAL_TOKENS = 2
+TRIAL_WINDOW = 3600  # 1 час в секундах
 
 def escape_html(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -34,7 +38,9 @@ def init_db():
         chat_id INTEGER PRIMARY KEY,
         tokens INTEGER DEFAULT 1000,
         state TEXT DEFAULT 'idle',
-        mode TEXT DEFAULT 'coder'
+        mode TEXT DEFAULT 'coder',
+        trial_started INTEGER DEFAULT 0,
+        trial_used INTEGER DEFAULT 0
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS orders (
         order_id TEXT PRIMARY KEY,
@@ -48,11 +54,17 @@ def init_db():
         content TEXT
     )''')
     conn.commit()
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN mode TEXT DEFAULT 'coder'")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
+    # Миграции (на случай старой базы)
+    for col, definition in [
+        ("mode", "TEXT DEFAULT 'coder'"),
+        ("trial_started", "INTEGER DEFAULT 0"),
+        ("trial_used", "INTEGER DEFAULT 0"),
+    ]:
+        try:
+            c.execute(f"ALTER TABLE users ADD COLUMN {col} {definition}")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
     conn.close()
 
 init_db()
@@ -60,14 +72,28 @@ init_db()
 def get_user(chat_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT tokens, state, mode FROM users WHERE chat_id=?", (chat_id,))
+    c.execute("SELECT tokens, state, mode, trial_started, trial_used FROM users WHERE chat_id=?", (chat_id,))
     row = c.fetchone()
     if not row:
-        c.execute("INSERT INTO users (chat_id, tokens, state, mode) VALUES (?, 1000, 'idle', 'coder')", (chat_id,))
+        c.execute("INSERT INTO users (chat_id, tokens, state, mode, trial_started, trial_used) VALUES (?, 1000, 'idle', 'coder', 0, 0)", (chat_id,))
         conn.commit()
-        row = (1000, 'idle', 'coder')
+        row = (1000, 'idle', 'coder', 0, 0)
     conn.close()
     return row
+
+def set_trial_started(chat_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE users SET trial_started=? WHERE chat_id=?", (int(time.time()), chat_id))
+    conn.commit()
+    conn.close()
+
+def set_trial_used(chat_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE users SET trial_used=1 WHERE chat_id=?", (chat_id,))
+    conn.commit()
+    conn.close()
 
 def update_state(chat_id, state):
     conn = sqlite3.connect(DB_PATH)
@@ -143,9 +169,26 @@ def main_menu():
     markup.add(telebot.types.InlineKeyboardButton("🆘 Поддержка", callback_data="menu_support"))
     return markup
 
-def buy_menu():
+def buy_menu(chat_id):
     markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("🎁 10 ₽ — 2 токена", callback_data="pack_10_2"))
+    # Получаем данные пользователя
+    _, _, _, trial_started, trial_used = get_user(chat_id)
+    now = int(time.time())
+    # Если пробный ещё не использован — показываем кнопку
+    if not trial_used:
+        if trial_started == 0:
+            # Первый вход — ставим время старта
+            set_trial_started(chat_id)
+            trial_started = now
+        # Считаем, сколько осталось
+        elapsed = now - trial_started
+        if elapsed < TRIAL_WINDOW:
+            left = TRIAL_WINDOW - elapsed
+            minutes = left // 60
+            markup.add(telebot.types.InlineKeyboardButton(
+                f"🎁 Первый раз: 2 токена за 10 ₽ (осталось {minutes} мин)",
+                callback_data="pack_trial"
+            ))
     markup.add(telebot.types.InlineKeyboardButton("100 ₽ — 20 токенов", callback_data="pack_100_20"))
     markup.add(telebot.types.InlineKeyboardButton("250 ₽ — 50 токенов", callback_data="pack_250_50"))
     markup.add(telebot.types.InlineKeyboardButton("500 ₽ — 100 токенов", callback_data="pack_500_100"))
@@ -167,7 +210,7 @@ def back_menu():
     return markup
 
 def send_main_menu(chat_id):
-    tokens, _, _ = get_user(chat_id)
+    tokens, _, _, _, _ = get_user(chat_id)
     update_state(chat_id, 'idle')
     text = f"👋 <b>Главное меню</b>\n💰 Токенов: <b>{tokens}</b>\n────────────────\nВыбери действие:"
     sent = bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=main_menu())
@@ -200,8 +243,29 @@ def buy_tokens(call):
     except Exception:
         pass
     clear_old_messages(call.message.chat.id)
-    sent = bot.send_message(call.message.chat.id, "💳 <b>Покупка токенов</b>\n────────────────\nВыбери пакет:", parse_mode='HTML', reply_markup=buy_menu())
+    sent = bot.send_message(call.message.chat.id, "💳 <b>Покупка токенов</b>\n────────────────\nВыбери пакет:", parse_mode='HTML', reply_markup=buy_menu(call.message.chat.id))
     remember(call.message.chat.id, sent.message_id)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "pack_trial")
+def pack_trial(call):
+    # Проверяем, не использован ли уже
+    _, _, _, trial_started, trial_used = get_user(call.message.chat.id)
+    if trial_used:
+        bot.answer_callback_query(call.id, "❌ Пробное предложение уже использовано.")
+        return
+    # Проверяем, не истёк ли час
+    if int(time.time()) - trial_started > TRIAL_WINDOW:
+        bot.answer_callback_query(call.id, "⏳ Время пробного предложения истекло.")
+        return
+
+    try:
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
+    clear_old_messages(call.message.chat.id)
+    set_trial_used(call.message.chat.id)
+    create_invoice(call.message.chat.id, TRIAL_PRICE, TRIAL_TOKENS)
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pack_"))
@@ -272,7 +336,7 @@ def show_balance(call):
     except Exception:
         pass
     clear_old_messages(call.message.chat.id)
-    tokens, _, _ = get_user(call.message.chat.id)
+    tokens, _, _, _, _ = get_user(call.message.chat.id)
     sent = bot.send_message(call.message.chat.id, f"💰 <b>Ваш баланс:</b> {tokens} токенов", parse_mode='HTML', reply_markup=back_menu())
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
@@ -304,7 +368,7 @@ def show_history(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == "menu_chat")
 def enter_chat(call):
-    tokens, _, mode = get_user(call.message.chat.id)
+    tokens, _, mode, _, _ = get_user(call.message.chat.id)
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
     except Exception:
@@ -414,7 +478,7 @@ def ask_gigachat(chat_id, question, mode):
 
 @bot.message_handler(func=lambda m: True)
 def handle_message(message):
-    tokens, state, mode = get_user(message.chat.id)
+    tokens, state, mode, _, _ = get_user(message.chat.id)
     if state != 'chat':
         return
     if message.text == "⬅️ Назад":
@@ -446,7 +510,7 @@ def handle_message(message):
     typing_thread.daemon = True
     typing_thread.start()
     answer = ask_gigachat(message.chat.id, message.text, mode)
-    tokens_left, _, _ = get_user(message.chat.id)
+    tokens_left, _, _, _, _ = get_user(message.chat.id)
     stop_typing.set()
     typing_thread.join(timeout=2)
     if "```" in answer:
@@ -484,7 +548,7 @@ def handle_message(message):
             sent = bot.send_message(message.chat.id, f"{answer}\n\n──────────\n💰 Осталось: {tokens_left}", reply_markup=mode_menu())
         remember(message.chat.id, sent.message_id)
 
-# === СТРАНИЦА ОПЛАТЫ (КАК В СТАРОМ РАБОЧЕМ ВАРИАНТЕ) ===
+# === СТРАНИЦА ОПЛАТЫ ===
 @app.route('/pay/<amount>/<label>')
 def pay_page(amount, label):
     html = f'''
@@ -503,25 +567,19 @@ def pay_page(amount, label):
     '''
     return html
 
-# === ВЕБХУК С ПРАВИЛЬНОЙ ПРОВЕРКОЙ ПОДПИСИ sign ===
+# === ВЕБХУК ===
 @app.route('/webhook', methods=['POST'])
 def yoomoney_webhook():
     data = request.form.to_dict()
     received_sign = data.pop('sign', '')
 
     if received_sign:
-        # Новый формат: HMAC-SHA256 (согласно документации ЮMoney [citation:6][citation:18])
         sorted_items = sorted(data.items())
         check_string = '&'.join(f"{k}={urllib.parse.quote_plus(str(v))}" for k, v in sorted_items)
-        calculated_sign = hmac.new(
-            YOOMONEY_SECRET.encode('utf-8'),
-            check_string.encode('utf-8'),
-            sha256
-        ).hexdigest()
+        calculated_sign = hmac.new(YOOMONEY_SECRET.encode('utf-8'), check_string.encode('utf-8'), sha256).hexdigest()
         if not hmac.compare_digest(calculated_sign, received_sign):
             return jsonify({"status": "error", "message": "Invalid sign"}), 403
     else:
-        # Старый формат: sha1_hash (устареет с 18 мая 2026 [citation:6])
         received_hash = data.pop('sha1_hash', '')
         if received_hash:
             check_string = '&'.join([f"{k}={v}" for k, v in sorted(data.items())]) + YOOMONEY_SECRET
@@ -534,11 +592,14 @@ def yoomoney_webhook():
     if order:
         chat_id, tokens = order
         add_tokens(chat_id, tokens)
-        new_balance, _, _ = get_user(chat_id)
+        new_balance, _, _, _, _ = get_user(chat_id)
         clear_old_messages(chat_id)
+        # Берём сумму из order_id (последний элемент)
+        parts = label.split("-")
+        real_amount = parts[-1] if len(parts) >= 4 else amount
         sent = bot.send_message(
             chat_id,
-            f"✅ <b>Оплата прошла!</b>\n\n🧾 Счёт: <code>{label}</code>\n💰 Сумма: {amount} ₽\n🎫 Токенов: <b>{tokens}</b>\n💎 Баланс: <b>{new_balance}</b>",
+            f"✅ <b>Оплата прошла!</b>\n\n🧾 Счёт: <code>{label}</code>\n💰 Сумма: {real_amount} ₽\n🎫 Токенов: <b>{tokens}</b>\n💎 Баланс: <b>{new_balance}</b>",
             parse_mode='HTML',
             reply_markup=main_menu()
         )
