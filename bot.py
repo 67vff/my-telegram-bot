@@ -110,11 +110,8 @@ def get_user(chat_id):
         c.execute("SELECT tokens, state, mode, trial_started, trial_used, username, theme, night_mode, notifications FROM users WHERE chat_id=?", (chat_id,))
         row = c.fetchone()
     if not row:
-        try:
-            c.execute("INSERT INTO users (chat_id) VALUES (?)", (chat_id,))
-            conn.commit()
-        except sqlite3.IntegrityError:
-            pass
+        c.execute("INSERT OR IGNORE INTO users (chat_id) VALUES (?)", (chat_id,))
+        conn.commit()
         c.execute("SELECT tokens, state, mode, trial_started, trial_used, username, theme, night_mode, notifications FROM users WHERE chat_id=?", (chat_id,))
         row = c.fetchone()
         if not row:
