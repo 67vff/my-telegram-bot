@@ -20,7 +20,7 @@ YOOMONEY_RECEIVER = os.getenv('YOOMONEY_RECEIVER')
 YOOMONEY_SECRET = os.getenv('YOOMONEY_SECRET')
 GIGACHAT_AUTH_KEY = os.getenv('GIGACHAT_AUTH_KEY')
 
-ADMIN_ID = 8000630493   # ← Твой ID
+ADMIN_ID = 8000630493
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
@@ -110,9 +110,15 @@ def get_user(chat_id):
         c.execute("SELECT tokens, state, mode, trial_started, trial_used, username, theme, night_mode, notifications FROM users WHERE chat_id=?", (chat_id,))
         row = c.fetchone()
     if not row:
-        c.execute("INSERT INTO users (chat_id) VALUES (?)", (chat_id,))
-        conn.commit()
-        row = (0, 'idle', 'regular', 0, 0, '', 'bright', 1, 1)
+        try:
+            c.execute("INSERT INTO users (chat_id) VALUES (?)", (chat_id,))
+            conn.commit()
+        except sqlite3.IntegrityError:
+            pass
+        c.execute("SELECT tokens, state, mode, trial_started, trial_used, username, theme, night_mode, notifications FROM users WHERE chat_id=?", (chat_id,))
+        row = c.fetchone()
+        if not row:
+            row = (0, 'idle', 'regular', 0, 0, '', 'bright', 1, 1)
     conn.close()
     return row
 
@@ -313,7 +319,6 @@ def send_main_menu(chat_id):
 # === /start ===
 @bot.message_handler(commands=['start'])
 def start(message):
-    # Сохраняем username
     if message.from_user.username:
         update_user(message.chat.id, 'username', f"@{message.from_user.username}")
     try:
@@ -541,9 +546,7 @@ def ticket_save(message):
     user = get_user(message.chat.id)
     username = user[5] if user[5] else f"ID:{message.chat.id}"
     text = message.text if message.text else (message.caption if message.caption else "[без текста]")
-    photo_id = None
-    if message.photo:
-        photo_id = message.photo[-1].file_id
+    photo_id = message.photo[-1].file_id if message.photo else None
     ticket_id = create_ticket(message.chat.id, username, text, photo_id)
     try:
         bot.delete_message(message.chat.id, message.message_id)
@@ -556,7 +559,6 @@ def ticket_save(message):
         reply_markup=back_menu()
     )
     remember(message.chat.id, sent.message_id)
-    # Уведомляем админа
     try:
         if photo_id:
             bot.send_photo(ADMIN_ID, photo_id, caption=f"🔔 Новый тикет #{ticket_id} от {username}\n\n{text}")
@@ -893,7 +895,6 @@ def ask_gigachat(chat_id, question, mode, image_base64=None):
 
 @bot.message_handler(content_types=['text', 'photo'])
 def handle_message(message):
-    # === ЕСЛИ ЭТО АДМИН И ОН ОТВЕЧАЕТ НА ТИКЕТ — игнорируем (обрабатывается через next_step) ===
     tokens, state, mode, _, _, _, _, _, _ = get_user(message.chat.id)
     if state != 'chat':
         return
