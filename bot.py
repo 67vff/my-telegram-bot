@@ -152,6 +152,7 @@ def buy_menu():
     return markup
 
 def mode_menu():
+    """Кнопки выбора режима ИИ"""
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("💻 Кодер", callback_data="mode_coder"))
     markup.add(telebot.types.InlineKeyboardButton("📖 Объяснятор", callback_data="mode_explainer"))
@@ -469,7 +470,7 @@ def handle_message(message):
 
     add_tokens(message.chat.id, -1)
 
-    # === ЗАПУСКАЕМ ПОСТОЯННЫЙ СТАТУС "ПЕЧАТАЕТ" ===
+    # === ПОСТОЯННЫЙ СТАТУС "ПЕЧАТАЕТ" ===
     stop_typing = threading.Event()
 
     def keep_typing():
@@ -484,7 +485,6 @@ def handle_message(message):
     typing_thread.daemon = True
     typing_thread.start()
 
-    # Запрос к GigaChat
     answer = ask_gigachat(message.chat.id, message.text, mode)
     tokens_left, _, _ = get_user(message.chat.id)
 
