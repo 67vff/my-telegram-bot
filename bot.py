@@ -404,7 +404,7 @@ def back_to_main(call):
     send_main_menu(call.message.chat.id)
     bot.answer_callback_query(call.id)
 
-# === ГЕНЕРАЦИЯ КАРТИНОК ===
+# === ГЕНЕРАЦИЯ КАРТИНОК (модель для Эко) ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_image")
 def image_menu(call):
     user = get_user(call.message.chat.id)
@@ -479,13 +479,14 @@ def generate_image_process(message):
         remember(message.chat.id, sent.message_id)
 
 def generate_image_bothub(prompt):
+    # Модель, которая точно есть в Эко
     url = "https://openai.bothub.chat/v1/images/generations"
     headers = {
         "Authorization": f"Bearer {BOTHUB_API_KEY}",
         "Content-Type": "application/json"
     }
     data = {
-        "model": "gemini-3.1-flash-image",
+        "model": "flux-schnell",  # ← РАБОЧАЯ модель для Эко
         "prompt": prompt,
         "n": 1,
         "size": "1024x1024"
