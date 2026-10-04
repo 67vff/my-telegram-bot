@@ -1,17 +1,12 @@
 import os
 import uuid
-import hmac
 import time
-import base64
 import sqlite3
-import hashlib
 import threading
-import urllib.parse
 import telebot
 import requests
 import urllib3
-from hashlib import sha256
-from flask import Flask, request, jsonify
+from flask import Flask, request
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -31,9 +26,14 @@ DB_PATH = "/app/data/users.db"
 
 last_broadcast = {"messages": [], "active": False}
 
-# === ХРАНИЛИЩЕ НАСТРОЕК ГЕНЕРАЦИИ (в памяти) ===
-# {chat_id: {"image": {...}, "video": {...}}}
+# === ГЛОБАЛЬНАЯ БЛОКИРОВКА ===
+maintenance_mode = {"active": False}
+
+# === НАСТРОЙКИ ГЕНЕРАЦИИ (в памяти) ===
 gen_settings = {}
+
+# === ФЛАГИ АКТИВНЫХ ГЕНЕРАЦИЙ (защита от дублей) ===
+active_generations = set()  # (chat_id, kind)
 
 
 def get_gen_settings(chat_id):
@@ -60,6 +60,14 @@ def get_gen_settings(chat_id):
 
 def escape_html(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def is_admin(chat_id):
+    return chat_id == ADMIN_ID
+
+
+def is_blocked(chat_id):
+    return maintenance_mode["active"] and not is_admin(chat_id)
 
 
 # === БАЗА ДАННЫХ ===
@@ -156,16 +164,8 @@ init_db()
 def get_user(chat_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    try:
-        c.execute("SELECT tokens, state, mode, ai_mode, trial_started, trial_used, username, phone, registered, coder_mode FROM users WHERE chat_id=?", (chat_id,))
-        row = c.fetchone()
-    except sqlite3.OperationalError:
-        conn.close()
-        init_db()
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT tokens, state, mode, ai_mode, trial_started, trial_used, username, phone, registered, coder_mode FROM users WHERE chat_id=?", (chat_id,))
-        row = c.fetchone()
+    c.execute("SELECT tokens, state, mode, ai_mode, trial_started, trial_used, username, phone, registered, coder_mode FROM users WHERE chat_id=?", (chat_id,))
+    row = c.fetchone()
     if not row:
         c.execute("INSERT OR IGNORE INTO users (chat_id, registered) VALUES (?, ?)", (chat_id, int(time.time())))
         conn.commit()
@@ -392,7 +392,7 @@ def stop_typing(stop, t):
     t.join(timeout=2)
 
 
-# === МОДЕЛИ (из документации) ===
+# === МОДЕЛИ ===
 IMAGE_MODELS = {
     "gemini-2.5-flash-image": "Gemini 2.5 Flash Image",
     "gpt-image-1": "GPT Image 1",
@@ -409,7 +409,6 @@ VIDEO_MODELS = {
     "sora-2": "Sora 2",
 }
 
-# === ВЫБОР СООТНОШЕНИЯ / ФОРМАТА ===
 ASPECT_RATIOS = ["1:1", "16:9", "9:16", "4:3", "3:4"]
 VIDEO_DURATIONS = [4, 5, 6, 7, 8, 9, 10, 12]
 OUTPUT_FORMATS = ["png", "jpeg", "webp"]
@@ -425,7 +424,10 @@ NEGATIVE_PRESETS = [
 def main_menu(chat_id=None):
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("💳 Купить токены", callback_data="menu_buy"))
-    markup.add(telebot.types.InlineKeyboardButton("✨ Создать (ИИ / Фото / Видео)", callback_data="menu_create"))
+    markup.add(telebot.types.InlineKeyboardButton("🤖 Чат с ИИ", callback_data="menu_chat"))
+    markup.add(telebot.types.InlineKeyboardButton("🖼 Генерация фото", callback_data="menu_image"))
+    markup.add(telebot.types.InlineKeyboardButton("🎬 Генерация видео", callback_data="menu_video"))
+    markup.add(telebot.types.InlineKeyboardButton("📚 История", callback_data="menu_history_hub"))
     markup.add(telebot.types.InlineKeyboardButton("💰 Мой баланс", callback_data="menu_balance"))
     markup.add(telebot.types.InlineKeyboardButton("🆘 Поддержка", callback_data="menu_support"))
     if chat_id == ADMIN_ID:
@@ -433,44 +435,25 @@ def main_menu(chat_id=None):
     return markup
 
 
-def create_hub_menu(chat_id):
-    """Главное меню раздела «Создать» — чат ИИ + генерация."""
-    user = get_user(chat_id)
-    tokens = user[0]
-    ai_mode = user[3]
-    ai_name = {"regular": "🤖 Обычный", "smart": "🧠 Умный", "open": "💬 Откровенный", "uncensored": "🔥 Без цензуры"}.get(ai_mode, "🤖 Обычный")
-    gs = get_gen_settings(chat_id)
-    img_model = gs["image"]["model"]
-    vid_model = gs["video"]["model"]
+def main_menu_text(chat_id):
+    tokens = get_user(chat_id)[0]
+    text = f"👋 <b>Главное меню</b>\n💰 Токенов: <b>{tokens}</b>\n────────────────\nВыбери действие:"
+    if maintenance_mode["active"]:
+        text += "\n\n🛠 <b>Технические работы</b>"
+    return text
+
+
+def history_hub_menu():
     markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("🤖 Чат с ИИ", callback_data="menu_chat"))
-    markup.add(telebot.types.InlineKeyboardButton("🖼 Генерация фото", callback_data="menu_image"))
-    markup.add(telebot.types.InlineKeyboardButton("🎬 Генерация видео", callback_data="menu_video"))
-    markup.add(telebot.types.InlineKeyboardButton("📜 История чата ИИ", callback_data="menu_history"))
-    markup.add(telebot.types.InlineKeyboardButton("🖼 История фото", callback_data="menu_image_history"))
-    markup.add(telebot.types.InlineKeyboardButton("🎬 История видео", callback_data="menu_video_history"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ В главное меню", callback_data="menu_main"))
+    markup.add(telebot.types.InlineKeyboardButton("📜 История чата с ИИ", callback_data="hist_chat"))
+    markup.add(telebot.types.InlineKeyboardButton("🖼 История генерации фото", callback_data="hist_image"))
+    markup.add(telebot.types.InlineKeyboardButton("🎬 История генерации видео", callback_data="hist_video"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
     return markup
 
 
-def create_hub_text(chat_id):
-    user = get_user(chat_id)
-    tokens = user[0]
-    ai_mode = user[3]
-    ai_name = {"regular": "🤖 Обычный", "smart": "🧠 Умный", "open": "💬 Откровенный", "uncensored": "🔥 Без цензуры"}.get(ai_mode, "🤖 Обычный")
-    gs = get_gen_settings(chat_id)
-    img_model = IMAGE_MODELS.get(gs["image"]["model"], gs["image"]["model"])
-    vid_model = VIDEO_MODELS.get(gs["video"]["model"], gs["video"]["model"])
-    return (
-        f"✨ <b>Создать</b>\n"
-        f"────────────────\n"
-        f"💰 Баланс: <b>{tokens}</b>\n"
-        f"🧠 Поведение ИИ: <b>{ai_name}</b>\n\n"
-        f"🖼 Фото — <b>{IMAGE_COST}</b> токенов\n"
-        f"   Модель: <b>{img_model}</b>\n\n"
-        f"🎬 Видео — <b>{VIDEO_COST}</b> токенов\n"
-        f"   Модель: <b>{vid_model}</b>"
-    )
+def history_hub_text():
+    return "📚 <b>История</b>\n────────────────\nВыбери раздел:"
 
 
 def image_menu(chat_id):
@@ -484,7 +467,7 @@ def image_menu(chat_id):
     b64 = "вкл" if i["return_base64"] else "выкл"
     markup.add(telebot.types.InlineKeyboardButton(f"🔢 Base64-ответ: {b64}", callback_data="img_toggle_b64"))
     markup.add(telebot.types.InlineKeyboardButton("🚀 Сгенерировать фото", callback_data="img_generate"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_create"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
     return markup
 
 
@@ -520,7 +503,7 @@ def video_menu(chat_id):
     seed = str(v["seed"]) if v["seed"] is not None else "—"
     markup.add(telebot.types.InlineKeyboardButton(f"🎲 Seed: {seed}", callback_data="vid_set_seed"))
     markup.add(telebot.types.InlineKeyboardButton("🚀 Сгенерировать видео", callback_data="vid_generate"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_create"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
     return markup
 
 
@@ -560,7 +543,8 @@ def ratio_menu(kind):
     markup = telebot.types.InlineKeyboardMarkup()
     for r in ASPECT_RATIOS:
         markup.add(telebot.types.InlineKeyboardButton(r, callback_data=f"{kind}_pick_ratio_{r}"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_image" if kind == "img" else "menu_video"))
+    back = "menu_image" if kind == "img" else "menu_video"
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data=back))
     return markup
 
 
@@ -602,6 +586,13 @@ def negative_menu():
     return markup
 
 
+def confirm_menu(kind):
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("✅ Подтвердить", callback_data=f"{kind}_confirm"))
+    markup.add(telebot.types.InlineKeyboardButton("❌ Отменить", callback_data=f"{kind}_cancel"))
+    return markup
+
+
 def buy_menu(chat_id):
     markup = telebot.types.InlineKeyboardMarkup()
     _, _, _, _, trial_started, trial_used, _, _, _, _ = get_user(chat_id)
@@ -632,7 +623,7 @@ def chat_menu():
     markup.add(telebot.types.InlineKeyboardButton("📖 Объяснятор", callback_data="mode_explainer"))
     markup.add(telebot.types.InlineKeyboardButton("🌍 Переводчик", callback_data="mode_translator"))
     markup.add(telebot.types.InlineKeyboardButton("⚙️ Настройки поведения", callback_data="settings_from_chat"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_create"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
     return markup
 
 
@@ -664,21 +655,38 @@ def admin_menu():
     markup.add(telebot.types.InlineKeyboardButton("🛒 Покупки", callback_data="admin_orders"))
     markup.add(telebot.types.InlineKeyboardButton("🧹 Очистить память", callback_data="admin_clearmem"))
     markup.add(telebot.types.InlineKeyboardButton("📢 Рассылка", callback_data="admin_broadcast"))
+    if maintenance_mode["active"]:
+        markup.add(telebot.types.InlineKeyboardButton("✅ Включить бота", callback_data="admin_toggle_bot"))
+    else:
+        markup.add(telebot.types.InlineKeyboardButton("🛠 Тех. работы (выключить)", callback_data="admin_toggle_bot"))
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
     return markup
 
 
 def send_main_menu(chat_id):
-    tokens = get_user(chat_id)[0]
     update_user(chat_id, 'state', 'idle')
-    text = f"👋 <b>Главное меню</b>\n💰 Токенов: <b>{tokens}</b>\n────────────────\nВыбери действие:"
-    sent = bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=main_menu(chat_id))
+    sent = bot.send_message(chat_id, main_menu_text(chat_id), parse_mode='HTML', reply_markup=main_menu(chat_id))
     remember(chat_id, sent.message_id)
+
+
+# === ГЛОБАЛЬНЫЙ ПЕРЕХВАТЧИК БЛОКИРОВКИ ===
+def block_check(chat_id, send_msg=True):
+    """Возвращает True, если пользователь заблокирован."""
+    if is_blocked(chat_id):
+        if send_msg:
+            try:
+                bot.send_message(chat_id, "🛠 <b>Технические работы</b>\n\nБот временно недоступен. Пожалуйста, попробуйте позже.", parse_mode='HTML')
+            except Exception:
+                pass
+        return True
+    return False
 
 
 # === /start ===
 @bot.message_handler(commands=['start'])
 def start(message):
+    if block_check(message.chat.id):
+        return
     if message.from_user.username:
         update_user(message.chat.id, 'username', f"@{message.from_user.username}")
     try:
@@ -692,6 +700,9 @@ def start(message):
 # === НАЗАД В ГЛАВНОЕ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_main")
 def back_to_main(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
     except Exception:
@@ -701,19 +712,88 @@ def back_to_main(call):
     bot.answer_callback_query(call.id)
 
 
-# === ХАБ "СОЗДАТЬ" ===
-@bot.callback_query_handler(func=lambda call: call.data == "menu_create")
-def menu_create(call):
+# =========================================================
+# ================== ИСТОРИЯ (ХАБ) ========================
+# =========================================================
+@bot.callback_query_handler(func=lambda call: call.data == "menu_history_hub")
+def menu_history_hub(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     try:
-        bot.edit_message_text(
-            create_hub_text(call.message.chat.id),
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            parse_mode='HTML',
-            reply_markup=create_hub_menu(call.message.chat.id),
-        )
+        bot.edit_message_text(history_hub_text(), chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode='HTML', reply_markup=history_hub_menu())
     except Exception:
-        sent = bot.send_message(call.message.chat.id, create_hub_text(call.message.chat.id), parse_mode='HTML', reply_markup=create_hub_menu(call.message.chat.id))
+        sent = bot.send_message(call.message.chat.id, history_hub_text(), parse_mode='HTML', reply_markup=history_hub_menu())
+        remember(call.message.chat.id, sent.message_id)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "hist_chat")
+def hist_chat(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
+    history = get_history(call.message.chat.id, limit=100)
+    text = "📜 <b>История чата с ИИ:</b>\n\n"
+    if not history:
+        text += "Пусто."
+    else:
+        for role, content in history:
+            prefix = "👤 <b>Вы:</b> " if role == "user" else "🤖 <b>Боб:</b> "
+            short = content[:200] + "..." if len(content) > 200 else content
+            text += f"{prefix}{escape_html(short)}\n\n"
+        if len(text) > 4000:
+            text = text[:4000] + "\n\n...и другие"
+    try:
+        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode='HTML', reply_markup=history_hub_menu())
+    except Exception:
+        sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=history_hub_menu())
+        remember(call.message.chat.id, sent.message_id)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "hist_image")
+def hist_image(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
+    history = get_image_history(call.message.chat.id, limit=50)
+    text = "🖼 <b>История генерации фото:</b>\n\n"
+    if not history:
+        text += "Пусто."
+    else:
+        for prompt, url, model, created in history:
+            when = time.strftime('%d.%m %H:%M', time.localtime(created)) if created else ""
+            text += f"<b>{escape_html(prompt[:80])}</b>\n🎨 {model}\n📅 {when}\n🔗 <a href='{url}'>Открыть</a>\n\n"
+        if len(text) > 4000:
+            text = text[:4000] + "\n\n...и другие"
+    try:
+        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode='HTML', reply_markup=history_hub_menu(), disable_web_page_preview=True)
+    except Exception:
+        sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=history_hub_menu(), disable_web_page_preview=True)
+        remember(call.message.chat.id, sent.message_id)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "hist_video")
+def hist_video(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
+    history = get_video_history(call.message.chat.id, limit=50)
+    text = "🎬 <b>История генерации видео:</b>\n\n"
+    if not history:
+        text += "Пусто."
+    else:
+        for prompt, url, model, created in history:
+            when = time.strftime('%d.%m %H:%M', time.localtime(created)) if created else ""
+            text += f"<b>{escape_html(prompt[:80])}</b>\n🎥 {model}\n📅 {when}\n🔗 <a href='{url}'>Открыть</a>\n\n"
+        if len(text) > 4000:
+            text = text[:4000] + "\n\n...и другие"
+    try:
+        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode='HTML', reply_markup=history_hub_menu(), disable_web_page_preview=True)
+    except Exception:
+        sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=history_hub_menu(), disable_web_page_preview=True)
         remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
@@ -723,6 +803,9 @@ def menu_create(call):
 # =========================================================
 @bot.callback_query_handler(func=lambda call: call.data == "menu_image")
 def menu_image(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     try:
         bot.edit_message_text(image_text(call.message.chat.id), chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode='HTML', reply_markup=image_menu(call.message.chat.id))
     except Exception:
@@ -733,6 +816,9 @@ def menu_image(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == "img_set_model")
 def img_set_model(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     bot.answer_callback_query(call.id)
     try:
         bot.edit_message_text("🎨 <b>Выбери модель</b>", chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode='HTML', reply_markup=model_choice_menu("image"))
@@ -743,6 +829,9 @@ def img_set_model(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("img_pick_model_"))
 def img_pick_model(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     m = call.data.replace("img_pick_model_", "")
     get_gen_settings(call.message.chat.id)["image"]["model"] = m
     bot.answer_callback_query(call.id, f"✅ {IMAGE_MODELS.get(m, m)}")
@@ -754,6 +843,9 @@ def img_pick_model(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == "img_set_ratio")
 def img_set_ratio(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     bot.answer_callback_query(call.id)
     try:
         bot.edit_message_text("📐 <b>Соотношение сторон</b>", chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode='HTML', reply_markup=ratio_menu("img"))
@@ -764,6 +856,9 @@ def img_set_ratio(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("img_pick_ratio_"))
 def img_pick_ratio(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     r = call.data.replace("img_pick_ratio_", "")
     get_gen_settings(call.message.chat.id)["image"]["aspect_ratio"] = r
     bot.answer_callback_query(call.id, f"✅ {r}")
@@ -775,6 +870,9 @@ def img_pick_ratio(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == "img_set_format")
 def img_set_format(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     bot.answer_callback_query(call.id)
     try:
         bot.edit_message_text("💾 <b>Формат</b>", chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode='HTML', reply_markup=format_menu())
@@ -785,6 +883,9 @@ def img_set_format(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("img_pick_format_"))
 def img_pick_format(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     f = call.data.replace("img_pick_format_", "")
     get_gen_settings(call.message.chat.id)["image"]["output_format"] = f
     bot.answer_callback_query(call.id, f"✅ {f}")
@@ -796,6 +897,9 @@ def img_pick_format(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == "img_set_quality")
 def img_set_quality(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     bot.answer_callback_query(call.id)
     try:
         bot.edit_message_text("⚙️ <b>Качество</b>", chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode='HTML', reply_markup=quality_menu())
@@ -806,6 +910,9 @@ def img_set_quality(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("img_pick_quality_"))
 def img_pick_quality(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     q = int(call.data.replace("img_pick_quality_", ""))
     get_gen_settings(call.message.chat.id)["image"]["output_quality"] = q
     bot.answer_callback_query(call.id, f"✅ {q}")
@@ -817,6 +924,9 @@ def img_pick_quality(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == "img_toggle_b64")
 def img_toggle_b64(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     gs = get_gen_settings(call.message.chat.id)
     gs["image"]["return_base64"] = not gs["image"]["return_base64"]
     bot.answer_callback_query(call.id, "✅")
@@ -828,6 +938,9 @@ def img_toggle_b64(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == "img_generate")
 def img_generate(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     bot.answer_callback_query(call.id)
     user = get_user(call.message.chat.id)
     if user[0] < IMAGE_COST:
@@ -836,61 +949,123 @@ def img_generate(call):
     update_user(call.message.chat.id, 'state', 'image')
     sent = bot.send_message(call.message.chat.id, "✏️ Напиши <b>промпт</b> — что нарисовать:", parse_mode='HTML', reply_markup=back_menu())
     remember(call.message.chat.id, sent.message_id)
-    bot.register_next_step_handler(sent, image_process)
+    bot.register_next_step_handler(sent, image_prompt_received)
 
 
-def image_process(message):
+def image_prompt_received(message):
     if message.text == "⬅️ Назад":
         back_to_main(message)
         return
-    user = get_user(message.chat.id)
-    if user[0] < IMAGE_COST:
-        sent = bot.send_message(message.chat.id, f"❌ Недостаточно токенов. Нужно {IMAGE_COST}, у вас {user[0]}.", reply_markup=back_menu())
-        remember(message.chat.id, sent.message_id)
+    if block_check(message.chat.id):
         return
+    prompt = message.text
     try:
         bot.delete_message(message.chat.id, message.message_id)
     except Exception:
         pass
-    prompt = message.text
     gs = get_gen_settings(message.chat.id)["image"]
-    sent = bot.send_message(message.chat.id, "🎨 <b>Рисую...</b>\n⏳ 20-40 секунд.", parse_mode='HTML')
+    text = (
+        f"🖼 <b>Подтверди генерацию фото</b>\n"
+        f"────────────────\n"
+        f"📝 Промпт: <b>{escape_html(prompt[:300])}</b>\n\n"
+        f"🎨 Модель: <b>{IMAGE_MODELS.get(gs['model'], gs['model'])}</b>\n"
+        f"📐 Соотношение: <b>{gs['aspect_ratio']}</b>\n"
+        f"💾 Формат: <b>{gs['output_format']}</b>\n"
+        f"⚙️ Качество: <b>{gs['output_quality']}</b>\n\n"
+        f"💸 Стоимость: <b>{IMAGE_COST}</b> токенов"
+    )
+    # сохраним промпт временно
+    gen_settings[message.chat.id]["_pending_image_prompt"] = prompt
+    sent = bot.send_message(message.chat.id, text, parse_mode='HTML', reply_markup=confirm_menu("img"))
     remember(message.chat.id, sent.message_id)
 
-    image_url = generate_image_bothub(prompt, gs)
 
+@bot.callback_query_handler(func=lambda call: call.data == "img_confirm")
+def img_confirm(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
+    chat_id = call.message.chat.id
+    prompt = get_gen_settings(chat_id).get("_pending_image_prompt")
+    if not prompt:
+        bot.answer_callback_query(call.id, "❌ Промпт потерян")
+        return
+    # защита от дублей
+    key = (chat_id, "image")
+    if key in active_generations:
+        bot.answer_callback_query(call.id, "⏳ Уже генерируется")
+        return
+    user = get_user(chat_id)
+    if user[0] < IMAGE_COST:
+        bot.answer_callback_query(call.id, "❌ Нет токенов")
+        try:
+            bot.edit_message_text("❌ Недостаточно токенов.", chat_id=chat_id, message_id=call.message.message_id, reply_markup=back_menu())
+        except Exception:
+            pass
+        return
+    active_generations.add(key)
+    bot.answer_callback_query(call.id, "✅ Запущено")
     try:
-        bot.delete_message(message.chat.id, sent.message_id)
+        bot.delete_message(chat_id, call.message.message_id)
     except Exception:
         pass
-    if not image_url:
-        sent = bot.send_message(message.chat.id, "❌ Не удалось сгенерировать.", reply_markup=back_menu())
-        remember(message.chat.id, sent.message_id)
+    gs = dict(get_gen_settings(chat_id)["image"])
+    sent = bot.send_message(chat_id, "🎨 <b>Рисую...</b>\n⏳ 20-40 секунд.", parse_mode='HTML')
+    remember(chat_id, sent.message_id)
+    threading.Thread(target=image_thread, args=(chat_id, prompt, gs, sent.message_id), daemon=True).start()
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "img_cancel")
+def img_cancel(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
         return
+    chat_id = call.message.chat.id
+    get_gen_settings(chat_id).pop("_pending_image_prompt", None)
+    bot.answer_callback_query(call.id, "❌ Отменено")
     try:
+        bot.delete_message(chat_id, call.message.message_id)
+    except Exception:
+        pass
+    sent = bot.send_message(chat_id, image_text(chat_id), parse_mode='HTML', reply_markup=image_menu(chat_id))
+    remember(chat_id, sent.message_id)
+
+
+def image_thread(chat_id, prompt, gs, loading_msg_id):
+    try:
+        image_url = generate_image_bothub(prompt, gs)
+        try:
+            bot.delete_message(chat_id, loading_msg_id)
+        except Exception:
+            pass
+        if not image_url:
+            sent = bot.send_message(chat_id, "❌ Не удалось сгенерировать.", reply_markup=back_menu())
+            remember(chat_id, sent.message_id)
+            return
         img = requests.get(image_url, timeout=60).content
         caption = (
             f"🖼 <b>{escape_html(prompt[:200])}</b>\n"
             f"🎨 {IMAGE_MODELS.get(gs['model'], gs['model'])} • {gs['aspect_ratio']} • {gs['output_format']}"
         )
-        sent = bot.send_photo(message.chat.id, img, caption=caption, parse_mode='HTML', reply_markup=back_menu())
-        remember(message.chat.id, sent.message_id)
-        add_tokens(message.chat.id, -IMAGE_COST)
-        log_stat(message.chat.id, IMAGE_COST)
-        add_image_history(message.chat.id, prompt, image_url, gs['model'])
+        sent = bot.send_photo(chat_id, img, caption=caption, parse_mode='HTML', reply_markup=back_menu())
+        remember(chat_id, sent.message_id)
+        add_tokens(chat_id, -IMAGE_COST)
+        log_stat(chat_id, IMAGE_COST)
+        add_image_history(chat_id, prompt, image_url, gs['model'])
     except Exception as e:
-        sent = bot.send_message(message.chat.id, f"❌ Ошибка: {e}", reply_markup=back_menu())
-        remember(message.chat.id, sent.message_id)
+        try:
+            bot.delete_message(chat_id, loading_msg_id)
+        except Exception:
+            pass
+        sent = bot.send_message(chat_id, f"❌ Ошибка: {e}", reply_markup=back_menu())
+        remember(chat_id, sent.message_id)
+    finally:
+        active_generations.discard((chat_id, "image"))
 
 
 def generate_image_bothub(prompt, gs):
-    """
-    Генерация изображения через BotHub.
-    Для flux-2-max — используем Replicate-шлюз, для остальных — OpenAI.
-    """
     model = gs["model"]
     if model == "flux-2-max":
-        # Replicate-шлюз
         url = "https://bothub.chat/api/v2/replicate/v1/images/generations"
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {BOTHUB_API_KEY}"}
         data = {
@@ -916,7 +1091,6 @@ def generate_image_bothub(prompt, gs):
             print(f"Replicate image error: {e}")
             return None
     else:
-        # OpenAI-совместимый шлюз
         url = "https://openai.bothub.chat/v1/images/generations"
         headers = {"Authorization": f"Bearer {BOTHUB_API_KEY}", "Content-Type": "application/json"}
         data = {
@@ -952,6 +1126,9 @@ def _size_from_ratio(ratio):
 # =========================================================
 @bot.callback_query_handler(func=lambda call: call.data == "menu_video")
 def menu_video(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     try:
         bot.edit_message_text(video_text(call.message.chat.id), chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode='HTML', reply_markup=video_menu(call.message.chat.id))
     except Exception:
@@ -962,6 +1139,9 @@ def menu_video(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == "vid_set_model")
 def vid_set_model(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     bot.answer_callback_query(call.id)
     try:
         bot.edit_message_text("🎥 <b>Выбери модель</b>", chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode='HTML', reply_markup=model_choice_menu("video"))
@@ -972,6 +1152,9 @@ def vid_set_model(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("vid_pick_model_"))
 def vid_pick_model(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     m = call.data.replace("vid_pick_model_", "")
     get_gen_settings(call.message.chat.id)["video"]["model"] = m
     bot.answer_callback_query(call.id, f"✅ {VIDEO_MODELS.get(m, m)}")
@@ -983,6 +1166,9 @@ def vid_pick_model(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == "vid_set_duration")
 def vid_set_duration(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     bot.answer_callback_query(call.id)
     try:
         bot.edit_message_text("⏱ <b>Длительность</b>", chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode='HTML', reply_markup=duration_menu())
@@ -993,6 +1179,9 @@ def vid_set_duration(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("vid_pick_dur_"))
 def vid_pick_dur(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     d = int(call.data.replace("vid_pick_dur_", ""))
     get_gen_settings(call.message.chat.id)["video"]["duration_seconds"] = d
     bot.answer_callback_query(call.id, f"✅ {d}с")
@@ -1004,6 +1193,9 @@ def vid_pick_dur(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == "vid_set_ratio")
 def vid_set_ratio(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     bot.answer_callback_query(call.id)
     try:
         bot.edit_message_text("📐 <b>Соотношение</b>", chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode='HTML', reply_markup=ratio_menu("vid"))
@@ -1014,6 +1206,9 @@ def vid_set_ratio(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("vid_pick_ratio_"))
 def vid_pick_ratio(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     r = call.data.replace("vid_pick_ratio_", "")
     get_gen_settings(call.message.chat.id)["video"]["aspect_ratio"] = r
     bot.answer_callback_query(call.id, f"✅ {r}")
@@ -1025,6 +1220,9 @@ def vid_pick_ratio(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == "vid_set_negative")
 def vid_set_negative(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     bot.answer_callback_query(call.id)
     try:
         bot.edit_message_text("🚫 <b>Негативный промпт</b>", chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode='HTML', reply_markup=negative_menu())
@@ -1035,6 +1233,9 @@ def vid_set_negative(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("vid_pick_neg_"))
 def vid_pick_neg(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     i = int(call.data.replace("vid_pick_neg_", ""))
     val = NEGATIVE_PRESETS[i][0]
     get_gen_settings(call.message.chat.id)["video"]["negative_prompt"] = val
@@ -1047,6 +1248,9 @@ def vid_pick_neg(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == "vid_toggle_audio")
 def vid_toggle_audio(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     gs = get_gen_settings(call.message.chat.id)
     gs["video"]["generate_audio"] = not gs["video"]["generate_audio"]
     bot.answer_callback_query(call.id, "✅")
@@ -1058,6 +1262,9 @@ def vid_toggle_audio(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == "vid_set_seed")
 def vid_set_seed(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     bot.answer_callback_query(call.id)
     sent = bot.send_message(call.message.chat.id, "🎲 Введи seed (число) или напиши <code>random</code>:", parse_mode='HTML', reply_markup=back_menu())
     remember(call.message.chat.id, sent.message_id)
@@ -1067,6 +1274,8 @@ def vid_set_seed(call):
 def vid_set_seed_value(message):
     if message.text == "⬅️ Назад":
         back_to_main(message)
+        return
+    if block_check(message.chat.id):
         return
     val = message.text.strip().lower()
     gs = get_gen_settings(message.chat.id)["video"]
@@ -1085,6 +1294,9 @@ def vid_set_seed_value(message):
 
 @bot.callback_query_handler(func=lambda call: call.data == "vid_generate")
 def vid_generate(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     bot.answer_callback_query(call.id)
     user = get_user(call.message.chat.id)
     if user[0] < VIDEO_COST:
@@ -1093,40 +1305,99 @@ def vid_generate(call):
     update_user(call.message.chat.id, 'state', 'video')
     sent = bot.send_message(call.message.chat.id, "✏️ Напиши <b>промпт</b> — что показать в видео:", parse_mode='HTML', reply_markup=back_menu())
     remember(call.message.chat.id, sent.message_id)
-    bot.register_next_step_handler(sent, video_process)
+    bot.register_next_step_handler(sent, video_prompt_received)
 
 
-def video_process(message):
+def video_prompt_received(message):
     if message.text == "⬅️ Назад":
         back_to_main(message)
         return
-    user = get_user(message.chat.id)
-    if user[0] < VIDEO_COST:
-        sent = bot.send_message(message.chat.id, f"❌ Недостаточно токенов. Нужно {VIDEO_COST}, у вас {user[0]}.", reply_markup=back_menu())
-        remember(message.chat.id, sent.message_id)
+    if block_check(message.chat.id):
         return
+    prompt = message.text
     try:
         bot.delete_message(message.chat.id, message.message_id)
     except Exception:
         pass
-    prompt = message.text
     gs = get_gen_settings(message.chat.id)["video"]
-    sent = bot.send_message(message.chat.id, "🎬 <b>Генерирую видео...</b>\n⏳ Это займёт 1-3 минуты.", parse_mode='HTML')
+    text = (
+        f"🎬 <b>Подтверди генерацию видео</b>\n"
+        f"────────────────\n"
+        f"📝 Промпт: <b>{escape_html(prompt[:300])}</b>\n\n"
+        f"🎥 Модель: <b>{VIDEO_MODELS.get(gs['model'], gs['model'])}</b>\n"
+        f"⏱ Длительность: <b>{gs['duration_seconds']} сек</b>\n"
+        f"📐 Соотношение: <b>{gs['aspect_ratio']}</b>\n"
+        f"🚫 Негатив: <b>{escape_html(gs['negative_prompt'] or '—')}</b>\n"
+        f"🔊 Звук: <b>{'вкл' if gs['generate_audio'] else 'выкл'}</b>\n"
+        f"🎲 Seed: <b>{gs['seed'] if gs['seed'] is not None else '—'}</b>\n\n"
+        f"💸 Стоимость: <b>{VIDEO_COST}</b> токенов"
+    )
+    get_gen_settings(message.chat.id)["_pending_video_prompt"] = prompt
+    sent = bot.send_message(message.chat.id, text, parse_mode='HTML', reply_markup=confirm_menu("vid"))
     remember(message.chat.id, sent.message_id)
-    threading.Thread(target=video_thread, args=(message.chat.id, prompt, dict(gs), sent.message_id), daemon=True).start()
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "vid_confirm")
+def vid_confirm(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
+    chat_id = call.message.chat.id
+    prompt = get_gen_settings(chat_id).get("_pending_video_prompt")
+    if not prompt:
+        bot.answer_callback_query(call.id, "❌ Промпт потерян")
+        return
+    key = (chat_id, "video")
+    if key in active_generations:
+        bot.answer_callback_query(call.id, "⏳ Уже генерируется")
+        return
+    user = get_user(chat_id)
+    if user[0] < VIDEO_COST:
+        bot.answer_callback_query(call.id, "❌ Нет токенов")
+        try:
+            bot.edit_message_text("❌ Недостаточно токенов.", chat_id=chat_id, message_id=call.message.message_id, reply_markup=back_menu())
+        except Exception:
+            pass
+        return
+    active_generations.add(key)
+    bot.answer_callback_query(call.id, "✅ Запущено")
+    try:
+        bot.delete_message(chat_id, call.message.message_id)
+    except Exception:
+        pass
+    gs = dict(get_gen_settings(chat_id)["video"])
+    sent = bot.send_message(chat_id, "🎬 <b>Генерирую видео...</b>\n⏳ Это займёт 1-3 минуты.", parse_mode='HTML')
+    remember(chat_id, sent.message_id)
+    threading.Thread(target=video_thread, args=(chat_id, prompt, gs, sent.message_id), daemon=True).start()
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "vid_cancel")
+def vid_cancel(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
+    chat_id = call.message.chat.id
+    get_gen_settings(chat_id).pop("_pending_video_prompt", None)
+    bot.answer_callback_query(call.id, "❌ Отменено")
+    try:
+        bot.delete_message(chat_id, call.message.message_id)
+    except Exception:
+        pass
+    sent = bot.send_message(chat_id, video_text(chat_id), parse_mode='HTML', reply_markup=video_menu(chat_id))
+    remember(chat_id, sent.message_id)
 
 
 def video_thread(chat_id, prompt, gs, loading_msg_id):
-    video_url = generate_video_bothub(prompt, gs)
     try:
-        bot.delete_message(chat_id, loading_msg_id)
-    except Exception:
-        pass
-    if not video_url:
-        sent = bot.send_message(chat_id, "❌ Не удалось сгенерировать видео.", reply_markup=back_menu())
-        remember(chat_id, sent.message_id)
-        return
-    try:
+        video_url = generate_video_bothub(prompt, gs)
+        try:
+            bot.delete_message(chat_id, loading_msg_id)
+        except Exception:
+            pass
+        if not video_url:
+            sent = bot.send_message(chat_id, "❌ Не удалось сгенерировать видео.", reply_markup=back_menu())
+            remember(chat_id, sent.message_id)
+            return
         vid = requests.get(video_url, timeout=180).content
         caption = (
             f"🎬 <b>{escape_html(prompt[:200])}</b>\n"
@@ -1138,8 +1409,14 @@ def video_thread(chat_id, prompt, gs, loading_msg_id):
         log_stat(chat_id, VIDEO_COST)
         add_video_history(chat_id, prompt, video_url, gs['model'])
     except Exception as e:
+        try:
+            bot.delete_message(chat_id, loading_msg_id)
+        except Exception:
+            pass
         sent = bot.send_message(chat_id, f"❌ Ошибка: {e}", reply_markup=back_menu())
         remember(chat_id, sent.message_id)
+    finally:
+        active_generations.discard((chat_id, "video"))
 
 
 def generate_video_bothub(prompt, gs):
@@ -1170,7 +1447,6 @@ def generate_video_bothub(prompt, gs):
         if not video_id:
             print(f"Create video error: {result}")
             return None
-        # Опрос статуса: до 40 попыток × 10 сек = ~6.5 минут
         for _ in range(40):
             time.sleep(10)
             s = requests.get(f"{base_url}/videos/{video_id}?include_usage=true", headers=headers, timeout=30)
@@ -1186,82 +1462,12 @@ def generate_video_bothub(prompt, gs):
     return None
 
 
-# === ИСТОРИЯ ЧАТА ===
-@bot.callback_query_handler(func=lambda call: call.data == "menu_history")
-def show_history(call):
-    try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
-        pass
-    history = get_history(call.message.chat.id, limit=100)
-    if not history:
-        sent = bot.send_message(call.message.chat.id, "📜 История чата пуста.", reply_markup=back_menu())
-        remember(call.message.chat.id, sent.message_id)
-        bot.answer_callback_query(call.id)
-        return
-    text = "📜 <b>История чата с ИИ:</b>\n\n"
-    for role, content in history:
-        prefix = "👤 <b>Вы:</b> " if role == "user" else "🤖 <b>Боб:</b> "
-        short = content[:200] + "..." if len(content) > 200 else content
-        text += f"{prefix}{escape_html(short)}\n\n"
-    if len(text) > 4000:
-        text = text[:4000] + "\n\n...и другие"
-    sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=back_menu())
-    remember(call.message.chat.id, sent.message_id)
-    bot.answer_callback_query(call.id)
-
-
-# === ИСТОРИЯ ФОТО ===
-@bot.callback_query_handler(func=lambda call: call.data == "menu_image_history")
-def show_image_history(call):
-    try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
-        pass
-    history = get_image_history(call.message.chat.id, limit=50)
-    if not history:
-        sent = bot.send_message(call.message.chat.id, "🖼 История фото пуста.", reply_markup=back_menu())
-        remember(call.message.chat.id, sent.message_id)
-        bot.answer_callback_query(call.id)
-        return
-    text = "🖼 <b>История генерации фото:</b>\n\n"
-    for prompt, url, model, created in history:
-        when = time.strftime('%d.%m %H:%M', time.localtime(created)) if created else ""
-        text += f"<b>{escape_html(prompt[:80])}</b>\n🎨 {model}\n📅 {when}\n🔗 <a href='{url}'>Открыть</a>\n\n"
-    if len(text) > 4000:
-        text = text[:4000] + "\n\n...и другие"
-    sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=back_menu(), disable_web_page_preview=True)
-    remember(call.message.chat.id, sent.message_id)
-    bot.answer_callback_query(call.id)
-
-
-# === ИСТОРИЯ ВИДЕО ===
-@bot.callback_query_handler(func=lambda call: call.data == "menu_video_history")
-def show_video_history(call):
-    try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
-        pass
-    history = get_video_history(call.message.chat.id, limit=50)
-    if not history:
-        sent = bot.send_message(call.message.chat.id, "🎬 История видео пуста.", reply_markup=back_menu())
-        remember(call.message.chat.id, sent.message_id)
-        bot.answer_callback_query(call.id)
-        return
-    text = "🎬 <b>История генерации видео:</b>\n\n"
-    for prompt, url, model, created in history:
-        when = time.strftime('%d.%m %H:%M', time.localtime(created)) if created else ""
-        text += f"<b>{escape_html(prompt[:80])}</b>\n🎥 {model}\n📅 {when}\n🔗 <a href='{url}'>Открыть</a>\n\n"
-    if len(text) > 4000:
-        text = text[:4000] + "\n\n...и другие"
-    sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=back_menu(), disable_web_page_preview=True)
-    remember(call.message.chat.id, sent.message_id)
-    bot.answer_callback_query(call.id)
-
-
 # === НАСТРОЙКИ ИИ ===
 @bot.callback_query_handler(func=lambda call: call.data == "settings_from_chat")
 def settings_from_chat(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     try:
         bot.edit_message_text("⚙️ <b>Настройки поведения ИИ</b>", chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode='HTML', reply_markup=ai_settings_menu(call.message.chat.id))
     except Exception:
@@ -1271,6 +1477,9 @@ def settings_from_chat(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("ai_"))
 def set_ai_mode(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     ai_mode = call.data.replace("ai_", "")
     update_user(call.message.chat.id, 'ai_mode', ai_mode)
     names = {"regular": "Обычный", "smart": "Умный", "open": "Откровенный", "uncensored": "Без цензуры"}
@@ -1284,6 +1493,9 @@ def set_ai_mode(call):
 # === КУПИТЬ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_buy")
 def buy_tokens(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     _, _, _, _, trial_started, trial_used, _, _, _, _ = get_user(call.message.chat.id)
     now = int(time.time())
     show_gift = False
@@ -1309,6 +1521,9 @@ def buy_tokens(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == "decline_gift")
 def decline_gift(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
     except Exception:
@@ -1320,6 +1535,9 @@ def decline_gift(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == "pack_trial")
 def pack_trial(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     _, _, _, _, trial_started, trial_used, _, _, _, _ = get_user(call.message.chat.id)
     if trial_used or int(time.time()) - trial_started > 3600:
         bot.answer_callback_query(call.id, "❌ Недоступно.")
@@ -1331,15 +1549,25 @@ def pack_trial(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pack_"))
 def pack_selected(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     parts = call.data.split("_")
-    amount = int(parts[1])
-    tokens = int(parts[2])
+    try:
+        amount = int(parts[1])
+        tokens = int(parts[2])
+    except Exception:
+        bot.answer_callback_query(call.id, "❌")
+        return
     create_invoice(call.message.chat.id, amount, tokens)
     bot.answer_callback_query(call.id)
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "custom_amount")
 def custom_amount(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     bot.answer_callback_query(call.id)
     sent = bot.send_message(call.message.chat.id, "✏️ Введи количество токенов (минимум 20):", reply_markup=back_menu())
     remember(call.message.chat.id, sent.message_id)
@@ -1349,6 +1577,8 @@ def custom_amount(call):
 def custom_tokens(message):
     if message.text == "⬅️ Назад":
         back_to_main(message)
+        return
+    if block_check(message.chat.id):
         return
     try:
         tokens = int(message.text)
@@ -1376,6 +1606,9 @@ def create_invoice(chat_id, amount, tokens):
 # === БАЛАНС ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_balance")
 def show_balance(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
     except Exception:
@@ -1389,6 +1622,9 @@ def show_balance(call):
 # === ПОДДЕРЖКА ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_support")
 def support(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
     except Exception:
@@ -1404,6 +1640,9 @@ def support(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == "ticket_new")
 def ticket_new(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
     except Exception:
@@ -1416,6 +1655,8 @@ def ticket_new(call):
 def ticket_save(message):
     if message.text == "⬅️ Назад":
         back_to_main(message)
+        return
+    if block_check(message.chat.id):
         return
     user = get_user(message.chat.id)
     username = user[6] if user[6] else f"ID:{message.chat.id}"
@@ -1430,6 +1671,9 @@ def ticket_save(message):
 
 @bot.callback_query_handler(func=lambda call: call.data == "ticket_my")
 def ticket_my(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     tickets = get_user_tickets(call.message.chat.id)
     if not tickets:
         bot.answer_callback_query(call.id, "У вас нет тикетов.")
@@ -1450,6 +1694,9 @@ def ticket_my(call):
 # === ЧАТ С ИИ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_chat")
 def enter_chat(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     user = get_user(call.message.chat.id)
     tokens = user[0]
     mode = user[2]
@@ -1477,6 +1724,9 @@ def enter_chat(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("mode_"))
 def set_mode(call):
+    if block_check(call.message.chat.id):
+        bot.answer_callback_query(call.id)
+        return
     raw = call.data.replace("mode_", "")
     if raw == "coder_hints":
         mode, coder = "coder", "with_hints"
@@ -1563,6 +1813,8 @@ def handle_message(message):
     tokens, state, mode, ai_mode = user[0], user[1], user[2], user[3]
     if state != 'chat':
         return
+    if block_check(message.chat.id):
+        return
     if message.text == "⬅️ Назад":
         back_to_main(message)
         return
@@ -1596,9 +1848,23 @@ def admin_panel(call):
         bot.delete_message(call.message.chat.id, call.message.message_id)
     except Exception:
         pass
-    sent = bot.send_message(call.message.chat.id, "👑 <b>Админ-меню</b>", parse_mode='HTML', reply_markup=admin_menu())
+    status = "🛠 Тех. работы ВКЛ" if maintenance_mode["active"] else "✅ Бот работает"
+    sent = bot.send_message(call.message.chat.id, f"👑 <b>Админ-меню</b>\n{status}", parse_mode='HTML', reply_markup=admin_menu())
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_toggle_bot")
+def admin_toggle_bot(call):
+    if call.message.chat.id != ADMIN_ID:
+        return
+    maintenance_mode["active"] = not maintenance_mode["active"]
+    state = "ВКЛЮЧЕНЫ 🛠" if maintenance_mode["active"] else "ВЫКЛЮЧЕНЫ ✅"
+    bot.answer_callback_query(call.id, f"Тех. работы {state}")
+    try:
+        bot.edit_message_text(f"👑 <b>Админ-меню</b>\nТех. работы: <b>{state}</b>", chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode='HTML', reply_markup=admin_menu())
+    except Exception:
+        pass
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "admin_tickets")
