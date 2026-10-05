@@ -35,7 +35,7 @@ IMAGE_COST = 4
 EDIT_COST = 4
 MIN_CUSTOM_TOKENS = 20
 MAX_CUSTOM_TOKENS = 3000
-ORDER_TTL = 1200  # 20 минут
+ORDER_TTL = 1200
 
 last_broadcast = {"messages": [], "active": False}
 edit_photos_cache = {}
@@ -50,9 +50,9 @@ def is_code_response(text):
         return False
     if "```" in text:
         return True
-    code_marks = ["def ", "import ", "class ", "function ", "<?php",
-                  "public static", "#include", "fn main", "package main"]
-    for m in code_marks:
+    marks = ["def ", "import ", "class ", "function ", "<?php",
+             "public static", "#include", "fn main", "package main"]
+    for m in marks:
         if m in text:
             return True
     return False
@@ -65,18 +65,13 @@ def detect_code_language(text):
     if m:
         lang = m.group(1).lower()
         mapping = {
-            "python": "py", "py": "py",
-            "javascript": "js", "js": "js", "node": "js",
-            "typescript": "ts", "ts": "ts",
-            "cpp": "cpp", "c++": "cpp", "cxx": "cpp",
-            "c": "c", "java": "java",
-            "go": "go", "golang": "go",
-            "rust": "rs", "rs": "rs",
-            "ruby": "rb", "rb": "rb",
-            "php": "php", "html": "html", "css": "css",
-            "sql": "sql", "bash": "sh", "sh": "sh", "shell": "sh",
-            "yaml": "yaml", "yml": "yaml", "json": "json",
-            "xml": "xml", "markdown": "md", "md": "md",
+            "python": "py", "py": "py", "javascript": "js", "js": "js", "node": "js",
+            "typescript": "ts", "ts": "ts", "cpp": "cpp", "c++": "cpp", "cxx": "cpp",
+            "c": "c", "java": "java", "go": "go", "golang": "go",
+            "rust": "rs", "rs": "rs", "ruby": "rb", "rb": "rb",
+            "php": "php", "html": "html", "css": "css", "sql": "sql",
+            "bash": "sh", "sh": "sh", "shell": "sh", "yaml": "yaml", "yml": "yaml",
+            "json": "json", "xml": "xml", "markdown": "md", "md": "md",
         }
         return mapping.get(lang, "txt")
     text_lower = text.lower()
@@ -106,19 +101,17 @@ def render_progress_bar(percent, width=22):
     filled = int(width * percent / 100)
     empty = width - filled
     if filled == 0:
-        bar = "░" * width
-    elif filled >= width:
-        bar = "█" * width
-    else:
-        fill_part = "█" * max(0, filled - 6)
-        remains = filled - len(fill_part)
-        gradient_part = ""
-        if remains > 0:
-            gradient = "▓▒░"
-            for i in range(remains):
-                gradient_part += gradient[i % 3]
-        bar = fill_part + gradient_part + ("░" * empty)
-    return bar
+        return "░" * width
+    if filled >= width:
+        return "█" * width
+    fill_part = "█" * max(0, filled - 6)
+    remains = filled - len(fill_part)
+    gradient_part = ""
+    if remains > 0:
+        g = "▓▒░"
+        for i in range(remains):
+            gradient_part += g[i % 3]
+    return fill_part + gradient_part + ("░" * empty)
 
 
 PROGRESS_STAGES = [
@@ -282,23 +275,16 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
-    try:
-        c.execute("ALTER TABLE maintenance ADD COLUMN message TEXT DEFAULT 'Технические работы, пожалуйста подождите'")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        c.execute("ALTER TABLE maintenance ADD COLUMN enabled INTEGER DEFAULT 0")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        c.execute("ALTER TABLE maintenance ADD COLUMN notified INTEGER DEFAULT 0")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
+    for col, definition in [
+        ("message", "TEXT DEFAULT 'Технические работы, пожалуйста подождите'"),
+        ("enabled", "INTEGER DEFAULT 0"),
+        ("notified", "INTEGER DEFAULT 1"),
+    ]:
+        try:
+            c.execute(f"ALTER TABLE maintenance ADD COLUMN {col} {definition}")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
 
     for col, definition in [
         ("reason", "TEXT DEFAULT ''"),
@@ -566,7 +552,6 @@ def get_user_orders_paid(chat_id):
 
 
 def get_user_orders_pending(chat_id):
-    # Удаляем старые
     cutoff = int(time.time())
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -781,8 +766,67 @@ def get_user_tickets(chat_id):
     return rows
 
 
+# === ОЧИСТКА ДАННЫХ ===
+def wipe_user_data(chat_id, what="all"):
+    """Полная очистка данных юзера."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    if what in ("all", "chat"):
+        c.execute("DELETE FROM history WHERE chat_id=?", (chat_id,))
+    if what in ("all", "image"):
+        c.execute("DELETE FROM image_history WHERE chat_id=? AND kind='gen'", (chat_id,))
+    if what in ("all", "edit"):
+        c.execute("DELETE FROM image_history WHERE chat_id=? AND kind='edit'", (chat_id,))
+    if what in ("all", "orders"):
+        c.execute("DELETE FROM orders WHERE chat_id=?", (chat_id,))
+    if what in ("all", "tickets"):
+        c.execute("DELETE FROM tickets WHERE chat_id=?", (chat_id,))
+    if what in ("all", "stats"):
+        c.execute("DELETE FROM stats WHERE chat_id=?", (chat_id,))
+    if what == "all":
+        c.execute("DELETE FROM action_logs WHERE chat_id=?", (chat_id,))
+        c.execute("DELETE FROM subscriptions WHERE user_id=?", (chat_id,))
+        c.execute("DELETE FROM active_operations WHERE chat_id=?", (chat_id,))
+    conn.commit()
+    conn.close()
+
+
+def wipe_all_data(what="all"):
+    """Глобальная очистка. what: all/chat/image/edit/orders/tickets/stats"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    if what in ("all", "chat"):
+        c.execute("DELETE FROM history")
+    if what in ("all", "image"):
+        c.execute("DELETE FROM image_history WHERE kind='gen'")
+    if what in ("all", "edit"):
+        c.execute("DELETE FROM image_history WHERE kind='edit'")
+    if what in ("all", "orders"):
+        c.execute("DELETE FROM orders")
+    if what in ("all", "tickets"):
+        c.execute("DELETE FROM tickets")
+    if what in ("all", "stats"):
+        c.execute("DELETE FROM stats")
+    if what == "all":
+        c.execute("DELETE FROM action_logs")
+        c.execute("DELETE FROM subscriptions")
+        c.execute("DELETE FROM active_operations")
+        c.execute("DELETE FROM maintenance_notified")
+        c.execute("""UPDATE users SET 
+            tokens = 0,
+            state = 'idle',
+            trial_started = 0,
+            trial_used = 0,
+            used_images = 0,
+            used_chats = 0,
+            used_edits = 0
+            """)
+    conn.commit()
+    conn.close()
+
+
 def reset_user_account(chat_id):
-    """Обнуляем юзера. Бан НЕ трогаем."""
+    """Обнуляет ВСЁ у юзера. Бан НЕ трогаем."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""UPDATE users SET 
@@ -810,6 +854,9 @@ def reset_user_account(chat_id):
     c.execute("DELETE FROM stats WHERE chat_id=?", (chat_id,))
     c.execute("DELETE FROM orders WHERE chat_id=?", (chat_id,))
     c.execute("DELETE FROM tickets WHERE chat_id=?", (chat_id,))
+    c.execute("DELETE FROM action_logs WHERE chat_id=?", (chat_id,))
+    c.execute("DELETE FROM subscriptions WHERE user_id=?", (chat_id,))
+    c.execute("DELETE FROM active_operations WHERE chat_id=?", (chat_id,))
     conn.commit()
     conn.close()
 
@@ -907,7 +954,6 @@ def send_photo_safe(chat_id, image_url, caption):
 
 
 def send_with_sound(chat_id, text, reply_markup=None, parse_mode='HTML'):
-    """Отправка с учётом настройки звука юзера."""
     user = get_user(chat_id)
     sound_on = user[23]
     try:
@@ -950,9 +996,7 @@ def deny_if_banned_or_maintenance(chat_id, call=None, message=None):
                 pass
         send_banned_message(chat_id)
         return True
-    # Тех.работы — только если не в списке игнора
     if not can_use_during_maintenance(chat_id):
-        enabled, _, _, _ = (0, "", 0, 0)
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("SELECT enabled, message FROM maintenance WHERE id=1")
@@ -1186,7 +1230,6 @@ def start(message):
         except Exception:
             pass
         return
-    # Записываем trial_started, если ещё не было
     trial_started = user[4]
     trial_used = user[5]
     if trial_started == 0 and not trial_used:
@@ -1352,6 +1395,39 @@ def back_to_chat(call):
     bot.answer_callback_query(call.id)
 
 
+@bot.callback_query_handler(func=lambda call: call.data == "back_to_admin")
+def back_to_admin(call):
+    if call.message.chat.id != ADMIN_ID:
+        return
+    try:
+        bot.edit_message_text(
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "     👑 АДМИН-МЕНЮ\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━",
+            chat_id=call.message.chat.id, message_id=call.message.message_id,
+            parse_mode='HTML', reply_markup=admin_menu())
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "back_to_wipe")
+def back_to_wipe(call):
+    if call.message.chat.id != ADMIN_ID:
+        return
+    try:
+        bot.edit_message_text(
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "      🧹 ОЧИСТКА\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Что очистить?",
+            chat_id=call.message.chat.id, message_id=call.message.message_id,
+            parse_mode='HTML', reply_markup=wipe_menu())
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id)
+
+
 # === МЕНЮ НАСТРОЙКИ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_settings")
 def settings_menu_handler(call):
@@ -1441,14 +1517,14 @@ def help_ai(call):
         "   🤖 ИНСТРУКЦИЯ ПО ИИ\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "Боб умеет:\n"
-        "• Отвечать на любые вопросы\n"
+        "• Отвечать на вопросы\n"
         "• Писать тексты и код\n"
         "• Переводить языки\n"
         "• Объяснять сложное\n\n"
         "🎯 <b>Режимы:</b>\n"
-        "• 🤖 Обычный — универсальный\n"
-        "• 💻 Кодер — код + объяснение\n"
-        "• 📖 Объяснятор — просто о сложном\n"
+        "• 🤖 Обычный\n"
+        "• 💻 Кодер\n"
+        "• 📖 Объяснятор\n"
         "• 🌍 Переводчик\n\n"
         "⚙️ <b>Поведение:</b>\n"
         "• 🧠 Умный, 💬 Откровенный, 🔥 Без цензуры"
@@ -1698,7 +1774,7 @@ def delete_account(call):
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         "   ⚠️ УДАЛЕНИЕ АККАУНТА\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Будут обнулены:\n"
+        "Будут удалены:\n"
         "• 💰 Все токены → 0\n"
         "• 📜 История чата\n"
         "• 🎨 История картинок\n"
@@ -1917,11 +1993,6 @@ def img_confirm_no(call):
     if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
         return
     update_user(call.message.chat.id, 'state', 'idle')
-    try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
-        pass
-    clear_old_messages(call.message.chat.id)
     try:
         bot.edit_message_text(
             "━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -3157,6 +3228,97 @@ def handle_document(message):
     remember(message.chat.id, s.message_id)
 
 # === АДМИН-МЕНЮ ===
+def admin_menu():
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("📋 Тикеты", callback_data="admin_tickets"))
+    markup.add(telebot.types.InlineKeyboardButton("📊 Логи", callback_data="admin_logs"))
+    markup.add(telebot.types.InlineKeyboardButton("✍️ Подписки", callback_data="admin_subs"))
+    markup.add(telebot.types.InlineKeyboardButton("💰 Начислить токены", callback_data="admin_give"))
+    markup.add(telebot.types.InlineKeyboardButton("💸 Забрать токены", callback_data="admin_take"))
+    markup.add(telebot.types.InlineKeyboardButton("👥 Список пользователей", callback_data="admin_users"))
+    markup.add(telebot.types.InlineKeyboardButton("🚫 Управление юзером", callback_data="admin_manage"))
+    markup.add(telebot.types.InlineKeyboardButton("🎯 Лимиты", callback_data="admin_limits"))
+    markup.add(telebot.types.InlineKeyboardButton("🛒 Покупки", callback_data="admin_orders"))
+    markup.add(telebot.types.InlineKeyboardButton("🧹 Очистка", callback_data="admin_wipe"))
+    markup.add(telebot.types.InlineKeyboardButton("📢 Рассылка", callback_data="admin_broadcast"))
+    markup.add(telebot.types.InlineKeyboardButton("🛠 Тех.работы", callback_data="admin_maintenance"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main"))
+    return markup
+
+
+def tickets_menu():
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("📬 Открытые", callback_data="admin_tickets_open"))
+    markup.add(telebot.types.InlineKeyboardButton("✅ Выполненные", callback_data="admin_tickets_done"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
+    return markup
+
+
+def logs_menu():
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("📅 Последние 50", callback_data="logs_50"))
+    markup.add(telebot.types.InlineKeyboardButton("📅 Последние 100", callback_data="logs_100"))
+    markup.add(telebot.types.InlineKeyboardButton("🎨 Генерации", callback_data="logs_type_gen"))
+    markup.add(telebot.types.InlineKeyboardButton("🖼 Редактирования", callback_data="logs_type_edit"))
+    markup.add(telebot.types.InlineKeyboardButton("🤖 ИИ вопросы", callback_data="logs_type_ai"))
+    markup.add(telebot.types.InlineKeyboardButton("💳 Покупки", callback_data="logs_type_buy"))
+    markup.add(telebot.types.InlineKeyboardButton("📄 Файлом", callback_data="logs_file"))
+    markup.add(telebot.types.InlineKeyboardButton("🗑 Очистить", callback_data="logs_clear"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
+    return markup
+
+
+def subs_menu():
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("➕ Добавить", callback_data="subs_add"))
+    markup.add(telebot.types.InlineKeyboardButton("➖ Отписаться", callback_data="subs_remove"))
+    markup.add(telebot.types.InlineKeyboardButton("📋 Список", callback_data="subs_list"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
+    return markup
+
+
+def wipe_menu():
+    """Меню очистки."""
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("👤 Очистить юзера", callback_data="wipe_user_select"))
+    markup.add(telebot.types.InlineKeyboardButton("💬 Все переписки", callback_data="wipe_confirm_chat_all"))
+    markup.add(telebot.types.InlineKeyboardButton("🎨 Все генерации", callback_data="wipe_confirm_image_all"))
+    markup.add(telebot.types.InlineKeyboardButton("🖼 Все редактирования", callback_data="wipe_confirm_edit_all"))
+    markup.add(telebot.types.InlineKeyboardButton("📊 Всю статистику", callback_data="wipe_confirm_stats_all"))
+    markup.add(telebot.types.InlineKeyboardButton("💥 ОЧИСТИТЬ ВСЁ", callback_data="wipe_confirm_all_all"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
+    return markup
+
+
+def wipe_confirm_menu(what):
+    """Меню подтверждения очистки."""
+    names = {
+        "chat_all": "💬 ВСЕ ПЕРЕПИСКИ",
+        "image_all": "🎨 ВСЕ ГЕНЕРАЦИИ",
+        "edit_all": "🖼 ВСЕ РЕДАКТИРОВАНИЯ",
+        "stats_all": "📊 ВСЮ СТАТИСТИКУ",
+        "all_all": "💥 ВСЁ (кроме юзеров)",
+    }
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("✅ Да, удалить", callback_data=f"wipe_do_{what}"))
+    markup.add(telebot.types.InlineKeyboardButton("❌ Отмена", callback_data="back_to_wipe"))
+    return markup
+
+
+def wipe_user_menu(uid):
+    """Меню очистки юзера."""
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("💬 Переписку", callback_data=f"wipe_user_do_chat_{uid}"))
+    markup.add(telebot.types.InlineKeyboardButton("🎨 Генерации", callback_data=f"wipe_user_do_image_{uid}"))
+    markup.add(telebot.types.InlineKeyboardButton("🖼 Редактирования", callback_data=f"wipe_user_do_edit_{uid}"))
+    markup.add(telebot.types.InlineKeyboardButton("🛒 Заказы", callback_data=f"wipe_user_do_orders_{uid}"))
+    markup.add(telebot.types.InlineKeyboardButton("📋 Тикеты", callback_data=f"wipe_user_do_tickets_{uid}"))
+    markup.add(telebot.types.InlineKeyboardButton("📊 Статистику", callback_data=f"wipe_user_do_stats_{uid}"))
+    markup.add(telebot.types.InlineKeyboardButton("💥 ВСЁ У ЮЗЕРА", callback_data=f"wipe_user_do_all_{uid}"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_wipe"))
+    return markup
+
+
 @bot.callback_query_handler(func=lambda call: call.data == "menu_admin")
 def admin_panel(call):
     if call.message.chat.id != ADMIN_ID:
@@ -3174,55 +3336,6 @@ def admin_panel(call):
                                 parse_mode='HTML', reply_markup=admin_menu())
         remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
-
-
-def admin_menu():
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("📋 Тикеты", callback_data="admin_tickets"))
-    markup.add(telebot.types.InlineKeyboardButton("📊 Логи", callback_data="admin_logs"))
-    markup.add(telebot.types.InlineKeyboardButton("✍️ Подписки", callback_data="admin_subs"))
-    markup.add(telebot.types.InlineKeyboardButton("💰 Начислить токены", callback_data="admin_give"))
-    markup.add(telebot.types.InlineKeyboardButton("💸 Забрать токены", callback_data="admin_take"))
-    markup.add(telebot.types.InlineKeyboardButton("👥 Список пользователей", callback_data="admin_users"))
-    markup.add(telebot.types.InlineKeyboardButton("🚫 Управление юзером", callback_data="admin_manage"))
-    markup.add(telebot.types.InlineKeyboardButton("🎯 Лимиты", callback_data="admin_limits"))
-    markup.add(telebot.types.InlineKeyboardButton("🛒 Покупки", callback_data="admin_orders"))
-    markup.add(telebot.types.InlineKeyboardButton("🧹 Очистить память", callback_data="admin_clearmem"))
-    markup.add(telebot.types.InlineKeyboardButton("📢 Рассылка", callback_data="admin_broadcast"))
-    markup.add(telebot.types.InlineKeyboardButton("🛠 Тех.работы", callback_data="admin_maintenance"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main"))
-    return markup
-
-
-def tickets_menu():
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("📬 Открытые", callback_data="admin_tickets_open"))
-    markup.add(telebot.types.InlineKeyboardButton("✅ Выполненные", callback_data="admin_tickets_done"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_admin"))
-    return markup
-
-
-def logs_menu():
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("📅 Последние 50", callback_data="logs_50"))
-    markup.add(telebot.types.InlineKeyboardButton("📅 Последние 100", callback_data="logs_100"))
-    markup.add(telebot.types.InlineKeyboardButton("🎨 Генерации", callback_data="logs_type_gen"))
-    markup.add(telebot.types.InlineKeyboardButton("🖼 Редактирования", callback_data="logs_type_edit"))
-    markup.add(telebot.types.InlineKeyboardButton("🤖 ИИ вопросы", callback_data="logs_type_ai"))
-    markup.add(telebot.types.InlineKeyboardButton("💳 Покупки", callback_data="logs_type_buy"))
-    markup.add(telebot.types.InlineKeyboardButton("📄 Файлом", callback_data="logs_file"))
-    markup.add(telebot.types.InlineKeyboardButton("🗑 Очистить", callback_data="logs_clear"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_admin"))
-    return markup
-
-
-def subs_menu():
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("➕ Добавить", callback_data="subs_add"))
-    markup.add(telebot.types.InlineKeyboardButton("➖ Отписаться", callback_data="subs_remove"))
-    markup.add(telebot.types.InlineKeyboardButton("📋 Список", callback_data="subs_list"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_admin"))
-    return markup
 
 
 # === ТЕХ.РАБОТЫ ===
@@ -3259,7 +3372,7 @@ def admin_maintenance(call):
     else:
         markup.add(telebot.types.InlineKeyboardButton("🟢 Включить", callback_data="maint_on"))
     markup.add(telebot.types.InlineKeyboardButton("✏️ Изменить текст", callback_data="maint_edit"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_admin"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
     try:
         bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id,
                               parse_mode='HTML', reply_markup=markup)
@@ -3282,7 +3395,6 @@ def maint_off(call):
     if call.message.chat.id != ADMIN_ID:
         return
     set_maintenance(0, enabled=0, notified=1)
-    # Меняем сообщения
     rows = get_maintenance_notified()
     new_text = (
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -3330,14 +3442,14 @@ def cmd_start(call):
 def maint_edit(call):
     if call.message.chat.id != ADMIN_ID:
         return
-    sent = bot.send_message(call.message.chat.id, "✏️ Введи новый текст:", reply_markup=back_to_main_menu())
+    sent = bot.send_message(call.message.chat.id, "✏️ Введи новый текст:", reply_markup=back_to_admin_menu())
     bot.register_next_step_handler(sent, maint_edit_save)
     bot.answer_callback_query(call.id)
 
 
-def back_to_main_menu():
+def back_to_admin_menu():
     markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_admin"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
     return markup
 
 
@@ -3358,7 +3470,6 @@ def maint_edit_save(message):
 
 # === ФОНОВАЯ РАССЫЛКА ТЕХ.РАБОТ ===
 def maintenance_worker():
-    """Каждые 30 сек проверяем — можно ли рассылать тех.работы"""
     while True:
         try:
             row = get_maintenance()
@@ -3507,6 +3618,146 @@ def logs_clear(call):
     admin_logs(call)
 
 
+# === ОЧИСТКА ===
+@bot.callback_query_handler(func=lambda call: call.data == "admin_wipe")
+def admin_wipe(call):
+    if call.message.chat.id != ADMIN_ID:
+        return
+    try:
+        bot.edit_message_text(
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "      🧹 ОЧИСТКА\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Что очистить?",
+            chat_id=call.message.chat.id, message_id=call.message.message_id,
+            parse_mode='HTML', reply_markup=wipe_menu())
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "wipe_user_select")
+def wipe_user_select(call):
+    if call.message.chat.id != ADMIN_ID:
+        return
+    users = get_all_users()
+    if not users:
+        bot.answer_callback_query(call.id, "Юзеров нет.")
+        return
+    markup = telebot.types.InlineKeyboardMarkup()
+    for uid, uname, tokens in users[:30]:
+        name = uname if uname else "—"
+        markup.add(telebot.types.InlineKeyboardButton(f"🆔 {uid} — {name}",
+                                                       callback_data=f"wipe_user_{uid}"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_wipe"))
+    try:
+        bot.edit_message_text("👤 <b>Кого очистить?</b>\n\nВыбери юзера:",
+                              chat_id=call.message.chat.id, message_id=call.message.message_id,
+                              parse_mode='HTML', reply_markup=markup)
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("wipe_user_") and not call.data.startswith("wipe_user_do_"))
+def wipe_user_menu_handler(call):
+    if call.message.chat.id != ADMIN_ID:
+        return
+    uid = int(call.data.replace("wipe_user_", ""))
+    user = get_user(uid)
+    uname = user[6] if user[6] else "—"
+    text = (
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"   🧹 ОЧИСТКА USER {uid}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 {uname}\n\n"
+        f"Что удалить?"
+    )
+    try:
+        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id,
+                              parse_mode='HTML', reply_markup=wipe_user_menu(uid))
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("wipe_user_do_"))
+def wipe_user_do(call):
+    if call.message.chat.id != ADMIN_ID:
+        return
+    rest = call.data.replace("wipe_user_do_", "")
+    parts = rest.split("_", 1)
+    if len(parts) < 2:
+        bot.answer_callback_query(call.id, "❌ Ошибка.")
+        return
+    what, uid_str = parts
+    try:
+        uid = int(uid_str)
+    except ValueError:
+        bot.answer_callback_query(call.id, "❌ Ошибка ID.")
+        return
+    wipe_user_data(uid, what)
+    bot.answer_callback_query(call.id, "✅ Очищено")
+    wipe_user_menu_handler(call)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("wipe_confirm_"))
+def wipe_confirm(call):
+    if call.message.chat.id != ADMIN_ID:
+        return
+    what = call.data.replace("wipe_confirm_", "")
+    names = {
+        "chat_all": "💬 ВСЕ ПЕРЕПИСКИ",
+        "image_all": "🎨 ВСЕ ГЕНЕРАЦИИ",
+        "edit_all": "🖼 ВСЕ РЕДАКТИРОВАНИЯ",
+        "stats_all": "📊 ВСЮ СТАТИСТИКУ",
+        "all_all": "💥 ВСЁ (кроме юзеров)",
+    }
+    label = names.get(what, what)
+    text = (
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "   ⚠️ ПОДТВЕРЖДЕНИЕ\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Удалить: <b>{label}</b>\n\n"
+        f"У ВСЕХ пользователей.\n\n"
+        f"Нельзя отменить."
+    )
+    try:
+        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id,
+                              parse_mode='HTML', reply_markup=wipe_confirm_menu(what))
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("wipe_do_"))
+def wipe_do(call):
+    if call.message.chat.id != ADMIN_ID:
+        return
+    what = call.data.replace("wipe_do_", "")
+    mapping = {
+        "chat_all": "chat",
+        "image_all": "image",
+        "edit_all": "edit",
+        "stats_all": "stats",
+        "all_all": "all",
+    }
+    real_what = mapping.get(what, what)
+    wipe_all_data(real_what)
+    bot.answer_callback_query(call.id, "✅ Очищено")
+    try:
+        bot.edit_message_text(
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "      🧹 ОЧИСТКА\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "✅ Готово!\n\n"
+            "Что ещё очистить?",
+            chat_id=call.message.chat.id, message_id=call.message.message_id,
+            parse_mode='HTML', reply_markup=wipe_menu())
+    except Exception:
+        pass
+
+
 # === ПОДПИСКИ ===
 @bot.callback_query_handler(func=lambda call: call.data == "admin_subs")
 def admin_subs(call):
@@ -3650,7 +3901,7 @@ def admin_tickets_open(call):
     tickets = get_open_tickets()
     if not tickets:
         try:
-            bot.edit_message_text("📬 Открытых тикетов нет.",
+            bot.edit_message_text("📬 Открытых нет.",
                                   chat_id=call.message.chat.id, message_id=call.message.message_id,
                                   reply_markup=tickets_menu())
         except Exception:
@@ -3742,7 +3993,7 @@ def admin_reply(call):
         return
     ticket_id = int(call.data.replace("admin_reply_", ""))
     sent = bot.send_message(call.message.chat.id, f"✍️ Ответ на тикет #{ticket_id}:",
-                            reply_markup=back_to_main_menu())
+                            reply_markup=back_to_admin_menu())
     bot.register_next_step_handler(sent, admin_send_reply, ticket_id)
     bot.answer_callback_query(call.id)
 
@@ -3775,14 +4026,14 @@ def admin_give(call):
         return
     users = get_all_users()
     if not users:
-        bot.answer_callback_query(call.id, "Пользователей нет.")
+        bot.answer_callback_query(call.id, "Юзеров нет.")
         return
     markup = telebot.types.InlineKeyboardMarkup()
     for uid, uname, tokens in users[:30]:
         name = uname if uname else "—"
         markup.add(telebot.types.InlineKeyboardButton(f"🆔 {uid} — {name} ({tokens})",
                                                        callback_data=f"admin_give_to_{uid}"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_admin"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
     try:
         bot.edit_message_text("💰 <b>Начислить токены</b>\n\nВыбери пользователя:",
                               chat_id=call.message.chat.id, message_id=call.message.message_id,
@@ -3798,7 +4049,7 @@ def admin_give_to(call):
         return
     uid = int(call.data.replace("admin_give_to_", ""))
     sent = bot.send_message(call.message.chat.id, f"💰 Кол-во токенов для <code>{uid}</code>:",
-                            parse_mode='HTML', reply_markup=back_to_main_menu())
+                            parse_mode='HTML', reply_markup=back_to_admin_menu())
     bot.register_next_step_handler(sent, admin_give_amount, uid)
     bot.answer_callback_query(call.id)
 
@@ -3838,7 +4089,7 @@ def admin_take(call):
         name = uname if uname else "—"
         markup.add(telebot.types.InlineKeyboardButton(f"🆔 {uid} — {name} ({tokens})",
                                                        callback_data=f"admin_take_from_{uid}"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_admin"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
     try:
         bot.edit_message_text("💸 <b>Забрать токены</b>\n\nВыбери пользователя:",
                               chat_id=call.message.chat.id, message_id=call.message.message_id,
@@ -3854,7 +4105,7 @@ def admin_take_from(call):
         return
     uid = int(call.data.replace("admin_take_from_", ""))
     sent = bot.send_message(call.message.chat.id, f"💸 Сколько токенов забрать у <code>{uid}</code>?",
-                            parse_mode='HTML', reply_markup=back_to_main_menu())
+                            parse_mode='HTML', reply_markup=back_to_admin_menu())
     bot.register_next_step_handler(sent, admin_take_amount, uid)
     bot.answer_callback_query(call.id)
 
@@ -3882,7 +4133,7 @@ def admin_take_amount(message, uid):
     remember(message.chat.id, sent.message_id)
 
 
-# === СПИСОК / О ЮЗЕРЕ / ПОКУПКИ / ОЧИСТКА ===
+# === СПИСОК / О ЮЗЕРЕ / ПОКУПКИ ===
 @bot.callback_query_handler(func=lambda call: call.data == "admin_users")
 def admin_users(call):
     if call.message.chat.id != ADMIN_ID:
@@ -3915,7 +4166,7 @@ def admin_manage(call):
     for uid, uname, tokens in users[:30]:
         name = uname if uname else "—"
         markup.add(telebot.types.InlineKeyboardButton(f"🆔 {uid} — {name}", callback_data=f"admin_mng_{uid}"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_admin"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
     try:
         bot.edit_message_text("🚫 <b>Управление юзером</b>\n\nВыбери:",
                               chat_id=call.message.chat.id, message_id=call.message.message_id,
@@ -4002,7 +4253,7 @@ def admin_mng_ban(call):
         return
     uid = int(call.data.replace("admin_mng_ban_", ""))
     sent = bot.send_message(call.message.chat.id, f"🚫 Причина бана <code>{uid}</code>:",
-                            parse_mode='HTML', reply_markup=back_to_main_menu())
+                            parse_mode='HTML', reply_markup=back_to_admin_menu())
     bot.register_next_step_handler(sent, admin_mng_ban_save, uid)
     bot.answer_callback_query(call.id)
 
@@ -4121,7 +4372,7 @@ def admin_mng_mute(call):
     sent = bot.send_message(call.message.chat.id,
                             f"🚫 На сколько минут замутить поддержку <code>{uid}</code>?\n\n"
                             f"<i>Введи число (например 5)</i>",
-                            parse_mode='HTML', reply_markup=back_to_main_menu())
+                            parse_mode='HTML', reply_markup=back_to_admin_menu())
     bot.register_next_step_handler(sent, admin_mng_mute_save, uid)
     bot.answer_callback_query(call.id)
 
@@ -4183,7 +4434,7 @@ def admin_lim_img(call):
         return
     uid = int(call.data.replace("admin_lim_img_", ""))
     sent = bot.send_message(call.message.chat.id, f"🎨 Лимит картинок для <code>{uid}</code> (-1=∞):",
-                            parse_mode='HTML', reply_markup=back_to_main_menu())
+                            parse_mode='HTML', reply_markup=back_to_admin_menu())
     bot.register_next_step_handler(sent, admin_lim_img_save, uid)
     bot.answer_callback_query(call.id)
 
@@ -4215,7 +4466,7 @@ def admin_lim_edit(call):
         return
     uid = int(call.data.replace("admin_lim_edit_", ""))
     sent = bot.send_message(call.message.chat.id, f"🖼 Лимит правок для <code>{uid}</code> (-1=∞):",
-                            parse_mode='HTML', reply_markup=back_to_main_menu())
+                            parse_mode='HTML', reply_markup=back_to_admin_menu())
     bot.register_next_step_handler(sent, admin_lim_edit_save, uid)
     bot.answer_callback_query(call.id)
 
@@ -4247,7 +4498,7 @@ def admin_lim_chat(call):
         return
     uid = int(call.data.replace("admin_lim_chat_", ""))
     sent = bot.send_message(call.message.chat.id, f"🤖 Лимит чата для <code>{uid}</code> (-1=∞):",
-                            parse_mode='HTML', reply_markup=back_to_main_menu())
+                            parse_mode='HTML', reply_markup=back_to_admin_menu())
     bot.register_next_step_handler(sent, admin_lim_chat_save, uid)
     bot.answer_callback_query(call.id)
 
@@ -4349,7 +4600,7 @@ def admin_mng_write(call):
         return
     uid = int(call.data.replace("admin_mng_write_", ""))
     sent = bot.send_message(call.message.chat.id, f"✍️ Сообщение для <code>{uid}</code>:",
-                            parse_mode='HTML', reply_markup=back_to_main_menu())
+                            parse_mode='HTML', reply_markup=back_to_admin_menu())
     bot.register_next_step_handler(sent, admin_mng_write_save, uid)
     bot.answer_callback_query(call.id)
 
@@ -4387,7 +4638,7 @@ def admin_limits_root(call):
         name = uname if uname else "—"
         markup.add(telebot.types.InlineKeyboardButton(f"🎯 {uid} — {name}",
                                                        callback_data=f"admin_mng_limits_{uid}"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_admin"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
     try:
         bot.edit_message_text("🎯 <b>Лимиты</b>\n\nВыбери юзера:",
                               chat_id=call.message.chat.id, message_id=call.message.message_id,
@@ -4429,62 +4680,6 @@ def admin_orders(call):
     bot.answer_callback_query(call.id)
 
 
-@bot.callback_query_handler(func=lambda call: call.data == "admin_clearmem")
-def admin_clearmem(call):
-    if call.message.chat.id != ADMIN_ID:
-        return
-    users = get_all_users()
-    if not users:
-        return
-    markup = telebot.types.InlineKeyboardMarkup()
-    for uid, uname, tokens in users[:30]:
-        name = uname if uname else "—"
-        markup.add(telebot.types.InlineKeyboardButton(f"🧹 {uid} — {name}",
-                                                       callback_data=f"admin_clearmem_{uid}"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_admin"))
-    try:
-        bot.edit_message_text("🧹 <b>Очистить память</b>\n\nВыбери:",
-                              chat_id=call.message.chat.id, message_id=call.message.message_id,
-                              parse_mode='HTML', reply_markup=markup)
-    except Exception:
-        pass
-    bot.answer_callback_query(call.id)
-
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_clearmem_") and not call.data.startswith("admin_clearmem_yes_"))
-def admin_clearmem_confirm(call):
-    if call.message.chat.id != ADMIN_ID or call.data == "admin_clearmem":
-        return
-    uid = int(call.data.replace("admin_clearmem_", ""))
-    user = get_user(uid)
-    uname = user[6] if user[6] else "—"
-    text = f"⚠️ Очистить память у:\n🆔 <code>{uid}</code>\n👤 {uname}\n\nНельзя отменить."
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("✅ Да", callback_data=f"admin_clearmem_yes_{uid}"))
-    markup.add(telebot.types.InlineKeyboardButton("❌ Отмена", callback_data="admin_clearmem"))
-    try:
-        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id,
-                              parse_mode='HTML', reply_markup=markup)
-    except Exception:
-        pass
-    bot.answer_callback_query(call.id)
-
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_clearmem_yes_"))
-def admin_clearmem_do(call):
-    if call.message.chat.id != ADMIN_ID:
-        return
-    uid = int(call.data.replace("admin_clearmem_yes_", ""))
-    clear_history(uid)
-    bot.answer_callback_query(call.id, "✅ Очищено")
-    try:
-        bot.edit_message_text(f"✅ Память <code>{uid}</code> очищена.",
-                              chat_id=call.message.chat.id, message_id=call.message.message_id,
-                              parse_mode='HTML', reply_markup=admin_menu())
-    except Exception:
-        pass
-
-
 @bot.callback_query_handler(func=lambda call: call.data == "admin_broadcast")
 def admin_broadcast(call):
     if call.message.chat.id != ADMIN_ID:
@@ -4494,7 +4689,7 @@ def admin_broadcast(call):
     markup.add(telebot.types.InlineKeyboardButton("📨 Без подписи", callback_data="admin_bc_unsigned"))
     if last_broadcast["active"]:
         markup.add(telebot.types.InlineKeyboardButton("🗑 Удалить", callback_data="admin_bc_delete"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_admin"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
     try:
         bot.edit_message_text("📢 <b>Рассылка</b>\n\nВыбери тип:",
                               chat_id=call.message.chat.id, message_id=call.message.message_id,
@@ -4509,7 +4704,7 @@ def admin_broadcast_type(call):
     if call.message.chat.id != ADMIN_ID:
         return
     signed = call.data == "admin_bc_signed"
-    sent = bot.send_message(call.message.chat.id, "📢 Введи текст:", reply_markup=back_to_main_menu())
+    sent = bot.send_message(call.message.chat.id, "📢 Введи текст:", reply_markup=back_to_admin_menu())
     bot.register_next_step_handler(sent, admin_broadcast_confirm, signed)
     bot.answer_callback_query(call.id)
 
@@ -4587,7 +4782,7 @@ def admin_bc_yes(call):
     last_broadcast = {"messages": sent_messages, "active": True}
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("🗑 Удалить", callback_data="admin_bc_delete"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_admin"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
     bot.send_message(call.message.chat.id, f"✅ Отправлено: <b>{sent_count}</b>",
                      parse_mode='HTML', reply_markup=markup)
 
@@ -4616,7 +4811,7 @@ def admin_bc_delete(call):
         pass
 
 
-# === ОЧИСТКА СТАРЫХ ЗАКАЗОВ ===
+# === ФОНОВАЯ ОЧИСТКА СТАРЫХ ЗАКАЗОВ ===
 def cleanup_orders_worker():
     while True:
         try:
