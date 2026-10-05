@@ -119,6 +119,46 @@ def format_size(size):
         return f"{size / (1024 * 1024):.1f} MB"
 
 
+def render_progress_bar(percent, width=22):
+    """Красивый градиент-бар."""
+    filled = int(width * percent / 100)
+    empty = width - filled
+    # Градиент: █ → ▓ → ▒ → ░
+    if filled == 0:
+        bar = "░" * width
+    elif filled >= width:
+        bar = "█" * width
+    else:
+        # Плавный переход
+        fill_part = "█" * max(0, filled - 6)
+        gradient_part = ""
+        remains = filled - len(fill_part)
+        if remains > 0:
+            gradient = "▓▒░"
+            for i in range(remains):
+                gradient_part += gradient[i % 3]
+        bar = fill_part + gradient_part + ("░" * empty)
+    return bar
+
+
+PROGRESS_STAGES = [
+    (0, "⏳ Анализирую..."),
+    (15, "🎨 Начинаю..."),
+    (35, "💎 Рисую основу..."),
+    (55, "✨ Добавляю детали..."),
+    (75, "🔥 Финал..."),
+    (100, "✅ Готово!"),
+]
+
+
+def get_stage_text(percent):
+    text = "⏳ Обрабатываю..."
+    for p, t in PROGRESS_STAGES:
+        if percent >= p:
+            text = t
+    return text
+
+
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -560,7 +600,6 @@ def get_user_tickets(chat_id):
 
 
 def delete_user_account(chat_id):
-    """Полное удаление данных юзера. Бан остаётся. Акция сбрасывается."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("DELETE FROM users WHERE chat_id=?", (chat_id,))
@@ -744,7 +783,6 @@ def tickets_menu():
 
 
 def buy_menu(chat_id):
-    """Только кнопки с токенами — цены в тексте сообщения."""
     markup = telebot.types.InlineKeyboardMarkup()
     user = get_user(chat_id)
     trial_started = user[4]
@@ -754,13 +792,13 @@ def buy_menu(chat_id):
         left = TRIAL_WINDOW - (now - trial_started)
         minutes = left // 60
         markup.add(telebot.types.InlineKeyboardButton(
-            f"🎁 АКЦИЯ: 10 токенов ({minutes} мин)",
+            f"🎁 50 ₽ — 10 токенов ({minutes} мин)",
             callback_data="pack_trial"
         ))
-    markup.add(telebot.types.InlineKeyboardButton("20 токенов", callback_data="pack_100_20"))
-    markup.add(telebot.types.InlineKeyboardButton("50 токенов", callback_data="pack_250_50"))
-    markup.add(telebot.types.InlineKeyboardButton("100 токенов", callback_data="pack_500_100"))
-    markup.add(telebot.types.InlineKeyboardButton("200 токенов", callback_data="pack_1000_200"))
+    markup.add(telebot.types.InlineKeyboardButton("💵 100 ₽ — 20 токенов", callback_data="pack_100_20"))
+    markup.add(telebot.types.InlineKeyboardButton("💵 250 ₽ — 50 токенов", callback_data="pack_250_50"))
+    markup.add(telebot.types.InlineKeyboardButton("💵 500 ₽ — 100 токенов", callback_data="pack_500_100"))
+    markup.add(telebot.types.InlineKeyboardButton("💵 1000 ₽ — 200 токенов", callback_data="pack_1000_200"))
     markup.add(telebot.types.InlineKeyboardButton("✏️ Своя сумма (20–3000)", callback_data="custom_amount"))
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
     return markup
@@ -1104,7 +1142,6 @@ def delete_account_yes(call):
     bot.answer_callback_query(call.id)
 
 
-# === ИНСТРУКЦИЯ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_help")
 def menu_help(call):
     if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
@@ -1319,31 +1356,102 @@ def img_confirm_yes(call):
     except Exception:
         pass
     bot.answer_callback_query(call.id)
-    sent = bot.send_message(call.message.chat.id, "🎨 <b>Рисую картинку...</b>\n⏳ Подожди 20-40 секунд.",
-                            parse_mode='HTML')
-    remember(call.message.chat.id, sent.message_id)
-    image_url = generate_image_bothub(prompt)
+
+    # === ЗАПУСК ПРОГРЕСС-БАРА ===
+    chat_id = call.message.chat.id
+    bar_width = 22
+    bar_msg = None
     try:
-        bot.delete_message(call.message.chat.id, sent.message_id)
+        bar_text = (
+            f"🎨 <b>Генерация картинки</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<code>{render_progress_bar(0, bar_width)}</code> 0%\n"
+            f"⏳ Анализирую...\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📝 Промт: <code>{escape_html(prompt)}</code>"
+        )
+        bar_msg = bot.send_message(chat_id, bar_text, parse_mode='HTML')
+        remember(chat_id, bar_msg.message_id)
     except Exception:
-        pass
+        bar_msg = None
+
+    # Запускаем поток: имитируем прогресс, пока реально генерируется
+    generation_done = threading.Event()
+    generation_result = {"url": None}
+
+    def do_generation():
+        try:
+            url = generate_image_bothub(prompt)
+            generation_result["url"] = url
+        except Exception as e:
+            print(f"Gen error: {e}")
+        finally:
+            generation_done.set()
+
+    threading.Thread(target=do_generation, daemon=True).start()
+
+    # Цикл обновления бара
+    percent = 0
+    if bar_msg:
+        while not generation_done.is_set():
+            if percent < 90:
+                percent += 15
+                if percent > 90:
+                    percent = 90
+            else:
+                # Держим на 90-95%, пока не готово
+                percent = 90 + (percent % 6) if percent >= 90 else 90
+                percent = min(percent + 1, 95)
+            try:
+                bar_text = (
+                    f"🎨 <b>Генерация картинки</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"<code>{render_progress_bar(percent, bar_width)}</code> {percent}%\n"
+                    f"{get_stage_text(percent)}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📝 Промт: <code>{escape_html(prompt)}</code>"
+                )
+                bot.edit_message_text(bar_text, chat_id=chat_id,
+                                      message_id=bar_msg.message_id, parse_mode='HTML')
+            except Exception:
+                pass
+            time.sleep(2)
+
+    # Финальный апдейт: 100%
+    if bar_msg:
+        try:
+            bar_text = (
+                f"🎨 <b>Генерация картинки</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"<code>{render_progress_bar(100, bar_width)}</code> 100%\n"
+                f"✅ Готово!\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━"
+            )
+            bot.edit_message_text(bar_text, chat_id=chat_id,
+                                  message_id=bar_msg.message_id, parse_mode='HTML')
+            time.sleep(1)
+            bot.delete_message(chat_id, bar_msg.message_id)
+        except Exception:
+            pass
+
+    image_url = generation_result["url"]
     if not image_url:
-        sent = bot.send_message(call.message.chat.id, "❌ Не удалось сгенерировать картинку. Попробуй позже.",
+        sent = bot.send_message(chat_id, "❌ Не удалось сгенерировать картинку. Попробуй позже.",
                                 reply_markup=back_menu())
-        remember(call.message.chat.id, sent.message_id)
+        remember(chat_id, sent.message_id)
         return
     try:
         img = requests.get(image_url, timeout=60).content
-        sent = bot.send_photo(call.message.chat.id, img, caption=f"🎨 <b>{escape_html(prompt)}</b>",
+        sent = bot.send_photo(chat_id, img, caption=f"🎨 <b>{escape_html(prompt)}</b>",
                               parse_mode='HTML', reply_markup=back_menu())
-        remember(call.message.chat.id, sent.message_id)
-        add_tokens(call.message.chat.id, -IMAGE_COST)
-        log_stat(call.message.chat.id, IMAGE_COST)
-        add_image_history(call.message.chat.id, prompt, image_url, kind="gen")
-        inc_used(call.message.chat.id, 'used_images')
+        remember(chat_id, sent.message_id)
+        add_tokens(chat_id, -IMAGE_COST)
+        log_stat(chat_id, IMAGE_COST)
+        add_image_history(chat_id, prompt, image_url, kind="gen")
+        inc_used(chat_id, 'used_images')
     except Exception as e:
-        sent = bot.send_message(call.message.chat.id, f"❌ Ошибка отправки: {e}", reply_markup=back_menu())
-        remember(call.message.chat.id, sent.message_id)
+        sent = bot.send_message(chat_id, f"❌ Ошибка отправки: {e}", reply_markup=back_menu())
+        remember(chat_id, sent.message_id)
 
 
 def generate_image_bothub(prompt):
@@ -1836,12 +1944,7 @@ def buy_tokens(call):
         text = (
             "💳 <b>Покупка токенов</b>\n"
             "────────────────\n"
-            "💵 <b>Цены:</b>\n"
-            "• 100 ₽ → <b>20 токенов</b>\n"
-            "• 250 ₽ → <b>50 токенов</b>\n"
-            "• 500 ₽ → <b>100 токенов</b>\n"
-            "• 1000 ₽ → <b>200 токенов</b>\n\n"
-            "Нажми на нужное количество 👇"
+            "Выбери пакет 👇"
         )
         sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=buy_menu(call.message.chat.id))
     remember(call.message.chat.id, sent.message_id)
@@ -1860,12 +1963,7 @@ def decline_gift(call):
     text = (
         "💳 <b>Покупка токенов</b>\n"
         "────────────────\n"
-        "💵 <b>Цены:</b>\n"
-        "• 100 ₽ → <b>20 токенов</b>\n"
-        "• 250 ₽ → <b>50 токенов</b>\n"
-        "• 500 ₽ → <b>100 токенов</b>\n"
-        "• 1000 ₽ → <b>200 токенов</b>\n\n"
-        "Нажми на нужное количество 👇"
+        "Выбери пакет 👇"
     )
     sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=buy_menu(call.message.chat.id))
     remember(call.message.chat.id, sent.message_id)
@@ -2427,7 +2525,6 @@ def admin_panel(call):
     bot.answer_callback_query(call.id)
 
 
-# === ТЕХ.РАБОТЫ ===
 @bot.callback_query_handler(func=lambda call: call.data == "admin_maintenance")
 def admin_maintenance(call):
     if call.message.chat.id != ADMIN_ID:
@@ -2537,7 +2634,6 @@ def maint_notify(call):
     admin_maintenance(call)
 
 
-# === УПРАВЛЕНИЕ ЮЗЕРОМ ===
 @bot.callback_query_handler(func=lambda call: call.data == "admin_manage")
 def admin_manage(call):
     if call.message.chat.id != ADMIN_ID:
@@ -3159,7 +3255,6 @@ def admin_send_reply(message, ticket_id):
     remember(message.chat.id, sent.message_id)
 
 
-# === НАЧИСЛИТЬ / ЗАБРАТЬ ===
 @bot.callback_query_handler(func=lambda call: call.data == "admin_give")
 def admin_give(call):
     if call.message.chat.id != ADMIN_ID:
@@ -3274,7 +3369,6 @@ def admin_take_amount(message, uid):
     remember(message.chat.id, sent.message_id)
 
 
-# === СПИСОК / О ЮЗЕРЕ / ПОКУПКИ / ОЧИСТКА ===
 @bot.callback_query_handler(func=lambda call: call.data == "admin_users")
 def admin_users(call):
     if call.message.chat.id != ADMIN_ID:
@@ -3438,7 +3532,6 @@ def admin_clearmem_do(call):
         pass
 
 
-# === РАССЫЛКА ===
 @bot.callback_query_handler(func=lambda call: call.data == "admin_broadcast")
 def admin_broadcast(call):
     if call.message.chat.id != ADMIN_ID:
@@ -3672,7 +3765,6 @@ def set_mode(call):
         pass
 
 
-# === GIGACHAT ===
 def get_gigachat_token():
     url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
     headers = {
@@ -3777,7 +3869,6 @@ def ask_gigachat(chat_id, question, mode, ai_mode):
         return f"❌ Ошибка: {e}"
 
 
-# === ОБРАБОТКА ТЕКСТОВЫХ СООБЩЕНИЙ ===
 @bot.message_handler(content_types=['text'])
 def handle_message(message):
     if message.text == "⬅️ Назад":
@@ -3942,7 +4033,6 @@ def handle_message(message):
         remember(message.chat.id, sent.message_id)
 
 
-# === ОБРАБОТКА ФОТО ===
 @bot.message_handler(content_types=['photo'])
 def handle_photo(message):
     if send_banned_message(message.chat.id):
@@ -3962,7 +4052,6 @@ def handle_photo(message):
         return
 
 
-# === ОПЛАТА ===
 @app.route('/pay/<amount>/<label>')
 def pay_page(amount, label):
     html = f'''<html><head><meta charset="utf-8"><title>Оплата...</title></head>
