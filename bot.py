@@ -44,6 +44,7 @@ ALLOWED_EXT = [
 ]
 
 last_broadcast = {"messages": [], "active": False}
+edit_photos_cache = {}
 
 
 def escape_html(text):
@@ -74,20 +75,14 @@ def detect_code_language(text):
             "javascript": "js", "js": "js", "node": "js",
             "typescript": "ts", "ts": "ts",
             "cpp": "cpp", "c++": "cpp", "cxx": "cpp",
-            "c": "c",
-            "java": "java",
+            "c": "c", "java": "java",
             "go": "go", "golang": "go",
             "rust": "rs", "rs": "rs",
             "ruby": "rb", "rb": "rb",
-            "php": "php",
-            "html": "html",
-            "css": "css",
-            "sql": "sql",
-            "bash": "sh", "sh": "sh", "shell": "sh",
-            "yaml": "yaml", "yml": "yaml",
-            "json": "json",
-            "xml": "xml",
-            "markdown": "md", "md": "md",
+            "php": "php", "html": "html", "css": "css",
+            "sql": "sql", "bash": "sh", "sh": "sh", "shell": "sh",
+            "yaml": "yaml", "yml": "yaml", "json": "json",
+            "xml": "xml", "markdown": "md", "md": "md",
         }
         return mapping.get(lang, "txt")
     text_lower = text.lower()
@@ -155,7 +150,8 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         chat_id INTEGER,
         prompt TEXT,
-        image_url TEXT
+        image_url TEXT,
+        kind TEXT DEFAULT 'gen'
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS stats (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -224,11 +220,15 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
-    try:
-        c.execute("ALTER TABLE image_history ADD COLUMN timestamp INTEGER DEFAULT 0")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
+    for col, definition in [
+        ("timestamp", "INTEGER DEFAULT 0"),
+        ("kind", "TEXT DEFAULT 'gen'"),
+    ]:
+        try:
+            c.execute(f"ALTER TABLE image_history ADD COLUMN {col} {definition}")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
 
     try:
         c.execute("ALTER TABLE maintenance ADD COLUMN message TEXT DEFAULT 'Технические работы, пожалуйста подождите'")
@@ -430,11 +430,11 @@ def clear_history(chat_id):
     conn.close()
 
 
-def add_image_history(chat_id, prompt, image_url):
+def add_image_history(chat_id, prompt, image_url, kind="gen"):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("INSERT INTO image_history (chat_id, prompt, image_url, timestamp) VALUES (?, ?, ?, ?)",
-              (chat_id, prompt, image_url, int(time.time())))
+    c.execute("INSERT INTO image_history (chat_id, prompt, image_url, timestamp, kind) VALUES (?, ?, ?, ?, ?)",
+              (chat_id, prompt, image_url, int(time.time()), kind))
     conn.commit()
     conn.close()
 
@@ -442,8 +442,18 @@ def add_image_history(chat_id, prompt, image_url):
 def get_image_history(chat_id, limit=20):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT prompt, image_url, timestamp FROM image_history WHERE chat_id=? ORDER BY id DESC LIMIT ?",
+    c.execute("SELECT prompt, image_url, timestamp, kind FROM image_history WHERE chat_id=? ORDER BY id DESC LIMIT ?",
               (chat_id, limit))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def get_image_history_by_kind(chat_id, kind, limit=20):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT prompt, image_url, timestamp FROM image_history WHERE chat_id=? AND kind=? ORDER BY id DESC LIMIT ?",
+              (chat_id, kind, limit))
     rows = c.fetchall()
     conn.close()
     return rows
@@ -452,7 +462,7 @@ def get_image_history(chat_id, limit=20):
 def get_full_image_history(chat_id, limit=100):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT prompt, image_url, timestamp FROM image_history WHERE chat_id=? ORDER BY id ASC LIMIT ?",
+    c.execute("SELECT prompt, image_url, timestamp, kind FROM image_history WHERE chat_id=? ORDER BY id ASC LIMIT ?",
               (chat_id, limit))
     rows = c.fetchall()
     conn.close()
@@ -625,18 +635,19 @@ def send_long_text_as_file(chat_id, text, filename="otvet.txt"):
         return False
 
 
-def send_code_as_file(chat_id, text, mode="coder"):
-    """Отправка кода файлом + отдельно ответ (в коде или текстом)."""
-    lang = detect_code_language(text)
-    filename = f"code.{lang}" if lang != "txt" else "code.txt"
-    code_only = extract_code_block(text)
+def send_photo_safe(chat_id, image_url, caption):
+    """Безопасная отправка фото по URL. Возвращает message_id или None."""
     try:
-        bot.send_document(chat_id, (filename, code_only.encode('utf-8')),
-                          caption=f"💻 Скрипт ({filename})")
-        return True
+        r = requests.get(image_url, timeout=15)
+        if r.status_code != 200:
+            print(f"Photo HTTP {r.status_code}: {image_url}")
+            return None
+        img = r.content
+        msg = bot.send_photo(chat_id, img, caption=caption, parse_mode='HTML')
+        return msg.message_id
     except Exception as e:
-        print(f"Send code file error: {e}")
-        return False
+        print(f"Send photo error: {e}")
+        return None
 
 
 def check_banned(chat_id):
@@ -797,6 +808,7 @@ def back_menu():
 def history_menu():
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("🎨 История фото", callback_data="hist_image"))
+    markup.add(telebot.types.InlineKeyboardButton("🖼 История редактирований", callback_data="hist_edit"))
     markup.add(telebot.types.InlineKeyboardButton("🤖 История чата", callback_data="hist_chat"))
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
     return markup
@@ -840,6 +852,14 @@ def edit_confirm_menu():
     return markup
 
 
+def edit_more_menu():
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("📸 Прислать фото", callback_data="edit_add_more"))
+    markup.add(telebot.types.InlineKeyboardButton("✅ Готово, обработать", callback_data="edit_confirm_yes"))
+    markup.add(telebot.types.InlineKeyboardButton("❌ Отмена", callback_data="edit_cancel"))
+    return markup
+
+
 def send_main_menu(chat_id):
     tokens = get_user(chat_id)[0]
     update_user(chat_id, 'state', 'idle')
@@ -865,8 +885,7 @@ def start(message):
         try:
             bot.send_message(
                 message.chat.id,
-                f"🚫 <b>Вы были забанены.</b>\n\nПричина: {escape_html(ban_reason) if ban_reason else 'не указана'}\n\n"
-                f"Для разбана обратитесь в поддержку.",
+                f"🚫 <b>Вы были забанены.</b>\n\nПричина: {escape_html(ban_reason) if ban_reason else 'не указана'}\n\nДля разбана обратитесь в поддержку.",
                 parse_mode='HTML')
         except Exception:
             pass
@@ -1015,6 +1034,7 @@ def support(call):
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
+
 @bot.callback_query_handler(func=lambda call: call.data == "delete_account")
 def delete_account(call):
     if send_banned_message(call.message.chat.id):
@@ -1031,6 +1051,7 @@ def delete_account(call):
         "• 💰 Все токены\n"
         "• 📜 История чата с ИИ\n"
         "• 🎨 История картинок\n"
+        "• 🖼 История редактирований\n"
         "• 🛒 Все заказы\n"
         "• 📋 Все тикеты\n"
         "• 📊 Статистика\n\n"
@@ -1054,15 +1075,10 @@ def delete_account_yes(call):
     markup.add(telebot.types.InlineKeyboardButton("🔄 Начать заново", callback_data="menu_main"))
     sent = bot.send_message(
         uid,
-        "✅ <b>Аккаунт удалён.</b>\n\n"
-        "Все данные обнулены.\n"
-        "Нажми «Начать заново» или /start.",
-        parse_mode='HTML',
-        reply_markup=markup
-    )
+        "✅ <b>Аккаунт удалён.</b>\n\nВсе данные обнулены.\nНажми «Начать заново» или /start.",
+        parse_mode='HTML', reply_markup=markup)
     remember(uid, sent.message_id)
     bot.answer_callback_query(call.id)
-
 
 # === ГЕНЕРАЦИЯ КАРТИНОК ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_image")
@@ -1220,7 +1236,7 @@ def img_confirm_yes(call):
         remember(call.message.chat.id, sent.message_id)
         add_tokens(call.message.chat.id, -IMAGE_COST)
         log_stat(call.message.chat.id, IMAGE_COST)
-        add_image_history(call.message.chat.id, prompt, image_url)
+        add_image_history(call.message.chat.id, prompt, image_url, kind="gen")
         inc_used(call.message.chat.id, 'used_images')
     except Exception as e:
         sent = bot.send_message(call.message.chat.id, f"❌ Ошибка отправки: {e}", reply_markup=back_menu())
@@ -1297,11 +1313,13 @@ def edit_menu(call):
         bot.answer_callback_query(call.id)
         return
 
+    edit_photos_cache[call.message.chat.id] = {"photos": [], "prompt": ""}
     update_user(call.message.chat.id, 'state', 'edit_wait_photo')
     try:
         bot.edit_message_text(
             f"🖼 <b>Редактирование фото</b>\n\nСтоимость: <b>{EDIT_COST} токенов</b>\n💰 У вас: {tokens}\n\n"
-            f"📸 Пришли фото, которое надо отредактировать.",
+            f"📸 Пришли фото, которое надо отредактировать.\n\n"
+            f"<i>Можно прислать несколько фото — потом напишешь задание.</i>",
             chat_id=call.message.chat.id, message_id=call.message.message_id,
             parse_mode='HTML', reply_markup=edit_mode_menu())
     except Exception:
@@ -1314,6 +1332,7 @@ def edit_cancel(call):
     if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
         return
     update_user(call.message.chat.id, 'state', 'idle')
+    edit_photos_cache.pop(call.message.chat.id, None)
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
     except Exception:
@@ -1328,20 +1347,21 @@ def edit_cancel(call):
 def edit_add_more(call):
     if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
         return
+    cache = edit_photos_cache.get(call.message.chat.id, {"photos": [], "prompt": ""})
+    edit_photos_cache[call.message.chat.id] = cache
     update_user(call.message.chat.id, 'state', 'edit_wait_photo')
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
     except Exception:
         pass
     sent = bot.send_message(call.message.chat.id,
-                            "📸 Пришли следующее фото.",
-                            reply_markup=edit_mode_menu())
+                            f"📸 Пришли следующее фото.\n\nВсего сейчас: <b>{len(cache['photos'])}</b>",
+                            parse_mode='HTML', reply_markup=edit_mode_menu())
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
 
 def edit_process_photo(message):
-    """Основной обработчик фото для редактирования."""
     if send_banned_message(message.chat.id):
         return
     if message.chat.id != ADMIN_ID:
@@ -1351,7 +1371,7 @@ def edit_process_photo(message):
     user = get_user(message.chat.id)
     state = user[1]
     tokens = user[0]
-    if not state.startswith('edit_wait_photo') and not state.startswith('edit_collecting'):
+    if not state.startswith('edit_wait_photo'):
         return
 
     if tokens < EDIT_COST:
@@ -1371,61 +1391,50 @@ def edit_process_photo(message):
         remember(message.chat.id, sent.message_id)
         return
 
-    photos = []
-    prompt = ""
-    if state.startswith('edit_collecting:'):
-        rest = state.replace('edit_collecting:', '', 1)
-        parts = rest.split('|', 1)
-        if len(parts) == 2:
-            existing_b64 = parts[0]
-            existing_prompt = parts[1]
-            photos = [existing_b64]
-            prompt = existing_prompt
-    photos.append(b64)
+    cache = edit_photos_cache.get(message.chat.id, {"photos": [], "prompt": ""})
+    cache["photos"].append(b64)
+    edit_photos_cache[message.chat.id] = cache
 
-    preview = " 📸" * len(photos)
-    info = (
-        f"🖼 <b>Фото получено</b>\n"
-        f"────────────────\n"
-        f"📦 Всего фото: {len(photos)}{preview}\n"
-        f"💰 Стоимость: <b>{EDIT_COST} токенов</b>\n\n"
-    )
-    if not prompt:
-        info += (
-            "📝 <b>Что сделать?</b>\n"
-            "Напиши задание, например:\n"
-            "• убери камень\n"
-            "• помести на пляж\n"
-            "• сделай фон размытым"
+    count = len(cache["photos"])
+    if cache["prompt"]:
+        info = (
+            f"🖼 <b>Фото добавлено</b>\n"
+            f"────────────────\n"
+            f"📸 Всего фото: <b>{count}</b>\n"
+            f"💰 Стоимость: <b>{EDIT_COST} токенов</b>\n"
+            f"📝 Задание: <code>{escape_html(cache['prompt'])}</code>\n\n"
+            f"Обработать или добавить ещё?"
         )
+        markup = edit_more_menu()
     else:
-        info += f"📝 <b>Задание:</b>\n<code>{escape_html(prompt)}</code>\n\n"
+        info = (
+            f"🖼 <b>Фото получено</b>\n"
+            f"────────────────\n"
+            f"📸 Всего фото: <b>{count}</b>\n"
+            f"💰 Стоимость: <b>{EDIT_COST} токенов</b>\n\n"
+            f"📝 <b>Что сделать?</b>\n"
+            f"Напиши задание, например:\n"
+            f"• убери камень\n"
+            f"• помести на пляж\n"
+            f"• сделай фон размытым\n\n"
+            f"<i>Или пришли ещё фото — потом напишешь задание.</i>"
+        )
+        markup = edit_more_menu()
 
-    update_user(message.chat.id, 'state',
-                f'edit_collecting:{photos[0][:50]}...{len(photos)}|{prompt}')
-
-    # сохраняем фото в отдельную БД
-    save_edit_photos(message.chat.id, photos, prompt)
-
-    sent = bot.send_message(message.chat.id, info, parse_mode='HTML',
-                            reply_markup=edit_confirm_menu() if prompt else back_menu())
+    sent = bot.send_message(message.chat.id, info, parse_mode='HTML', reply_markup=markup)
     remember(message.chat.id, sent.message_id)
 
-    if not prompt:
+    if not cache["prompt"]:
         bot.register_next_step_handler(sent, edit_ask_prompt)
-
-
-edit_photos_cache = {}
-
-
-def save_edit_photos(chat_id, photos, prompt):
-    edit_photos_cache[chat_id] = {"photos": photos, "prompt": prompt}
 
 
 def edit_ask_prompt(message):
     if message.text == "⬅️ Назад":
         update_user(message.chat.id, 'state', 'idle')
+        edit_photos_cache.pop(message.chat.id, None)
         back_to_main(message)
+        return
+    if message.text in ["📸 Прислать фото", "✅ Готово, обработать", "❌ Отмена"]:
         return
     if send_banned_message(message.chat.id):
         return
@@ -1447,7 +1456,7 @@ def edit_ask_prompt(message):
         f"🖼 <b>Готово к обработке</b>\n\n"
         f"📸 Фото: <b>{len(cache['photos'])}</b>\n"
         f"📝 Задание: <code>{escape_html(prompt)}</code>\n\n"
-        f"Добавить ещё фото или обработать?",
+        f"Обработать или добавить ещё?",
         parse_mode='HTML', reply_markup=edit_confirm_menu())
     remember(message.chat.id, sent.message_id)
 
@@ -1478,7 +1487,7 @@ def edit_confirm_yes(call):
 
     photos = cache["photos"]
     prompt = cache["prompt"]
-    result_url = edit_photo_fluxkontext(photos, prompt)
+    result_url = edit_photo_bothub(photos, prompt)
 
     try:
         bot.delete_message(call.message.chat.id, sent.message_id)
@@ -1502,7 +1511,7 @@ def edit_confirm_yes(call):
         remember(call.message.chat.id, sent.message_id)
         add_tokens(call.message.chat.id, -EDIT_COST)
         log_stat(call.message.chat.id, EDIT_COST)
-        add_image_history(call.message.chat.id, f"[EDIT] {prompt}", result_url)
+        add_image_history(call.message.chat.id, prompt, result_url, kind="edit")
         inc_used(call.message.chat.id, 'used_images')
     except Exception as e:
         sent = bot.send_message(call.message.chat.id, f"❌ Ошибка отправки: {e}",
@@ -1513,32 +1522,49 @@ def edit_confirm_yes(call):
     update_user(call.message.chat.id, 'state', 'idle')
 
 
-def edit_photo_fluxkontext(photos_b64, prompt):
-    """Редактирование через flux-kontext-pro через BotHub."""
+def edit_photo_bothub(photos_b64, prompt):
+    """Редактирование фото через BotHub /v1/images/edits (multipart)."""
     url = "https://openai.bothub.chat/v1/images/edits"
     headers = {
-        "Authorization": f"Bearer {BOTHUB_API_KEY}",
-        "Content-Type": "application/json"
+        "Authorization": f"Bearer {BOTHUB_API_KEY}"
     }
-    # Пробуем передать через base64 data URL
-    images_data = [f"data:image/jpeg;base64,{b64}" for b64 in photos_b64]
+
+    if not photos_b64:
+        return None
+
+    files = []
+    for i, b64 in enumerate(photos_b64):
+        try:
+            if "," in b64:
+                b64 = b64.split(",")[1]
+            img_bytes = base64.b64decode(b64)
+            files.append(("image", (f"input_{i}.png", img_bytes, "image/png")))
+        except Exception as e:
+            print(f"Decode error for photo {i}: {e}")
+            continue
+
+    if not files:
+        print("No valid images to send")
+        return None
+
     data = {
-        "model": "flux-kontext-pro",
+        "model": "gemini-2.5-flash-image",
         "prompt": prompt,
-        "image": images_data if len(images_data) > 1 else images_data[0],
         "response_format": "url"
     }
+
     try:
-        r = requests.post(url, headers=headers, json=data, timeout=180)
+        r = requests.post(url, headers=headers, data=data, files=files, timeout=180)
+        print(f"Edit status: {r.status_code}")
         result = r.json()
-        print(f"FluxKontext response: {result}")
+        print(f"Edit response: {result}")
         if "data" in result and len(result["data"]) > 0:
             return result["data"][0].get("url")
         if "url" in result:
             return result["url"]
         return None
     except Exception as e:
-        print(f"FluxKontext error: {e}")
+        print(f"Edit error: {e}")
         return None
 
 @bot.callback_query_handler(func=lambda call: call.data == "settings_from_chat")
@@ -1846,10 +1872,10 @@ def menu_history(call):
 def hist_image(call):
     if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
         return
-    rows = get_image_history(call.message.chat.id, limit=15)
+    rows = get_image_history_by_kind(call.message.chat.id, "gen", limit=15)
     if not rows:
         try:
-            bot.edit_message_text("🎨 История фото пуста.", chat_id=call.message.chat.id,
+            bot.edit_message_text("🎨 История генераций пуста.", chat_id=call.message.chat.id,
                                   message_id=call.message.message_id, reply_markup=history_menu())
         except Exception:
             pass
@@ -1864,13 +1890,46 @@ def hist_image(call):
     remember(call.message.chat.id, sent.message_id)
     for prompt, image_url, ts in rows:
         when = time.strftime('%d.%m.%Y %H:%M', time.localtime(ts)) if ts else "—"
-        try:
-            img = requests.get(image_url, timeout=30).content
-            s = bot.send_photo(call.message.chat.id, img,
-                               caption=f"🎨 <b>{escape_html(prompt)}</b>\n📅 {when}", parse_mode='HTML')
-            remember(call.message.chat.id, s.message_id)
-        except Exception:
+        msg_id = send_photo_safe(call.message.chat.id, image_url,
+                                 f"🎨 <b>{escape_html(prompt)}</b>\n📅 {when}")
+        if msg_id:
+            remember(call.message.chat.id, msg_id)
+        else:
             s = bot.send_message(call.message.chat.id, f"🎨 {escape_html(prompt)} — {when} (фото недоступно)")
+            remember(call.message.chat.id, s.message_id)
+    s = bot.send_message(call.message.chat.id, "⬅️ Назад в меню", reply_markup=back_menu())
+    remember(call.message.chat.id, s.message_id)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "hist_edit")
+def hist_edit(call):
+    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
+        return
+    rows = get_image_history_by_kind(call.message.chat.id, "edit", limit=15)
+    if not rows:
+        try:
+            bot.edit_message_text("🖼 История редактирований пуста.", chat_id=call.message.chat.id,
+                                  message_id=call.message.message_id, reply_markup=history_menu())
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id)
+        return
+    try:
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
+    clear_old_messages(call.message.chat.id)
+    sent = bot.send_message(call.message.chat.id, "🖼 <b>История редактирований:</b>", parse_mode='HTML')
+    remember(call.message.chat.id, sent.message_id)
+    for prompt, image_url, ts in rows:
+        when = time.strftime('%d.%m.%Y %H:%M', time.localtime(ts)) if ts else "—"
+        msg_id = send_photo_safe(call.message.chat.id, image_url,
+                                 f"🖼 <b>{escape_html(prompt)}</b>\n📅 {when}")
+        if msg_id:
+            remember(call.message.chat.id, msg_id)
+        else:
+            s = bot.send_message(call.message.chat.id, f"🖼 {escape_html(prompt)} — {when} (фото недоступно)")
             remember(call.message.chat.id, s.message_id)
     s = bot.send_message(call.message.chat.id, "⬅️ Назад в меню", reply_markup=back_menu())
     remember(call.message.chat.id, s.message_id)
@@ -2603,12 +2662,18 @@ def admin_mng_hist(call):
     for role, content in history:
         prefix = "👤 ПОЛЬЗОВАТЕЛЬ:" if role == "user" else "🤖 БОБ:"
         txt += f"\n{prefix}\n{content}\n"
-    txt += "\n\n🎨 ГЕНЕРАЦИИ ФОТО:\n" + "-" * 30 + "\n"
+    txt += "\n\n🎨 ГЕНЕРАЦИИ И РЕДАКТИРОВАНИЯ ФОТО:\n" + "-" * 30 + "\n"
     if not img_hist:
         txt += "(пусто)\n"
-    for prompt, image_url, ts in img_hist:
+    for item in img_hist:
+        if len(item) == 4:
+            prompt, image_url, ts, kind = item
+        else:
+            prompt, image_url, ts = item
+            kind = "gen"
         when = time.strftime('%d.%m.%Y %H:%M', time.localtime(ts)) if ts else "—"
-        txt += f"\n[{when}] Промт: {prompt}\nURL: {image_url}\n"
+        tag = "🖼 EDIT" if kind == "edit" else "🎨 GEN"
+        txt += f"\n[{when}] {tag}\nПромт: {prompt}\nURL: {image_url}\n"
 
     try:
         data = txt.encode('utf-8')
@@ -2620,16 +2685,20 @@ def admin_mng_hist(call):
     if img_hist:
         s = bot.send_message(call.message.chat.id, f"🎨 Картинок: {len(img_hist)}. Отправляю...")
         remember(call.message.chat.id, s.message_id)
-        for prompt, image_url, ts in img_hist[-20:]:
+        for item in img_hist[-20:]:
+            if len(item) == 4:
+                prompt, image_url, ts, kind = item
+            else:
+                prompt, image_url, ts = item
+                kind = "gen"
             when = time.strftime('%d.%m.%Y %H:%M', time.localtime(ts)) if ts else "—"
-            try:
-                img = requests.get(image_url, timeout=30).content
-                s = bot.send_photo(call.message.chat.id, img,
-                                   caption=f"🎨 <b>{escape_html(prompt[:200])}</b>\n📅 {when}",
-                                   parse_mode='HTML')
-                remember(call.message.chat.id, s.message_id)
-            except Exception:
-                s = bot.send_message(call.message.chat.id, f"🎨 {escape_html(prompt[:100])} — {when}")
+            tag = "🖼" if kind == "edit" else "🎨"
+            msg_id = send_photo_safe(call.message.chat.id, image_url,
+                                     f"{tag} <b>{escape_html(prompt[:200])}</b>\n📅 {when}")
+            if msg_id:
+                remember(call.message.chat.id, msg_id)
+            else:
+                s = bot.send_message(call.message.chat.id, f"{tag} {escape_html(prompt[:100])} — {when}")
                 remember(call.message.chat.id, s.message_id)
 
     markup = telebot.types.InlineKeyboardMarkup()
@@ -3465,6 +3534,14 @@ def handle_message(message):
     limit_chats = user[15]
     used_chats = user[17]
     send_files = user[18]
+
+    # Состояние редактирования фото — ждём промт
+    if state.startswith('edit_ready') or state.startswith('edit_wait_photo'):
+        # Если это edit_ready, пользователь пишет промт
+        if state.startswith('edit_ready'):
+            edit_ask_prompt(message)
+            return
+
     if state != 'chat':
         return
 
@@ -3532,34 +3609,22 @@ def handle_message(message):
 
     tokens_left = get_user(message.chat.id)[0]
 
-    # Если режим кодера
     if mode == "coder":
+        lang = detect_code_language(answer)
+        code_name = f"code.{lang}" if lang != "txt" else "code.txt"
+        code_only = extract_code_block(answer)
+        try:
+            bot.send_document(message.chat.id, (code_name, code_only.encode('utf-8')),
+                              caption=f"💻 Скрипт ({code_name})")
+        except Exception as e:
+            print(f"Code file error: {e}")
         if send_files:
-            # 2 файла: скрипт + ответ
-            lang = detect_code_language(answer)
-            code_name = f"code.{lang}" if lang != "txt" else "code.txt"
-            code_only = extract_code_block(answer)
-            try:
-                bot.send_document(message.chat.id, (code_name, code_only.encode('utf-8')),
-                                  caption=f"💻 Скрипт ({code_name})")
-            except Exception as e:
-                print(f"Code file error: {e}")
-            # второй файл — объяснение
             send_long_text_as_file(message.chat.id, answer, filename="answer.txt")
-            s = bot.send_message(message.chat.id, f"📎 Скрипт + ответ в файлах.\n\n──────────\n💰 Осталось: {tokens_left}",
+            s = bot.send_message(message.chat.id,
+                                 f"📎 Скрипт + ответ в файлах.\n\n──────────\n💰 Осталось: {tokens_left}",
                                  reply_markup=chat_menu())
             remember(message.chat.id, s.message_id)
         else:
-            # только скрипт файлом, ответ текстом
-            lang = detect_code_language(answer)
-            code_name = f"code.{lang}" if lang != "txt" else "code.txt"
-            code_only = extract_code_block(answer)
-            try:
-                bot.send_document(message.chat.id, (code_name, code_only.encode('utf-8')),
-                                  caption=f"💻 Скрипт ({code_name})")
-            except Exception as e:
-                print(f"Code file error: {e}")
-            # текстом — объяснение (без кода)
             explanation = answer.replace(code_only, "").strip()
             if not explanation:
                 explanation = answer
@@ -3567,30 +3632,34 @@ def handle_message(message):
             if len(safe) > 4000:
                 safe = safe[:4000] + "..."
             try:
-                sent = bot.send_message(message.chat.id, f"{safe}\n\n──────────\n💰 Осталось: {tokens_left}",
-                                        parse_mode='HTML', reply_markup=chat_menu())
+                s = bot.send_message(message.chat.id,
+                                     f"{safe}\n\n──────────\n💰 Осталось: {tokens_left}",
+                                     parse_mode='HTML', reply_markup=chat_menu())
             except Exception:
-                sent = bot.send_message(message.chat.id, f"{explanation}\n\n──────────\n💰 Осталось: {tokens_left}",
-                                        reply_markup=chat_menu())
-            remember(message.chat.id, sent.message_id)
+                s = bot.send_message(message.chat.id,
+                                     f"{explanation}\n\n──────────\n💰 Осталось: {tokens_left}",
+                                     reply_markup=chat_menu())
+            remember(message.chat.id, s.message_id)
         return
 
-    # Обычные режимы
     if send_files or is_code_response(answer):
         lang = detect_code_language(answer)
         filename = f"code.{lang}" if lang != "txt" else "otvet.txt"
         ok = send_long_text_as_file(message.chat.id, answer, filename=filename)
         if ok:
-            s = bot.send_message(message.chat.id, f"📎 Ответ в файле.\n\n──────────\n💰 Осталось: {tokens_left}",
+            s = bot.send_message(message.chat.id,
+                                 f"📎 Ответ в файле.\n\n──────────\n💰 Осталось: {tokens_left}",
                                  reply_markup=chat_menu())
             remember(message.chat.id, s.message_id)
         else:
             safe = escape_html(answer)[:4000]
             try:
-                s = bot.send_message(message.chat.id, f"{safe}\n\n──────────\n💰 Осталось: {tokens_left}",
+                s = bot.send_message(message.chat.id,
+                                     f"{safe}\n\n──────────\n💰 Осталось: {tokens_left}",
                                      parse_mode='HTML', reply_markup=chat_menu())
             except Exception:
-                s = bot.send_message(message.chat.id, f"{answer}\n\n──────────\n💰 Осталось: {tokens_left}",
+                s = bot.send_message(message.chat.id,
+                                     f"{answer}\n\n──────────\n💰 Осталось: {tokens_left}",
                                      reply_markup=chat_menu())
             remember(message.chat.id, s.message_id)
     else:
@@ -3598,10 +3667,12 @@ def handle_message(message):
         if len(safe_answer) > 4000:
             safe_answer = safe_answer[:4000] + "..."
         try:
-            sent = bot.send_message(message.chat.id, f"{safe_answer}\n\n──────────\n💰 Осталось: {tokens_left}",
+            sent = bot.send_message(message.chat.id,
+                                    f"{safe_answer}\n\n──────────\n💰 Осталось: {tokens_left}",
                                     parse_mode='HTML', reply_markup=chat_menu())
         except Exception:
-            sent = bot.send_message(message.chat.id, f"{answer}\n\n──────────\n💰 Осталось: {tokens_left}",
+            sent = bot.send_message(message.chat.id,
+                                    f"{answer}\n\n──────────\n💰 Осталось: {tokens_left}",
                                     reply_markup=chat_menu())
         remember(message.chat.id, sent.message_id)
 
@@ -3683,4 +3754,9 @@ def run_flask():
 
 if __name__ == '__main__':
     threading.Thread(target=run_flask, daemon=True).start()
-    bot.polling(none_stop=True)
+    while True:
+        try:
+            bot.polling(none_stop=True, timeout=60, long_polling_timeout=60)
+        except Exception as e:
+            print(f"Polling error: {e}")
+            time.sleep(5)
