@@ -560,7 +560,7 @@ def get_user_tickets(chat_id):
 
 
 def delete_user_account(chat_id):
-    """Полное удаление всех данных юзера. Бан остаётся."""
+    """Полное удаление данных юзера. Бан остаётся. Акция сбрасывается."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("DELETE FROM users WHERE chat_id=?", (chat_id,))
@@ -744,6 +744,7 @@ def tickets_menu():
 
 
 def buy_menu(chat_id):
+    """Только кнопки с токенами — цены в тексте сообщения."""
     markup = telebot.types.InlineKeyboardMarkup()
     user = get_user(chat_id)
     trial_started = user[4]
@@ -753,32 +754,13 @@ def buy_menu(chat_id):
         left = TRIAL_WINDOW - (now - trial_started)
         minutes = left // 60
         markup.add(telebot.types.InlineKeyboardButton(
-            f"🎁 ПОДАРОК: 10 токенов за 50 ₽ ({minutes} мин)",
+            f"🎁 АКЦИЯ: 10 токенов ({minutes} мин)",
             callback_data="pack_trial"
         ))
-        markup.add(telebot.types.InlineKeyboardButton(
-            "  ↳ 10 картинок / 10 правок / 10 сообщений",
-            callback_data="noop"))
-    markup.add(telebot.types.InlineKeyboardButton("💵 100 ₽ — 20 токенов", callback_data="pack_100_20"))
-    markup.add(telebot.types.InlineKeyboardButton(
-        "  ↳ 20 картинок / 20 правок / 20 сообщений",
-        callback_data="noop"))
-    markup.add(telebot.types.InlineKeyboardButton("💵 250 ₽ — 50 токенов", callback_data="pack_250_50"))
-    markup.add(telebot.types.InlineKeyboardButton(
-        "  ↳ 50 картинок / 50 правок / 50 сообщений",
-        callback_data="noop"))
-    markup.add(telebot.types.InlineKeyboardButton("💵 500 ₽ — 100 токенов", callback_data="pack_500_100"))
-    markup.add(telebot.types.InlineKeyboardButton(
-        "  ↳ 100 картинок / 100 правок / 100 сообщений",
-        callback_data="noop"))
-    markup.add(telebot.types.InlineKeyboardButton("💵 1000 ₽ — 200 токенов", callback_data="pack_1000_200"))
-    markup.add(telebot.types.InlineKeyboardButton(
-        "  ↳ 200 картинок / 200 правок / 200 сообщений",
-        callback_data="noop"))
-    markup.add(telebot.types.InlineKeyboardButton("💵 3000 ₽ — 600 токенов", callback_data="pack_3000_600"))
-    markup.add(telebot.types.InlineKeyboardButton(
-        "  ↳ 600 картинок / 600 правок / 600 сообщений",
-        callback_data="noop"))
+    markup.add(telebot.types.InlineKeyboardButton("20 токенов", callback_data="pack_100_20"))
+    markup.add(telebot.types.InlineKeyboardButton("50 токенов", callback_data="pack_250_50"))
+    markup.add(telebot.types.InlineKeyboardButton("100 токенов", callback_data="pack_500_100"))
+    markup.add(telebot.types.InlineKeyboardButton("200 токенов", callback_data="pack_1000_200"))
     markup.add(telebot.types.InlineKeyboardButton("✏️ Своя сумма (20–3000)", callback_data="custom_amount"))
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
     return markup
@@ -1087,6 +1069,7 @@ def delete_account(call):
         "• 🛒 Все заказы\n"
         "• 📋 Все тикеты\n"
         "• 📊 Статистика\n\n"
+        "🎁 <b>Акция «50 ₽ за 10 токенов» появится снова!</b>\n\n"
         "❗️ <b>Бан НЕ удаляется</b>\n\n"
         "Это действие <b>нельзя отменить</b>. Продолжить?"
     )
@@ -1113,6 +1096,8 @@ def delete_account_yes(call):
         "• 📜 история → удалена\n"
         "• 🛒 заказы → удалены\n"
         "• 📋 тикеты → удалены\n\n"
+        "🎁 <b>Акция снова доступна!</b>\n"
+        "50 ₽ → 10 токенов\n\n"
         "Нажми «Начать заново» или /start.",
         parse_mode='HTML', reply_markup=markup)
     remember(uid, sent.message_id)
@@ -1145,7 +1130,6 @@ def menu_help(call):
         "• 250 ₽ → 50 токенов\n"
         "• 500 ₽ → 100 токенов\n"
         "• 1000 ₽ → 200 токенов\n"
-        "• 3000 ₽ → 600 токенов\n"
         "• Своя сумма: 20–3000 токенов\n\n"
 
         "🤖 <b>Чат с ИИ</b>\n"
@@ -1728,7 +1712,6 @@ def edit_confirm_yes(call):
 
 
 def edit_photo_bothub(photos_b64, prompt):
-    """Редактирование фото через BotHub /v1/images/edits (multipart)."""
     url = "https://openai.bothub.chat/v1/images/edits"
     headers = {
         "Authorization": f"Bearer {BOTHUB_API_KEY}"
@@ -1850,9 +1833,17 @@ def buy_tokens(call):
         )
         sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=gift_menu())
     else:
-        sent = bot.send_message(call.message.chat.id,
-                                "💳 <b>Покупка токенов</b>\n────────────────\nВыбери пакет:",
-                                parse_mode='HTML', reply_markup=buy_menu(call.message.chat.id))
+        text = (
+            "💳 <b>Покупка токенов</b>\n"
+            "────────────────\n"
+            "💵 <b>Цены:</b>\n"
+            "• 100 ₽ → <b>20 токенов</b>\n"
+            "• 250 ₽ → <b>50 токенов</b>\n"
+            "• 500 ₽ → <b>100 токенов</b>\n"
+            "• 1000 ₽ → <b>200 токенов</b>\n\n"
+            "Нажми на нужное количество 👇"
+        )
+        sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=buy_menu(call.message.chat.id))
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
@@ -1866,9 +1857,17 @@ def decline_gift(call):
     except Exception:
         pass
     clear_old_messages(call.message.chat.id)
-    sent = bot.send_message(call.message.chat.id,
-                            "💳 <b>Покупка токенов</b>\n────────────────\nВыбери пакет:",
-                            parse_mode='HTML', reply_markup=buy_menu(call.message.chat.id))
+    text = (
+        "💳 <b>Покупка токенов</b>\n"
+        "────────────────\n"
+        "💵 <b>Цены:</b>\n"
+        "• 100 ₽ → <b>20 токенов</b>\n"
+        "• 250 ₽ → <b>50 токенов</b>\n"
+        "• 500 ₽ → <b>100 токенов</b>\n"
+        "• 1000 ₽ → <b>200 токенов</b>\n\n"
+        "Нажми на нужное количество 👇"
+    )
+    sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=buy_menu(call.message.chat.id))
     remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
