@@ -32,7 +32,7 @@ TRIAL_PRICE = 10
 TRIAL_TOKENS = 2
 TRIAL_WINDOW = 3600
 IMAGE_COST = 4
-EDIT_COST = 20
+EDIT_COST = 4
 MAX_FILE_SIZE = 200 * 1024
 MAX_FILE_CHARS = 25000
 
@@ -150,8 +150,7 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         chat_id INTEGER,
         prompt TEXT,
-        image_url TEXT,
-        kind TEXT DEFAULT 'gen'
+        image_url TEXT
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS stats (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -439,16 +438,6 @@ def add_image_history(chat_id, prompt, image_url, kind="gen"):
     conn.close()
 
 
-def get_image_history(chat_id, limit=20):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT prompt, image_url, timestamp, kind FROM image_history WHERE chat_id=? ORDER BY id DESC LIMIT ?",
-              (chat_id, limit))
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-
 def get_image_history_by_kind(chat_id, kind, limit=20):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -711,6 +700,7 @@ def main_menu(chat_id=None):
     markup.add(telebot.types.InlineKeyboardButton("🛒 Мои покупки", callback_data="menu_my_orders"))
     markup.add(telebot.types.InlineKeyboardButton("📜 История", callback_data="menu_history"))
     markup.add(telebot.types.InlineKeyboardButton("💰 Мой баланс", callback_data="menu_balance"))
+    markup.add(telebot.types.InlineKeyboardButton("📖 Инструкция", callback_data="menu_help"))
     markup.add(telebot.types.InlineKeyboardButton("🆘 Поддержка", callback_data="menu_support"))
     if chat_id == ADMIN_ID:
         markup.add(telebot.types.InlineKeyboardButton("👑 Админ-меню", callback_data="menu_admin"))
@@ -736,6 +726,14 @@ def admin_menu():
     markup.add(telebot.types.InlineKeyboardButton("📢 Рассылка", callback_data="admin_broadcast"))
     markup.add(telebot.types.InlineKeyboardButton("🛠 Тех.работы", callback_data="admin_maintenance"))
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
+    return markup
+
+
+def tickets_menu():
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("📬 Открытые", callback_data="admin_tickets_open"))
+    markup.add(telebot.types.InlineKeyboardButton("✅ Выполненные", callback_data="admin_tickets_done"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_admin"))
     return markup
 
 
@@ -840,6 +838,7 @@ def delete_account_confirm_menu():
 
 def edit_mode_menu():
     markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("📖 Инструкция", callback_data="edit_help"))
     markup.add(telebot.types.InlineKeyboardButton("❌ Отмена", callback_data="menu_main"))
     return markup
 
@@ -848,6 +847,7 @@ def edit_confirm_menu():
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("✅ Готово, обработать", callback_data="edit_confirm_yes"))
     markup.add(telebot.types.InlineKeyboardButton("➕ Добавить ещё фото", callback_data="edit_add_more"))
+    markup.add(telebot.types.InlineKeyboardButton("📖 Инструкция", callback_data="edit_help"))
     markup.add(telebot.types.InlineKeyboardButton("❌ Отмена", callback_data="edit_cancel"))
     return markup
 
@@ -856,6 +856,7 @@ def edit_more_menu():
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("📸 Прислать фото", callback_data="edit_add_more"))
     markup.add(telebot.types.InlineKeyboardButton("✅ Готово, обработать", callback_data="edit_confirm_yes"))
+    markup.add(telebot.types.InlineKeyboardButton("📖 Инструкция", callback_data="edit_help"))
     markup.add(telebot.types.InlineKeyboardButton("❌ Отмена", callback_data="edit_cancel"))
     return markup
 
@@ -1078,6 +1079,83 @@ def delete_account_yes(call):
         "✅ <b>Аккаунт удалён.</b>\n\nВсе данные обнулены.\nНажми «Начать заново» или /start.",
         parse_mode='HTML', reply_markup=markup)
     remember(uid, sent.message_id)
+    bot.answer_callback_query(call.id)
+
+
+# === ИНСТРУКЦИЯ ===
+@bot.callback_query_handler(func=lambda call: call.data == "menu_help")
+def menu_help(call):
+    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
+        return
+    try:
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
+    clear_old_messages(call.message.chat.id)
+    help_text = (
+        "📖 <b>Инструкция по использованию бота</b>\n"
+        "════════════════════════\n\n"
+
+        "💳 <b>Купить токены</b>\n"
+        "Токены — внутренняя валюта бота.\n"
+        "• Генерация картинки: <b>4 токена</b>\n"
+        "• Редактирование фото: <b>4 токена</b>\n"
+        "• Сообщение в чате с ИИ: <b>1 токен</b>\n"
+        "• Отправка файла в ИИ: <b>1 токен</b>\n\n"
+
+        "🤖 <b>Чат с ИИ</b>\n"
+        "• Обычный ИИ — универсальный помощник\n"
+        "• Кодер (с подсказками) — код + объяснение\n"
+        "• Кодер (только код) — чистый код\n"
+        "• Объяснятор — простое объяснение\n"
+        "• Переводчик — перевод текстов\n\n"
+        "⚙️ В настройках можно выбрать <b>поведение ИИ</b>\n"
+        "и включить <b>ответы файлами</b>.\n\n"
+
+        "🎨 <b>Нарисовать картинку</b>\n"
+        "• Напиши промт — что нарисовать\n"
+        "• Подтверди — и получишь картинку\n"
+        "• Стоимость: <b>4 токена</b>\n\n"
+
+        "🖼 <b>Редактировать фото</b>\n"
+        "• Пришли фото (можно несколько)\n"
+        "• Напиши задание — что сделать\n"
+        "• Нажми «✅ Готово, обработать»\n"
+        "• Стоимость: <b>4 токена</b>\n\n"
+        "Примеры заданий:\n"
+        "• «убери камень»\n"
+        "• «помести на пляж»\n"
+        "• «сделай в стиле аниме»\n"
+        "• «добавь шляпу»\n\n"
+
+        "📄 <b>Отправить файл</b>\n"
+        "• Пришли файл (или с подписью-заданием)\n"
+        "• ИИ обработает и ответит\n"
+        "• Стоимость: <b>1 токен</b>\n\n"
+
+        "📜 <b>История</b>\n"
+        "• 🎨 История фото — все генерации\n"
+        "• 🖼 История редактирований — все правки\n"
+        "• 🤖 История чата — переписка с ИИ\n\n"
+
+        "🛒 <b>Мои покупки</b>\n"
+        "• ✅ Завершённые — оплаченные\n"
+        "• ⏳ Ожидают оплаты — неоплаченные\n\n"
+
+        "🆘 <b>Поддержка</b>\n"
+        "• Написать тикет — задать вопрос\n"
+        "• Мои тикеты — посмотреть ответы\n"
+        "• Удалить аккаунт — обнулить всё\n\n"
+
+        "════════════════════════\n"
+        "💡 <b>Советы:</b>\n"
+        "• Чем точнее промт — тем лучше результат\n"
+        "• Не бойтесь экспериментировать\n"
+        "• При проблемах — пишите в поддержку"
+    )
+    sent = bot.send_message(call.message.chat.id, help_text,
+                            parse_mode='HTML', reply_markup=back_menu())
+    remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
 # === ГЕНЕРАЦИЯ КАРТИНОК ===
@@ -1305,7 +1383,7 @@ def edit_menu(call):
         markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
         try:
             bot.edit_message_text(
-                f"❌ Нужно {EDIT_COST} токенов для редактирования.\nУ вас: {tokens}.",
+                f"❌ Нужно {EDIT_COST} токена для редактирования.\nУ вас: {tokens}.",
                 chat_id=call.message.chat.id, message_id=call.message.message_id,
                 reply_markup=markup)
         except Exception:
@@ -1317,7 +1395,7 @@ def edit_menu(call):
     update_user(call.message.chat.id, 'state', 'edit_wait_photo')
     try:
         bot.edit_message_text(
-            f"🖼 <b>Редактирование фото</b>\n\nСтоимость: <b>{EDIT_COST} токенов</b>\n💰 У вас: {tokens}\n\n"
+            f"🖼 <b>Редактирование фото</b>\n\nСтоимость: <b>{EDIT_COST} токена</b>\n💰 У вас: {tokens}\n\n"
             f"📸 Пришли фото, которое надо отредактировать.\n\n"
             f"<i>Можно прислать несколько фото — потом напишешь задание.</i>",
             chat_id=call.message.chat.id, message_id=call.message.message_id,
@@ -1361,6 +1439,81 @@ def edit_add_more(call):
     bot.answer_callback_query(call.id)
 
 
+@bot.callback_query_handler(func=lambda call: call.data == "edit_help")
+def edit_help(call):
+    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
+        return
+    help_text = (
+        "📖 <b>Как работает редактирование фото</b>\n"
+        "────────────────\n\n"
+        "🖼 <b>Что можно делать:</b>\n"
+        "• Убрать объект — «убери камень»\n"
+        "• Заменить объект — «на место камня поставь дерево»\n"
+        "• Изменить фон — «помести на пляж»\n"
+        "• Изменить стиль — «сделай в стиле аниме»\n"
+        "• Изменить цвет — «сделай фон синим»\n"
+        "• Добавить объект — «добавь шляпу»\n\n"
+        "📸 <b>Как использовать:</b>\n"
+        "1. Нажми «🖼 Редактировать фото»\n"
+        "2. Пришли фото (можно несколько)\n"
+        "3. Напиши задание — что сделать\n"
+        "4. Нажми «✅ Готово, обработать»\n\n"
+        "💰 <b>Стоимость:</b> 4 токена\n"
+        "⏳ <b>Время:</b> 20-60 секунд\n\n"
+        "💡 <b>Совет:</b> Чем точнее задание,\n"
+        "тем лучше результат.\n\n"
+        "<i>Пример: «Убери машину слева,\n"
+        "добавь на её место велосипед»</i>"
+    )
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="edit_help_back"))
+    try:
+        bot.edit_message_text(help_text, chat_id=call.message.chat.id,
+                              message_id=call.message.message_id,
+                              parse_mode='HTML', reply_markup=markup)
+    except Exception:
+        sent = bot.send_message(call.message.chat.id, help_text,
+                                parse_mode='HTML', reply_markup=markup)
+        remember(call.message.chat.id, sent.message_id)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "edit_help_back")
+def edit_help_back(call):
+    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
+        return
+    cache = edit_photos_cache.get(call.message.chat.id, {"photos": [], "prompt": ""})
+    count = len(cache.get("photos", []))
+    if count == 0:
+        text = (
+            f"🖼 <b>Редактирование фото</b>\n\nСтоимость: <b>{EDIT_COST} токена</b>\n\n"
+            f"📸 Пришли фото, которое надо отредактировать."
+        )
+        markup = edit_mode_menu()
+    else:
+        prompt = cache.get("prompt", "")
+        if prompt:
+            text = (
+                f"🖼 <b>Фото: {count}</b>\n"
+                f"📝 Задание: <code>{escape_html(prompt)}</code>\n\n"
+                f"Обработать или добавить ещё?"
+            )
+            markup = edit_confirm_menu()
+        else:
+            text = (
+                f"🖼 <b>Фото: {count}</b>\n\n"
+                f"📝 <b>Что сделать?</b>\nНапиши задание."
+            )
+            markup = edit_more_menu()
+    try:
+        bot.edit_message_text(text, chat_id=call.message.chat.id,
+                              message_id=call.message.message_id,
+                              parse_mode='HTML', reply_markup=markup)
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id)
+
+
 def edit_process_photo(message):
     if send_banned_message(message.chat.id):
         return
@@ -1401,7 +1554,7 @@ def edit_process_photo(message):
             f"🖼 <b>Фото добавлено</b>\n"
             f"────────────────\n"
             f"📸 Всего фото: <b>{count}</b>\n"
-            f"💰 Стоимость: <b>{EDIT_COST} токенов</b>\n"
+            f"💰 Стоимость: <b>{EDIT_COST} токена</b>\n"
             f"📝 Задание: <code>{escape_html(cache['prompt'])}</code>\n\n"
             f"Обработать или добавить ещё?"
         )
@@ -1411,7 +1564,7 @@ def edit_process_photo(message):
             f"🖼 <b>Фото получено</b>\n"
             f"────────────────\n"
             f"📸 Всего фото: <b>{count}</b>\n"
-            f"💰 Стоимость: <b>{EDIT_COST} токенов</b>\n\n"
+            f"💰 Стоимость: <b>{EDIT_COST} токена</b>\n\n"
             f"📝 <b>Что сделать?</b>\n"
             f"Напиши задание, например:\n"
             f"• убери камень\n"
@@ -1434,7 +1587,7 @@ def edit_ask_prompt(message):
         edit_photos_cache.pop(message.chat.id, None)
         back_to_main(message)
         return
-    if message.text in ["📸 Прислать фото", "✅ Готово, обработать", "❌ Отмена"]:
+    if message.text in ["📸 Прислать фото", "✅ Готово, обработать", "❌ Отмена", "📖 Инструкция"]:
         return
     if send_banned_message(message.chat.id):
         return
@@ -1473,7 +1626,7 @@ def edit_confirm_yes(call):
     user = get_user(call.message.chat.id)
     tokens = user[0]
     if tokens < EDIT_COST:
-        bot.answer_callback_query(call.id, f"❌ Нужно {EDIT_COST} токенов.")
+        bot.answer_callback_query(call.id, f"❌ Нужно {EDIT_COST} токена.")
         return
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -2766,14 +2919,10 @@ def admin_limits_root(call):
 def admin_tickets(call):
     if call.message.chat.id != ADMIN_ID:
         return
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("📬 Открытые", callback_data="admin_tickets_open"))
-    markup.add(telebot.types.InlineKeyboardButton("✅ Выполненные", callback_data="admin_tickets_done"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_admin"))
     try:
         bot.edit_message_text("📋 <b>Тикеты</b>\n\nВыбери раздел:",
                               chat_id=call.message.chat.id, message_id=call.message.message_id,
-                              parse_mode='HTML', reply_markup=markup)
+                              parse_mode='HTML', reply_markup=tickets_menu())
     except Exception:
         pass
     bot.answer_callback_query(call.id)
@@ -2787,7 +2936,7 @@ def admin_tickets_open(call):
     if not tickets:
         try:
             bot.edit_message_text("📬 Открытых тикетов нет.", chat_id=call.message.chat.id,
-                                  message_id=call.message.message_id, reply_markup=admin_menu())
+                                  message_id=call.message.message_id, reply_markup=tickets_menu())
         except Exception:
             pass
         bot.answer_callback_query(call.id)
@@ -2812,7 +2961,7 @@ def admin_tickets_done(call):
     if not tickets:
         try:
             bot.edit_message_text("✅ Выполненных тикетов нет.", chat_id=call.message.chat.id,
-                                  message_id=call.message.message_id, reply_markup=admin_menu())
+                                  message_id=call.message.message_id, reply_markup=tickets_menu())
         except Exception:
             pass
         bot.answer_callback_query(call.id)
@@ -2859,9 +3008,12 @@ def admin_reject_ticket(call):
     ticket_id = int(call.data.replace("admin_reject_", ""))
     delete_ticket(ticket_id)
     bot.answer_callback_query(call.id, "❌ Тикет удалён")
+    # Возвращаемся в список тикетов
     try:
-        bot.edit_message_text(f"❌ Тикет #{ticket_id} удалён.", chat_id=call.message.chat.id,
-                              message_id=call.message.message_id, reply_markup=admin_menu())
+        bot.edit_message_text(
+            f"❌ Тикет #{ticket_id} удалён.\n\n📋 <b>Тикеты</b>\nВыбери раздел:",
+            chat_id=call.message.chat.id, message_id=call.message.message_id,
+            parse_mode='HTML', reply_markup=tickets_menu())
     except Exception:
         pass
 
@@ -2893,8 +3045,9 @@ def admin_send_reply(message, ticket_id):
         bot.send_message(uid, f"💬 <b>Ответ от поддержки</b> (тикет #{ticket_id}):\n\n{text}", parse_mode='HTML')
     except Exception:
         pass
+    # Возвращаемся в тикеты
     sent = bot.send_message(message.chat.id, f"✅ Ответ отправлен. Тикет #{ticket_id} выполнен.",
-                            reply_markup=admin_menu())
+                            reply_markup=tickets_menu())
     remember(message.chat.id, sent.message_id)
 
 
@@ -3536,11 +3689,9 @@ def handle_message(message):
     send_files = user[18]
 
     # Состояние редактирования фото — ждём промт
-    if state.startswith('edit_ready') or state.startswith('edit_wait_photo'):
-        # Если это edit_ready, пользователь пишет промт
-        if state.startswith('edit_ready'):
-            edit_ask_prompt(message)
-            return
+    if state.startswith('edit_ready'):
+        edit_ask_prompt(message)
+        return
 
     if state != 'chat':
         return
