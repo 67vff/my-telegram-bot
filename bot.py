@@ -28,11 +28,13 @@ bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
 DB_PATH = "/app/data/users.db"
-TRIAL_PRICE = 10
-TRIAL_TOKENS = 2
+TRIAL_PRICE = 50
+TRIAL_TOKENS = 10
 TRIAL_WINDOW = 3600
 IMAGE_COST = 4
 EDIT_COST = 4
+MIN_CUSTOM_TOKENS = 20
+MAX_CUSTOM_TOKENS = 3000
 MAX_FILE_SIZE = 200 * 1024
 MAX_FILE_CHARS = 25000
 
@@ -200,6 +202,8 @@ def init_db():
         ("used_images", "INTEGER DEFAULT 0"),
         ("used_chats", "INTEGER DEFAULT 0"),
         ("send_files", "INTEGER DEFAULT 0"),
+        ("used_edits", "INTEGER DEFAULT 0"),
+        ("limit_edits", "INTEGER DEFAULT -1"),
     ]:
         try:
             c.execute(f"ALTER TABLE users ADD COLUMN {col} {definition}")
@@ -259,7 +263,8 @@ def get_user(chat_id):
     c = conn.cursor()
     c.execute("""SELECT tokens, state, mode, ai_mode, trial_started, trial_used, username,
                  phone, registered, coder_mode, banned, ban_reason, can_image, can_chat,
-                 limit_images, limit_chats, used_images, used_chats, send_files
+                 limit_images, limit_chats, used_images, used_chats, send_files,
+                 used_edits, limit_edits
                  FROM users WHERE chat_id=?""", (chat_id,))
     row = c.fetchone()
     if not row:
@@ -267,12 +272,13 @@ def get_user(chat_id):
         conn.commit()
         c.execute("""SELECT tokens, state, mode, ai_mode, trial_started, trial_used, username,
                      phone, registered, coder_mode, banned, ban_reason, can_image, can_chat,
-                     limit_images, limit_chats, used_images, used_chats, send_files
+                     limit_images, limit_chats, used_images, used_chats, send_files,
+                     used_edits, limit_edits
                      FROM users WHERE chat_id=?""", (chat_id,))
         row = c.fetchone()
         if not row:
             row = (0, 'idle', 'regular', 'regular', 0, 0, '', '', int(time.time()),
-                   'with_hints', 0, '', 1, 1, -1, -1, 0, 0, 0)
+                   'with_hints', 0, '', 1, 1, -1, -1, 0, 0, 0, 0, -1)
     conn.close()
     return row
 
@@ -307,7 +313,7 @@ def reset_used(chat_id, field=None):
     if field:
         c.execute(f"UPDATE users SET {field} = 0 WHERE chat_id=?", (chat_id,))
     else:
-        c.execute("UPDATE users SET used_images = 0, used_chats = 0 WHERE chat_id=?", (chat_id,))
+        c.execute("UPDATE users SET used_images = 0, used_chats = 0, used_edits = 0 WHERE chat_id=?", (chat_id,))
     conn.commit()
     conn.close()
 
@@ -554,6 +560,7 @@ def get_user_tickets(chat_id):
 
 
 def delete_user_account(chat_id):
+    """Полное удаление всех данных юзера. Бан остаётся."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("DELETE FROM users WHERE chat_id=?", (chat_id,))
@@ -625,7 +632,6 @@ def send_long_text_as_file(chat_id, text, filename="otvet.txt"):
 
 
 def send_photo_safe(chat_id, image_url, caption):
-    """Безопасная отправка фото по URL. Возвращает message_id или None."""
     try:
         r = requests.get(image_url, timeout=15)
         if r.status_code != 200:
@@ -747,20 +753,40 @@ def buy_menu(chat_id):
         left = TRIAL_WINDOW - (now - trial_started)
         minutes = left // 60
         markup.add(telebot.types.InlineKeyboardButton(
-            f"🎁 Подарок: 2 токена за 10 ₽ (осталось {minutes} мин)",
+            f"🎁 ПОДАРОК: 10 токенов за 50 ₽ ({minutes} мин)",
             callback_data="pack_trial"
         ))
-    markup.add(telebot.types.InlineKeyboardButton("100 ₽ — 20 токенов", callback_data="pack_100_20"))
-    markup.add(telebot.types.InlineKeyboardButton("250 ₽ — 50 токенов", callback_data="pack_250_50"))
-    markup.add(telebot.types.InlineKeyboardButton("500 ₽ — 100 токенов", callback_data="pack_500_100"))
-    markup.add(telebot.types.InlineKeyboardButton("✏️ Своя сумма", callback_data="custom_amount"))
+        markup.add(telebot.types.InlineKeyboardButton(
+            "  ↳ 10 картинок / 10 правок / 10 сообщений",
+            callback_data="noop"))
+    markup.add(telebot.types.InlineKeyboardButton("💵 100 ₽ — 20 токенов", callback_data="pack_100_20"))
+    markup.add(telebot.types.InlineKeyboardButton(
+        "  ↳ 20 картинок / 20 правок / 20 сообщений",
+        callback_data="noop"))
+    markup.add(telebot.types.InlineKeyboardButton("💵 250 ₽ — 50 токенов", callback_data="pack_250_50"))
+    markup.add(telebot.types.InlineKeyboardButton(
+        "  ↳ 50 картинок / 50 правок / 50 сообщений",
+        callback_data="noop"))
+    markup.add(telebot.types.InlineKeyboardButton("💵 500 ₽ — 100 токенов", callback_data="pack_500_100"))
+    markup.add(telebot.types.InlineKeyboardButton(
+        "  ↳ 100 картинок / 100 правок / 100 сообщений",
+        callback_data="noop"))
+    markup.add(telebot.types.InlineKeyboardButton("💵 1000 ₽ — 200 токенов", callback_data="pack_1000_200"))
+    markup.add(telebot.types.InlineKeyboardButton(
+        "  ↳ 200 картинок / 200 правок / 200 сообщений",
+        callback_data="noop"))
+    markup.add(telebot.types.InlineKeyboardButton("💵 3000 ₽ — 600 токенов", callback_data="pack_3000_600"))
+    markup.add(telebot.types.InlineKeyboardButton(
+        "  ↳ 600 картинок / 600 правок / 600 сообщений",
+        callback_data="noop"))
+    markup.add(telebot.types.InlineKeyboardButton("✏️ Своя сумма (20–3000)", callback_data="custom_amount"))
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_main"))
     return markup
 
 
 def gift_menu():
     markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("✅ Приобрести", callback_data="pack_trial"))
+    markup.add(telebot.types.InlineKeyboardButton("✅ Приобрести за 50 ₽", callback_data="pack_trial"))
     markup.add(telebot.types.InlineKeyboardButton("❌ Не надо", callback_data="decline_gift"))
     return markup
 
@@ -831,7 +857,7 @@ def support_menu():
 
 def delete_account_confirm_menu():
     markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("✅ Да, удалить", callback_data="delete_account_yes"))
+    markup.add(telebot.types.InlineKeyboardButton("✅ Да, удалить всё", callback_data="delete_account_yes"))
     markup.add(telebot.types.InlineKeyboardButton("❌ Отмена", callback_data="menu_support"))
     return markup
 
@@ -867,6 +893,11 @@ def send_main_menu(chat_id):
     text = f"👋 <b>Главное меню</b>\n💰 Токенов: <b>{tokens}</b>\n────────────────\nВыбери действие:"
     sent = bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=main_menu(chat_id))
     remember(chat_id, sent.message_id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "noop")
+def noop_handler(call):
+    bot.answer_callback_query(call.id, "")
 
 
 @bot.message_handler(commands=['start'])
@@ -1049,7 +1080,7 @@ def delete_account(call):
         "⚠️ <b>Удаление аккаунта</b>\n"
         "────────────────\n"
         "Будут удалены:\n"
-        "• 💰 Все токены\n"
+        "• 💰 Все токены (обнулятся)\n"
         "• 📜 История чата с ИИ\n"
         "• 🎨 История картинок\n"
         "• 🖼 История редактирований\n"
@@ -1076,7 +1107,13 @@ def delete_account_yes(call):
     markup.add(telebot.types.InlineKeyboardButton("🔄 Начать заново", callback_data="menu_main"))
     sent = bot.send_message(
         uid,
-        "✅ <b>Аккаунт удалён.</b>\n\nВсе данные обнулены.\nНажми «Начать заново» или /start.",
+        "✅ <b>Аккаунт удалён.</b>\n\n"
+        "Все данные обнулены:\n"
+        "• 💰 токены → 0\n"
+        "• 📜 история → удалена\n"
+        "• 🛒 заказы → удалены\n"
+        "• 📋 тикеты → удалены\n\n"
+        "Нажми «Начать заново» или /start.",
         parse_mode='HTML', reply_markup=markup)
     remember(uid, sent.message_id)
     bot.answer_callback_query(call.id)
@@ -1096,56 +1133,60 @@ def menu_help(call):
         "📖 <b>Инструкция по использованию бота</b>\n"
         "════════════════════════\n\n"
 
-        "💳 <b>Купить токены</b>\n"
+        "💰 <b>Что такое токены</b>\n"
         "Токены — внутренняя валюта бота.\n"
-        "• Генерация картинки: <b>4 токена</b>\n"
-        "• Редактирование фото: <b>4 токена</b>\n"
-        "• Сообщение в чате с ИИ: <b>1 токен</b>\n"
-        "• Отправка файла в ИИ: <b>1 токен</b>\n\n"
+        "• 🎨 Генерация картинки — <b>4 токена</b>\n"
+        "• 🖼 Редактирование фото — <b>4 токена</b>\n"
+        "• 🤖 Сообщение ИИ — <b>1 токен</b>\n"
+        "• 📄 Анализ файла — <b>1 токен</b>\n\n"
+
+        "💳 <b>Купить токены</b>\n"
+        "• 100 ₽ → 20 токенов\n"
+        "• 250 ₽ → 50 токенов\n"
+        "• 500 ₽ → 100 токенов\n"
+        "• 1000 ₽ → 200 токенов\n"
+        "• 3000 ₽ → 600 токенов\n"
+        "• Своя сумма: 20–3000 токенов\n\n"
 
         "🤖 <b>Чат с ИИ</b>\n"
-        "• Обычный ИИ — универсальный помощник\n"
-        "• Кодер (с подсказками) — код + объяснение\n"
-        "• Кодер (только код) — чистый код\n"
-        "• Объяснятор — простое объяснение\n"
-        "• Переводчик — перевод текстов\n\n"
-        "⚙️ В настройках можно выбрать <b>поведение ИИ</b>\n"
-        "и включить <b>ответы файлами</b>.\n\n"
+        "Режимы:\n"
+        "• 🤖 Обычный — универсальный\n"
+        "• 💻 Кодер — пишет код + объясняет\n"
+        "• ⚡ Кодер — только код\n"
+        "• 📖 Объяснятор — просто о сложном\n"
+        "• 🌍 Переводчик — переводы\n\n"
 
         "🎨 <b>Нарисовать картинку</b>\n"
-        "• Напиши промт — что нарисовать\n"
-        "• Подтверди — и получишь картинку\n"
-        "• Стоимость: <b>4 токена</b>\n\n"
+        "Напиши промт → подтверди → получи картинку\n"
+        "Любой стиль: реализм, аниме, киберпанк, мультик\n\n"
 
         "🖼 <b>Редактировать фото</b>\n"
-        "• Пришли фото (можно несколько)\n"
-        "• Напиши задание — что сделать\n"
-        "• Нажми «✅ Готово, обработать»\n"
-        "• Стоимость: <b>4 токена</b>\n\n"
-        "Примеры заданий:\n"
-        "• «убери камень»\n"
+        "1. Пришли фото (можно несколько)\n"
+        "2. Напиши задание\n"
+        "3. Нажми «Готово, обработать»\n\n"
+        "Примеры:\n"
+        "• «убери фон»\n"
         "• «помести на пляж»\n"
         "• «сделай в стиле аниме»\n"
-        "• «добавь шляпу»\n\n"
+        "• «добавь усы»\n\n"
 
         "📄 <b>Отправить файл</b>\n"
-        "• Пришли файл (или с подписью-заданием)\n"
-        "• ИИ обработает и ответит\n"
-        "• Стоимость: <b>1 токен</b>\n\n"
+        "Кидаешь файл → ИИ читает и отвечает.\n"
+        "Поддерживается: txt, md, py, js, json, csv и др.\n\n"
 
         "📜 <b>История</b>\n"
-        "• 🎨 История фото — все генерации\n"
-        "• 🖼 История редактирований — все правки\n"
-        "• 🤖 История чата — переписка с ИИ\n\n"
+        "• 🎨 Фото — генерации\n"
+        "• 🖼 Редактирования — правки\n"
+        "• 🤖 Чат — переписка\n\n"
 
         "🛒 <b>Мои покупки</b>\n"
         "• ✅ Завершённые — оплаченные\n"
-        "• ⏳ Ожидают оплаты — неоплаченные\n\n"
+        "• ⏳ Ожидают — неоплаченные\n\n"
 
         "🆘 <b>Поддержка</b>\n"
-        "• Написать тикет — задать вопрос\n"
-        "• Мои тикеты — посмотреть ответы\n"
-        "• Удалить аккаунт — обнулить всё\n\n"
+        "• 📝 Написать тикет\n"
+        "• 📋 Мои тикеты\n"
+        "• 🗑 Удалить аккаунт\n\n"
 
         "════════════════════════\n"
         "💡 <b>Советы:</b>\n"
@@ -1352,8 +1393,8 @@ def edit_menu(call):
     user = get_user(call.message.chat.id)
     tokens = user[0]
     can_image = user[12]
-    limit_images = user[14]
-    used_images = user[16]
+    limit_edits = user[20]
+    used_edits = user[19]
 
     if not can_image:
         bot.answer_callback_query(call.id, "🚫 Редактирование запрещено.")
@@ -1366,11 +1407,11 @@ def edit_menu(call):
             pass
         return
 
-    if limit_images >= 0 and used_images >= limit_images:
-        bot.answer_callback_query(call.id, "🚫 Лимит исчерпан.")
+    if limit_edits >= 0 and used_edits >= limit_edits:
+        bot.answer_callback_query(call.id, "🚫 Лимит редактирований исчерпан.")
         try:
             bot.edit_message_text(
-                f"🚫 <b>Лимит исчерпан.</b>\n\nИспользовано: {used_images} / {limit_images}\n\nОбратитесь в поддержку.",
+                f"🚫 <b>Лимит редактирований исчерпан.</b>\n\nИспользовано: {used_edits} / {limit_edits}\n\nОбратитесь в поддержку.",
                 chat_id=call.message.chat.id, message_id=call.message.message_id,
                 parse_mode='HTML', reply_markup=back_menu())
         except Exception:
@@ -1393,9 +1434,14 @@ def edit_menu(call):
 
     edit_photos_cache[call.message.chat.id] = {"photos": [], "prompt": ""}
     update_user(call.message.chat.id, 'state', 'edit_wait_photo')
+
+    limit_info = ""
+    if limit_edits >= 0:
+        limit_info = f"\n📊 Осталось редактирований: <b>{limit_edits - used_edits}</b>"
+
     try:
         bot.edit_message_text(
-            f"🖼 <b>Редактирование фото</b>\n\nСтоимость: <b>{EDIT_COST} токена</b>\n💰 У вас: {tokens}\n\n"
+            f"🖼 <b>Редактирование фото</b>\n\nСтоимость: <b>{EDIT_COST} токена</b>\n💰 У вас: {tokens}{limit_info}\n\n"
             f"📸 Пришли фото, которое надо отредактировать.\n\n"
             f"<i>Можно прислать несколько фото — потом напишешь задание.</i>",
             chat_id=call.message.chat.id, message_id=call.message.message_id,
@@ -1452,12 +1498,13 @@ def edit_help(call):
         "• Изменить фон — «помести на пляж»\n"
         "• Изменить стиль — «сделай в стиле аниме»\n"
         "• Изменить цвет — «сделай фон синим»\n"
-        "• Добавить объект — «добавь шляпу»\n\n"
+        "• Добавить объект — «добавь шляпу»\n"
+        "• Перенести персонажа — «пересади на другой фон»\n"
+        "• Объединить фото — пришли 2 и скажи «объедини»\n\n"
         "📸 <b>Как использовать:</b>\n"
-        "1. Нажми «🖼 Редактировать фото»\n"
-        "2. Пришли фото (можно несколько)\n"
-        "3. Напиши задание — что сделать\n"
-        "4. Нажми «✅ Готово, обработать»\n\n"
+        "1. Пришли фото (можно несколько)\n"
+        "2. Напиши задание — что сделать\n"
+        "3. Нажми «✅ Готово, обработать»\n\n"
         "💰 <b>Стоимость:</b> 4 токена\n"
         "⏳ <b>Время:</b> 20-60 секунд\n\n"
         "💡 <b>Совет:</b> Чем точнее задание,\n"
@@ -1625,8 +1672,13 @@ def edit_confirm_yes(call):
         return
     user = get_user(call.message.chat.id)
     tokens = user[0]
+    limit_edits = user[20]
+    used_edits = user[19]
     if tokens < EDIT_COST:
         bot.answer_callback_query(call.id, f"❌ Нужно {EDIT_COST} токена.")
+        return
+    if limit_edits >= 0 and used_edits >= limit_edits:
+        bot.answer_callback_query(call.id, "🚫 Лимит редактирований исчерпан.")
         return
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -1665,7 +1717,7 @@ def edit_confirm_yes(call):
         add_tokens(call.message.chat.id, -EDIT_COST)
         log_stat(call.message.chat.id, EDIT_COST)
         add_image_history(call.message.chat.id, prompt, result_url, kind="edit")
-        inc_used(call.message.chat.id, 'used_images')
+        inc_used(call.message.chat.id, 'used_edits')
     except Exception as e:
         sent = bot.send_message(call.message.chat.id, f"❌ Ошибка отправки: {e}",
                                 reply_markup=back_menu())
@@ -1791,8 +1843,8 @@ def buy_tokens(call):
         text = (
             "🎁 <b>ПОДАРОК НА ПЕРВЫЙ РАЗ!</b>\n"
             "────────────────\n"
-            f"🎫 <b>2 токена</b> всего за <b>10 ₽</b>\n"
-            "🤖 Попробуй чат с ИИ!\n\n"
+            f"🎫 <b>10 токенов</b> всего за <b>50 ₽</b>\n"
+            "🤖 Хватит на всё!\n\n"
             f"⏳ Осталось: <b>{minutes} мин</b>\n"
             "────────────────"
         )
@@ -1872,8 +1924,14 @@ def custom_amount(call):
     except Exception:
         pass
     clear_old_messages(call.message.chat.id)
-    sent = bot.send_message(call.message.chat.id, "✏️ Введи количество токенов (минимум 20):",
-                            reply_markup=back_menu())
+    text = (
+        "✏️ <b>Своя сумма токенов</b>\n"
+        "────────────────\n"
+        f"Введи количество токенов от <b>{MIN_CUSTOM_TOKENS}</b> до <b>{MAX_CUSTOM_TOKENS}</b>.\n\n"
+        f"💰 Цена: <b>5 ₽ за 1 токен</b>\n\n"
+        f"<i>Например: 100 токенов = 500 ₽</i>"
+    )
+    sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=back_menu())
     remember(call.message.chat.id, sent.message_id)
     bot.register_next_step_handler(sent, custom_tokens)
 
@@ -1891,15 +1949,19 @@ def custom_tokens(message):
     clear_old_messages(message.chat.id)
     try:
         tokens = int(message.text)
-        if tokens < 20:
-            sent = bot.send_message(message.chat.id, "❌ Минимум 20 токенов.", reply_markup=back_menu())
-            remember(message.chat.id, sent.message_id)
-            return
-        amount = tokens * 5
-        create_invoice(message.chat.id, amount, tokens)
     except ValueError:
         sent = bot.send_message(message.chat.id, "❌ Введи число.", reply_markup=back_menu())
         remember(message.chat.id, sent.message_id)
+        return
+    if tokens < MIN_CUSTOM_TOKENS or tokens > MAX_CUSTOM_TOKENS:
+        sent = bot.send_message(
+            message.chat.id,
+            f"❌ Неверная сумма.\n\nМинимум: <b>{MIN_CUSTOM_TOKENS}</b>\nМаксимум: <b>{MAX_CUSTOM_TOKENS}</b>",
+            parse_mode='HTML', reply_markup=back_menu())
+        remember(message.chat.id, sent.message_id)
+        return
+    amount = tokens * 5
+    create_invoice(message.chat.id, amount, tokens)
 
 
 def create_invoice(chat_id, amount, tokens):
@@ -2520,11 +2582,15 @@ def admin_mng_user(call):
     limit_chats = user[15]
     used_images = user[16]
     used_chats = user[17]
+    limit_edits = user[20]
+    used_edits = user[19]
 
     lim_img_txt = "∞" if limit_images < 0 else f"{used_images}/{limit_images}"
     lim_chat_txt = "∞" if limit_chats < 0 else f"{used_chats}/{limit_chats}"
+    lim_edit_txt = "∞" if limit_edits < 0 else f"{used_edits}/{limit_edits}"
     img_exh = "❌ исчерпан" if (limit_images >= 0 and used_images >= limit_images) else ""
     chat_exh = "❌ исчерпан" if (limit_chats >= 0 and used_chats >= limit_chats) else ""
+    edit_exh = "❌ исчерпан" if (limit_edits >= 0 and used_edits >= limit_edits) else ""
 
     text = (
         f"🚫 <b>Управление</b>\n────────────────\n"
@@ -2533,6 +2599,7 @@ def admin_mng_user(call):
         f"🎨 Картинки: {'разрешено' if can_image else 'ЗАПРЕЩЕНО'}\n"
         f"🤖 Чат с ИИ: {'разрешено' if can_chat else 'ЗАПРЕЩЕНО'}\n\n"
         f"📊 Лимит картинок: <b>{lim_img_txt}</b> {img_exh}\n"
+        f"📊 Лимит редактирований: <b>{lim_edit_txt}</b> {edit_exh}\n"
         f"📊 Лимит чата: <b>{lim_chat_txt}</b> {chat_exh}"
     )
     markup = telebot.types.InlineKeyboardMarkup()
@@ -2648,18 +2715,23 @@ def admin_mng_limits(call):
     limit_chats = user[15]
     used_images = user[16]
     used_chats = user[17]
+    limit_edits = user[20]
+    used_edits = user[19]
 
-    lim_img_txt = "без лимита" if limit_images < 0 else f"{limit_images} (использовано {used_images})"
-    lim_chat_txt = "без лимита" if limit_chats < 0 else f"{limit_chats} (использовано {used_chats})"
+    lim_img_txt = "без лимита" if limit_images < 0 else f"{limit_images} (исп. {used_images})"
+    lim_chat_txt = "без лимита" if limit_chats < 0 else f"{limit_chats} (исп. {used_chats})"
+    lim_edit_txt = "без лимита" if limit_edits < 0 else f"{limit_edits} (исп. {used_edits})"
 
     text = (
         f"🎯 <b>Лимиты для</b> <code>{uid}</code>\n"
         f"────────────────\n"
         f"🎨 Картинок: <b>{lim_img_txt}</b>\n"
+        f"🖼 Редактирований: <b>{lim_edit_txt}</b>\n"
         f"🤖 Чата: <b>{lim_chat_txt}</b>\n"
     )
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("🎨 Задать лимит картинок", callback_data=f"admin_lim_img_{uid}"))
+    markup.add(telebot.types.InlineKeyboardButton("🖼 Задать лимит редактирований", callback_data=f"admin_lim_edit_{uid}"))
     markup.add(telebot.types.InlineKeyboardButton("🤖 Задать лимит чата", callback_data=f"admin_lim_chat_{uid}"))
     markup.add(telebot.types.InlineKeyboardButton("🔄 Сбросить счётчики", callback_data=f"admin_lim_reset_{uid}"))
     markup.add(telebot.types.InlineKeyboardButton("♾ Снять все лимиты", callback_data=f"admin_lim_clear_{uid}"))
@@ -2702,6 +2774,40 @@ def admin_lim_img_save(message, uid):
     except Exception:
         pass
     sent = bot.send_message(message.chat.id, f"✅ Лимит картинок для {uid}: {val if val >= 0 else '∞'}",
+                            reply_markup=admin_menu())
+    remember(message.chat.id, sent.message_id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_lim_edit_"))
+def admin_lim_edit(call):
+    if call.message.chat.id != ADMIN_ID:
+        return
+    uid = int(call.data.replace("admin_lim_edit_", ""))
+    sent = bot.send_message(call.message.chat.id,
+                            f"🖼 Введи максимум редактирований для <code>{uid}</code>:\n\n<i>-1 = без лимита</i>",
+                            parse_mode='HTML', reply_markup=back_menu())
+    bot.register_next_step_handler(sent, admin_lim_edit_save, uid)
+    bot.answer_callback_query(call.id)
+
+
+def admin_lim_edit_save(message, uid):
+    if message.text == "⬅️ Назад":
+        back_to_main(message)
+        return
+    if message.chat.id != ADMIN_ID:
+        return
+    try:
+        val = int(message.text)
+    except ValueError:
+        bot.send_message(message.chat.id, "❌ Введи число.", reply_markup=admin_menu())
+        return
+    update_user(uid, 'limit_edits', val)
+    reset_used(uid, 'used_edits')
+    try:
+        bot.delete_message(message.chat.id, message.message_id)
+    except Exception:
+        pass
+    sent = bot.send_message(message.chat.id, f"✅ Лимит редактирований для {uid}: {val if val >= 0 else '∞'}",
                             reply_markup=admin_menu())
     remember(message.chat.id, sent.message_id)
 
@@ -2758,6 +2864,7 @@ def admin_lim_clear(call):
     uid = int(call.data.replace("admin_lim_clear_", ""))
     update_user(uid, 'limit_images', -1)
     update_user(uid, 'limit_chats', -1)
+    update_user(uid, 'limit_edits', -1)
     reset_used(uid)
     bot.answer_callback_query(call.id, "♾ Лимиты сняты")
     fake_call = type("C", (), {"data": f"admin_mng_limits_{uid}", "message": call.message, "id": call.id})()
@@ -2777,6 +2884,9 @@ def admin_mng_stats(call):
     limit_chats = user[15]
     used_images = user[16]
     used_chats = user[17]
+    limit_edits = user[20]
+    used_edits = user[19]
+
     text = (
         f"📊 <b>Статистика</b>\n────────────────\n"
         f"🆔 <code>{uid}</code>\n"
@@ -2784,6 +2894,7 @@ def admin_mng_stats(call):
         f"📉 Потрачено: <b>{total_spent}</b>\n"
         f"🛒 Покупок: <b>{len(orders)}</b>\n\n"
         f"🎨 Картинок: <b>{used_images}</b>" + (f" / {limit_images}" if limit_images >= 0 else " (∞)") + "\n"
+        f"🖼 Редактирований: <b>{used_edits}</b>" + (f" / {limit_edits}" if limit_edits >= 0 else " (∞)") + "\n"
         f"🤖 Сообщений ИИ: <b>{used_chats}</b>" + (f" / {limit_chats}" if limit_chats >= 0 else " (∞)") + "\n\n"
     )
     for oid, tk, amt, created in orders[:10]:
@@ -3008,7 +3119,6 @@ def admin_reject_ticket(call):
     ticket_id = int(call.data.replace("admin_reject_", ""))
     delete_ticket(ticket_id)
     bot.answer_callback_query(call.id, "❌ Тикет удалён")
-    # Возвращаемся в список тикетов
     try:
         bot.edit_message_text(
             f"❌ Тикет #{ticket_id} удалён.\n\n📋 <b>Тикеты</b>\nВыбери раздел:",
@@ -3045,7 +3155,6 @@ def admin_send_reply(message, ticket_id):
         bot.send_message(uid, f"💬 <b>Ответ от поддержки</b> (тикет #{ticket_id}):\n\n{text}", parse_mode='HTML')
     except Exception:
         pass
-    # Возвращаемся в тикеты
     sent = bot.send_message(message.chat.id, f"✅ Ответ отправлен. Тикет #{ticket_id} выполнен.",
                             reply_markup=tickets_menu())
     remember(message.chat.id, sent.message_id)
@@ -3583,8 +3692,15 @@ def get_gigachat_token():
 
 
 BASE_PROMPT = (
-    "Тебя зовут Боб. Ты — умный ИИ-помощник. Если спросят 'кто ты' — отвечай: 'Я Боб, твой ИИ-помощник.' "
-    "Не упоминай GigaChat, Сбер, OpenAI. Отвечай на языке пользователя. "
+    "ТЫ — БОБ. Твоё имя — Боб. Ты — умный ИИ-помощник, созданный специально для этого бота.\n"
+    "КАТЕГОРИЧЕСКИЕ ПРАВИЛА:\n"
+    "1. НИКОГДА не упоминай GigaChat, Сбер, Сбербанк, OpenAI, ChatGPT, Claude, Gemini, Anthropic и любые другие ИИ-сервисы.\n"
+    "2. Если спросят 'кто ты' / 'какая ты модель' / 'на чём работаешь' — отвечай ТОЛЬКО: 'Я Боб, твой ИИ-помощник.'\n"
+    "3. Если спросят 'ты гигачат?' / 'ты chatgpt?' / 'ты нейросеть сбера?' — отвечай: 'Нет, я Боб — твой личный ИИ-помощник.'\n"
+    "4. НИКОГДА не раскрывай, на какой технологии ты работаешь.\n"
+    "5. Если не знаешь ответ — скажи 'Не знаю', но не упоминай сторонние сервисы.\n"
+    "6. Отвечай на языке пользователя.\n"
+    "7. Не говори 'я не могу' без причины — старайся помочь."
 )
 
 MODE_PROMPTS = {
@@ -3688,7 +3804,6 @@ def handle_message(message):
     used_chats = user[17]
     send_files = user[18]
 
-    # Состояние редактирования фото — ждём промт
     if state.startswith('edit_ready'):
         edit_ask_prompt(message)
         return
