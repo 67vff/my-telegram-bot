@@ -170,13 +170,6 @@ def pagination_menu(prefix, page, total_pages, back_to="menu_main"):
     return markup
 
 
-def confirm_menu(confirm_data, cancel_data, confirm_text="✅ Да, подтверждаю", cancel_text="❌ Отмена"):
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton(confirm_text, callback_data=confirm_data))
-    markup.add(telebot.types.InlineKeyboardButton(cancel_text, callback_data=cancel_data))
-    return markup
-
-
 def get_conn():
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.execute("PRAGMA busy_timeout=30000")
@@ -996,39 +989,6 @@ def wipe_all_data(what="all"):
     conn.close()
 
 
-def reset_user_account(chat_id):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("""UPDATE users SET 
-        tokens = 0,
-        state = 'idle',
-        mode = 'regular',
-        ai_mode = 'regular',
-        can_image = 1,
-        can_chat = 1,
-        limit_images = -1,
-        limit_chats = -1,
-        used_images = 0,
-        used_chats = 0,
-        used_edits = 0,
-        limit_edits = -1,
-        send_files = 0,
-        support_muted_until = 0,
-        ignore_maintenance = 0,
-        sound_on = 0
-        WHERE chat_id=?""", (chat_id,))
-    c.execute("DELETE FROM history WHERE chat_id=?", (chat_id,))
-    c.execute("DELETE FROM image_history WHERE chat_id=?", (chat_id,))
-    c.execute("DELETE FROM stats WHERE chat_id=?", (chat_id,))
-    c.execute("DELETE FROM orders WHERE chat_id=?", (chat_id,))
-    c.execute("DELETE FROM tickets WHERE chat_id=?", (chat_id,))
-    c.execute("DELETE FROM action_logs WHERE chat_id=?", (chat_id,))
-    c.execute("DELETE FROM subscriptions WHERE user_id=?", (chat_id,))
-    c.execute("DELETE FROM active_operations WHERE chat_id=?", (chat_id,))
-    conn.commit()
-    conn.close()
-
-
 def has_ban_record(chat_id):
     conn = get_conn()
     c = conn.cursor()
@@ -1402,7 +1362,6 @@ def send_main_menu(chat_id, sound=False):
 
 
 def back_to_main_handler(chat_id, callback_query=None, message=None):
-    """Универсальный обработчик 'Назад' (работает и для callback, и для message)."""
     if callback_query:
         if deny_if_banned_or_maintenance(chat_id, call=callback_query):
             return
@@ -3243,7 +3202,9 @@ def get_gigachat_token(force_refresh=False):
             if token:
                 _gigachat_cache["token"] = token
                 _gigachat_cache["expires"] = time.time() + 1800
-            return token
+                return token
+            log_error(f"GigaChat token missing: status={response.status_code}, response={str(result)[:200]}")
+            return None
         except Exception as e:
             log_error(f"GigaChat token error: {e}")
             return None
@@ -3304,6 +3265,9 @@ def detect_mode_request(text):
 def ask_gigachat(chat_id, question, mode, ai_mode):
     access_token = get_gigachat_token()
     if not access_token:
+        user = get_user(chat_id)
+        uname = user[6] if user[6] else ""
+        log_error(f"GigaChat token unavailable for chat", chat_id=chat_id, username=uname)
         return "❌ Не удалось получить доступ к ИИ."
 
     url = "https://api.giga.chat/v1/chat/completions"
@@ -3552,7 +3516,6 @@ def handle_message(message):
     except Exception:
         pass
 
-    # Удаляем прошлое сообщение юзера с вопросом
     add_tokens(message.chat.id, -1)
     log_stat(message.chat.id, 1)
     inc_used(message.chat.id, 'used_chats')
@@ -3567,7 +3530,6 @@ def handle_message(message):
     log_action(message.chat.id, "ai", message.text[:200])
     clear_old_logs()
 
-    # Удаляем прошлый ответ ИИ (фича F9)
     old_ai_msg = _last_ai_message.get(message.chat.id)
     if old_ai_msg:
         try:
@@ -3638,7 +3600,6 @@ def handle_photo(message):
     if send_banned_message(message.chat.id):
         return
 
-    # Проверка дублей фото
     photo_id = message.photo[-1].file_id
     if check_duplicate(message.chat.id, f"photo_{photo_id}", cooldown=5):
         return
@@ -3672,7 +3633,6 @@ def handle_document(message):
     if not check_spam(message.chat.id, cooldown=3):
         return
 
-    # Проверка дублей документов
     doc_id = message.document.file_id
     if check_duplicate(message.chat.id, f"doc_{doc_id}", cooldown=5):
         return
@@ -3786,7 +3746,6 @@ def handle_document(message):
     tokens_left = user[0]
     log_action(message.chat.id, "file", filename[:100])
 
-    # Удаляем прошлый ответ ИИ (фича F9)
     old_ai_msg = _last_ai_message.get(message.chat.id)
     if old_ai_msg:
         try:
@@ -4167,11 +4126,11 @@ def admin_errors_send(call):
         return
     path = "/app/data/errors.log"
     if not os.path.exists(path):
-        bot.answer_callback_query(call.id, "❌ Файла нет")
+        bot.answer_callback_query(call.id, "❌ Ошибок не было — файла нет")
         return
     size = os.path.getsize(path)
     if size == 0:
-        bot.answer_callback_query(call.id, "❌ Файл пустой")
+        bot.answer_callback_query(call.id, "❌ Файл пустой — ошибок нет")
         return
     errors_count = 0
     try:
@@ -4381,7 +4340,10 @@ def wipe_user_select(call):
 def wipe_user_menu_handler(call):
     if call.message.chat.id != ADMIN_ID:
         return
-    uid = int(call.data.replace("wipe_user_", ""))
+    uid_str = call.data.replace("wipe_user_", "")
+    if not uid_str.isdigit():
+        return
+    uid = int(uid_str)
     user = get_user(uid)
     uname = user[6] if user[6] else "—"
     text = (
@@ -4409,11 +4371,10 @@ def wipe_user_do_confirm(call):
         bot.answer_callback_query(call.id, "❌ Ошибка.")
         return
     what, uid_str = parts
-    try:
-        uid = int(uid_str)
-    except ValueError:
+    if not uid_str.isdigit():
         bot.answer_callback_query(call.id, "❌ Ошибка ID.")
         return
+    uid = int(uid_str)
 
     names = {
         "chat": "💬 Переписку",
@@ -4458,11 +4419,10 @@ def wipe_user_do_execute(call):
         bot.answer_callback_query(call.id, "❌ Ошибка.")
         return
     what, uid_str = parts
-    try:
-        uid = int(uid_str)
-    except ValueError:
+    if not uid_str.isdigit():
         bot.answer_callback_query(call.id, "❌ Ошибка ID.")
         return
+    uid = int(uid_str)
     wipe_user_data(uid, what)
     bot.answer_callback_query(call.id, "✅ Очищено")
     user = get_user(uid)
@@ -4613,7 +4573,10 @@ def subs_add(call):
 def subs_toggle(call):
     if call.message.chat.id != ADMIN_ID:
         return
-    uid = int(call.data.replace("subs_toggle_", ""))
+    uid_str = call.data.replace("subs_toggle_", "")
+    if not uid_str.isdigit():
+        return
+    uid = int(uid_str)
     if is_subscribed(ADMIN_ID, uid):
         unsubscribe(ADMIN_ID, uid)
         bot.answer_callback_query(call.id, "➖ Отписан")
@@ -4651,7 +4614,10 @@ def subs_remove(call):
 def subs_rm(call):
     if call.message.chat.id != ADMIN_ID:
         return
-    uid = int(call.data.replace("subs_rm_", ""))
+    uid_str = call.data.replace("subs_rm_", "")
+    if not uid_str.isdigit():
+        return
+    uid = int(uid_str)
     unsubscribe(ADMIN_ID, uid)
     bot.answer_callback_query(call.id, "➖ Отписан")
     subs_remove(call)
@@ -4733,7 +4699,10 @@ def admin_tickets_done(call):
 def admin_view_ticket(call):
     if call.message.chat.id != ADMIN_ID:
         return
-    ticket_id = int(call.data.replace("admin_view_", ""))
+    ticket_id_str = call.data.replace("admin_view_", "")
+    if not ticket_id_str.isdigit():
+        return
+    ticket_id = int(ticket_id_str)
     ticket = get_ticket(ticket_id)
     if not ticket:
         return
@@ -4756,7 +4725,10 @@ def admin_view_ticket(call):
 def admin_reject_ticket(call):
     if call.message.chat.id != ADMIN_ID:
         return
-    ticket_id = int(call.data.replace("admin_reject_", ""))
+    ticket_id_str = call.data.replace("admin_reject_", "")
+    if not ticket_id_str.isdigit():
+        return
+    ticket_id = int(ticket_id_str)
     delete_ticket(ticket_id)
     bot.answer_callback_query(call.id, "❌ Удалён")
     try:
@@ -4772,7 +4744,10 @@ def admin_reject_ticket(call):
 def admin_reply(call):
     if call.message.chat.id != ADMIN_ID:
         return
-    ticket_id = int(call.data.replace("admin_reply_", ""))
+    ticket_id_str = call.data.replace("admin_reply_", "")
+    if not ticket_id_str.isdigit():
+        return
+    ticket_id = int(ticket_id_str)
     sent = bot.send_message(call.message.chat.id, f"✍️ Ответ на тикет #{ticket_id}:",
                             reply_markup=back_to_admin_menu())
     bot.register_next_step_handler(sent, admin_send_reply, ticket_id)
@@ -4827,7 +4802,10 @@ def admin_give(call):
 def admin_give_to(call):
     if call.message.chat.id != ADMIN_ID:
         return
-    uid = int(call.data.replace("admin_give_to_", ""))
+    uid_str = call.data.replace("admin_give_to_", "")
+    if not uid_str.isdigit():
+        return
+    uid = int(uid_str)
     sent = bot.send_message(call.message.chat.id, f"💰 Кол-во токенов для <code>{uid}</code>:",
                             parse_mode='HTML', reply_markup=back_to_admin_menu())
     bot.register_next_step_handler(sent, admin_give_amount, uid)
@@ -4883,7 +4861,10 @@ def admin_take(call):
 def admin_take_from(call):
     if call.message.chat.id != ADMIN_ID:
         return
-    uid = int(call.data.replace("admin_take_from_", ""))
+    uid_str = call.data.replace("admin_take_from_", "")
+    if not uid_str.isdigit():
+        return
+    uid = int(uid_str)
     user = get_user(uid)
     uname = user[6] if user[6] else "—"
     tokens = user[0]
@@ -4929,7 +4910,8 @@ def admin_users(call):
     if call.message.chat.id != ADMIN_ID:
         return
     if call.data.startswith("admin_users_page_"):
-        page = int(call.data.replace("admin_users_page_", ""))
+        page_str = call.data.replace("admin_users_page_", "")
+        page = int(page_str) if page_str.isdigit() else 1
     else:
         page = 1
     users = get_all_users()
@@ -4963,7 +4945,8 @@ def admin_manage(call):
     if call.message.chat.id != ADMIN_ID:
         return
     if call.data.startswith("admin_manage_page_"):
-        page = int(call.data.replace("admin_manage_page_", ""))
+        page_str = call.data.replace("admin_manage_page_", "")
+        page = int(page_str) if page_str.isdigit() else 1
     else:
         page = 1
     users = get_all_users()
@@ -4991,14 +4974,8 @@ def admin_manage(call):
     bot.answer_callback_query(call.id)
 
 
-def _is_manage_root(data):
-    if not data.startswith("admin_mng_"):
-        return False
-    tail = data.replace("admin_mng_", "")
-    return tail.isdigit()
-
-
-@bot.callback_query_handler(func=lambda call: _is_manage_root(call.data))
+# === ГЛАВНАЯ ФУНКЦИЯ УПРАВЛЕНИЯ (без _is_manage_root) ===
+@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_mng_") and call.data.replace("admin_mng_", "").isdigit())
 def admin_mng_user(call):
     if call.message.chat.id != ADMIN_ID:
         return
@@ -5062,36 +5039,15 @@ def admin_mng_user(call):
     bot.answer_callback_query(call.id)
 
 
+# === БАН (как в старом скрипте — сразу причина, без confirm) ===
 @bot.callback_query_handler(func=lambda call: call.data.startswith("admin_mng_ban_"))
 def admin_mng_ban(call):
     if call.message.chat.id != ADMIN_ID:
         return
-    uid = int(call.data.replace("admin_mng_ban_", ""))
-    user = get_user(uid)
-    uname = user[6] if user[6] else "—"
-    text = (
-        f"⚠️ <b>ПОДТВЕРЖДЕНИЕ БАНА</b>\n\n"
-        f"🆔 <code>{uid}</code>\n"
-        f"👤 {uname}\n\n"
-        f"Пользователь <b>не сможет пользоваться</b> ботом.\n\n"
-        f"Продолжить?"
-    )
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("✅ Да, забанить", callback_data=f"admin_mng_ban_confirm_{uid}"))
-    markup.add(telebot.types.InlineKeyboardButton("❌ Отмена", callback_data=f"admin_mng_{uid}"))
-    try:
-        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id,
-                              parse_mode='HTML', reply_markup=markup)
-    except Exception:
-        pass
-    bot.answer_callback_query(call.id)
-
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_mng_ban_confirm_"))
-def admin_mng_ban_confirm(call):
-    if call.message.chat.id != ADMIN_ID:
+    uid_str = call.data.replace("admin_mng_ban_", "")
+    if not uid_str.isdigit():
         return
-    uid = int(call.data.replace("admin_mng_ban_confirm_", ""))
+    uid = int(uid_str)
     sent = bot.send_message(call.message.chat.id, f"🚫 Причина бана <code>{uid}</code>:",
                             parse_mode='HTML', reply_markup=back_to_admin_menu())
     bot.register_next_step_handler(sent, admin_mng_ban_save, uid)
@@ -5131,7 +5087,10 @@ def admin_mng_ban_save(message, uid):
 def admin_mng_unban(call):
     if call.message.chat.id != ADMIN_ID:
         return
-    uid = int(call.data.replace("admin_mng_unban_", ""))
+    uid_str = call.data.replace("admin_mng_unban_", "")
+    if not uid_str.isdigit():
+        return
+    uid = int(uid_str)
     update_user(uid, 'banned', 0)
     update_user(uid, 'ban_reason', '')
     bot.answer_callback_query(call.id, "✅ Разбанен")
@@ -5146,7 +5105,10 @@ def admin_mng_unban(call):
 def admin_mng_img(call):
     if call.message.chat.id != ADMIN_ID:
         return
-    uid = int(call.data.replace("admin_mng_img_", ""))
+    uid_str = call.data.replace("admin_mng_img_", "")
+    if not uid_str.isdigit():
+        return
+    uid = int(uid_str)
     user = get_user(uid)
     update_user(uid, 'can_image', 0 if user[12] else 1)
     bot.answer_callback_query(call.id, "✅ Изменено")
@@ -5157,7 +5119,10 @@ def admin_mng_img(call):
 def admin_mng_chat(call):
     if call.message.chat.id != ADMIN_ID:
         return
-    uid = int(call.data.replace("admin_mng_chat_", ""))
+    uid_str = call.data.replace("admin_mng_chat_", "")
+    if not uid_str.isdigit():
+        return
+    uid = int(uid_str)
     user = get_user(uid)
     update_user(uid, 'can_chat', 0 if user[13] else 1)
     bot.answer_callback_query(call.id, "✅ Изменено")
@@ -5168,7 +5133,10 @@ def admin_mng_chat(call):
 def admin_mng_ignore_off(call):
     if call.message.chat.id != ADMIN_ID:
         return
-    uid = int(call.data.replace("admin_mng_ignore_off_", ""))
+    uid_str = call.data.replace("admin_mng_ignore_off_", "")
+    if not uid_str.isdigit():
+        return
+    uid = int(uid_str)
     update_user(uid, 'ignore_maintenance', 0)
     bot.answer_callback_query(call.id, "🔒 Убрано")
     admin_mng_user(call)
@@ -5178,7 +5146,10 @@ def admin_mng_ignore_off(call):
 def admin_mng_ignore(call):
     if call.message.chat.id != ADMIN_ID:
         return
-    uid = int(call.data.replace("admin_mng_ignore_", ""))
+    uid_str = call.data.replace("admin_mng_ignore_", "")
+    if not uid_str.isdigit():
+        return
+    uid = int(uid_str)
     update_user(uid, 'ignore_maintenance', 1)
     bot.answer_callback_query(call.id, "🔓 Разрешено")
     admin_mng_user(call)
@@ -5188,7 +5159,10 @@ def admin_mng_ignore(call):
 def admin_mng_sub(call):
     if call.message.chat.id != ADMIN_ID:
         return
-    uid = int(call.data.replace("admin_mng_sub_", ""))
+    uid_str = call.data.replace("admin_mng_sub_", "")
+    if not uid_str.isdigit():
+        return
+    uid = int(uid_str)
     subscribe(ADMIN_ID, uid)
     bot.answer_callback_query(call.id, "✍️ Подписан")
     admin_mng_user(call)
@@ -5198,7 +5172,10 @@ def admin_mng_sub(call):
 def admin_mng_unsub(call):
     if call.message.chat.id != ADMIN_ID:
         return
-    uid = int(call.data.replace("admin_mng_unsub_", ""))
+    uid_str = call.data.replace("admin_mng_unsub_", "")
+    if not uid_str.isdigit():
+        return
+    uid = int(uid_str)
     unsubscribe(ADMIN_ID, uid)
     bot.answer_callback_query(call.id, "➖ Отписан")
     admin_mng_user(call)
@@ -5208,7 +5185,10 @@ def admin_mng_unsub(call):
 def admin_mng_mute(call):
     if call.message.chat.id != ADMIN_ID:
         return
-    uid = int(call.data.replace("admin_mng_mute_", ""))
+    uid_str = call.data.replace("admin_mng_mute_", "")
+    if not uid_str.isdigit():
+        return
+    uid = int(uid_str)
     sent = bot.send_message(call.message.chat.id,
                             f"🚫 На сколько минут замутить поддержку <code>{uid}</code>?\n\n"
                             f"<i>Введи число (1-10080)</i>",
@@ -5246,7 +5226,10 @@ def admin_mng_mute_save(message, uid):
 def admin_mng_limits(call):
     if call.message.chat.id != ADMIN_ID:
         return
-    uid = int(call.data.replace("admin_mng_limits_", ""))
+    uid_str = call.data.replace("admin_mng_limits_", "")
+    if not uid_str.isdigit():
+        return
+    uid = int(uid_str)
     user = get_user(uid)
     li, lc, le = user[14], user[15], user[20]
     ui, uc, ue = user[16], user[17], user[19]
@@ -5275,7 +5258,10 @@ def admin_mng_limits(call):
 def admin_lim_img(call):
     if call.message.chat.id != ADMIN_ID:
         return
-    uid = int(call.data.replace("admin_lim_img_", ""))
+    uid_str = call.data.replace("admin_lim_img_", "")
+    if not uid_str.isdigit():
+        return
+    uid = int(uid_str)
     sent = bot.send_message(call.message.chat.id, f"🎨 Лимит картинок для <code>{uid}</code> (-1=∞):",
                             parse_mode='HTML', reply_markup=back_to_admin_menu())
     bot.register_next_step_handler(sent, admin_lim_img_save, uid)
@@ -5307,7 +5293,10 @@ def admin_lim_img_save(message, uid):
 def admin_lim_edit(call):
     if call.message.chat.id != ADMIN_ID:
         return
-    uid = int(call.data.replace("admin_lim_edit_", ""))
+    uid_str = call.data.replace("admin_lim_edit_", "")
+    if not uid_str.isdigit():
+        return
+    uid = int(uid_str)
     sent = bot.send_message(call.message.chat.id, f"🖼 Лимит правок для <code>{uid}</code> (-1=∞):",
                             parse_mode='HTML', reply_markup=back_to_admin_menu())
     bot.register_next_step_handler(sent, admin_lim_edit_save, uid)
@@ -5339,7 +5328,10 @@ def admin_lim_edit_save(message, uid):
 def admin_lim_chat(call):
     if call.message.chat.id != ADMIN_ID:
         return
-    uid = int(call.data.replace("admin_lim_chat_", ""))
+    uid_str = call.data.replace("admin_lim_chat_", "")
+    if not uid_str.isdigit():
+        return
+    uid = int(uid_str)
     sent = bot.send_message(call.message.chat.id, f"🤖 Лимит чата для <code>{uid}</code> (-1=∞):",
                             parse_mode='HTML', reply_markup=back_to_admin_menu())
     bot.register_next_step_handler(sent, admin_lim_chat_save, uid)
@@ -5371,7 +5363,10 @@ def admin_lim_chat_save(message, uid):
 def admin_lim_reset(call):
     if call.message.chat.id != ADMIN_ID:
         return
-    uid = int(call.data.replace("admin_lim_reset_", ""))
+    uid_str = call.data.replace("admin_lim_reset_", "")
+    if not uid_str.isdigit():
+        return
+    uid = int(uid_str)
     reset_used(uid)
     bot.answer_callback_query(call.id, "🔄 Сброшено")
     admin_mng_limits(call)
@@ -5381,7 +5376,10 @@ def admin_lim_reset(call):
 def admin_lim_clear(call):
     if call.message.chat.id != ADMIN_ID:
         return
-    uid = int(call.data.replace("admin_lim_clear_", ""))
+    uid_str = call.data.replace("admin_lim_clear_", "")
+    if not uid_str.isdigit():
+        return
+    uid = int(uid_str)
     update_user(uid, 'limit_images', -1)
     update_user(uid, 'limit_chats', -1)
     update_user(uid, 'limit_edits', -1)
@@ -5395,7 +5393,10 @@ def admin_lim_clear(call):
 def admin_mng_hist(call):
     if call.message.chat.id != ADMIN_ID:
         return
-    uid = int(call.data.replace("admin_mng_hist_", ""))
+    uid_str = call.data.replace("admin_mng_hist_", "")
+    if not uid_str.isdigit():
+        return
+    uid = int(uid_str)
     history = get_full_history(uid, limit=500)
     img_hist = get_full_image_history(uid, limit=100)
 
@@ -5481,7 +5482,10 @@ def admin_mng_hist(call):
 def admin_mng_write(call):
     if call.message.chat.id != ADMIN_ID:
         return
-    uid = int(call.data.replace("admin_mng_write_", ""))
+    uid_str = call.data.replace("admin_mng_write_", "")
+    if not uid_str.isdigit():
+        return
+    uid = int(uid_str)
     sent = bot.send_message(call.message.chat.id, f"✍️ Сообщение для <code>{uid}</code>:",
                             parse_mode='HTML', reply_markup=back_to_admin_menu())
     bot.register_next_step_handler(sent, admin_mng_write_save, uid)
