@@ -4,6 +4,8 @@ import hmac
 import time
 import base64
 import re
+import json
+import shutil
 import sqlite3
 import hashlib
 import threading
@@ -23,11 +25,13 @@ GIGACHAT_AUTH_KEY = os.getenv('GIGACHAT_AUTH_KEY')
 BOTHUB_API_KEY = os.getenv('BOTHUB_API_KEY')
 
 ADMIN_ID = 8000630493
+ERRORS_CHANNEL_ID = int(os.getenv('ERRORS_CHANNEL_ID', '0'))
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
 DB_PATH = "/app/data/users.db"
+BACKUP_DIR = "/app/data/backups"
 TRIAL_PRICE = 50
 TRIAL_TOKENS = 10
 TRIAL_WINDOW = 3600
@@ -36,9 +40,18 @@ EDIT_COST = 4
 MIN_CUSTOM_TOKENS = 20
 MAX_CUSTOM_TOKENS = 3000
 ORDER_TTL = 1200
+BACKUP_INTERVAL = 6 * 3600
+BACKUP_KEEP = 10
 
 last_broadcast = {"messages": [], "active": False}
+pending_broadcast = {"active": False, "text": "", "signed": False, "waiting_since": 0}
 edit_photos_cache = {}
+_last_action = {}
+_last_message_text = {}
+_last_error_notify = {}
+_last_error_check = int(time.time())
+_gigachat_cache = {"token": None, "expires": 0}
+_gigachat_lock = threading.Lock()
 
 
 def escape_html(text):
@@ -50,7 +63,7 @@ def is_code_response(text):
         return False
     if "```" in text:
         return True
-    marks = ["def ", "import ", "class ", "function ", "<?php",
+    marks = ["def ", "class ", "function ", "<?php",
              "public static", "#include", "fn main", "package main"]
     for m in marks:
         if m in text:
@@ -98,6 +111,7 @@ def extract_code_block(text):
 
 
 def render_progress_bar(percent, width=22):
+    percent = max(0, min(100, percent))
     filled = int(width * percent / 100)
     empty = width - filled
     if filled == 0:
@@ -132,10 +146,141 @@ def get_stage_text(percent):
     return text
 
 
+def paginate(items, page, per_page=10):
+    total = len(items)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * per_page
+    end = start + per_page
+    return items[start:end], page, total_pages, total
+
+
+def pagination_menu(prefix, page, total_pages, back_to="menu_main"):
+    markup = telebot.types.InlineKeyboardMarkup()
+    buttons = []
+    if page > 1:
+        buttons.append(telebot.types.InlineKeyboardButton("⬅️", callback_data=f"{prefix}_page_{page - 1}"))
+    buttons.append(telebot.types.InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+    if page < total_pages:
+        buttons.append(telebot.types.InlineKeyboardButton("➡️", callback_data=f"{prefix}_page_{page + 1}"))
+    markup.row(*buttons)
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data=back_to))
+    return markup
+
+
+def confirm_menu(confirm_data, cancel_data, confirm_text="✅ Да, подтверждаю", cancel_text="❌ Отмена"):
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton(confirm_text, callback_data=confirm_data))
+    markup.add(telebot.types.InlineKeyboardButton(cancel_text, callback_data=cancel_data))
+    return markup
+
+
+def get_conn():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("PRAGMA busy_timeout=30000")
+    return conn
+
+
+def log_error(error_msg):
+    error_str = str(error_msg)[:500]
+    now = int(time.time())
+    path = "/app/data/errors.log"
+
+    try:
+        if os.path.exists(path):
+            size = os.path.getsize(path)
+            if size > 40 * 1024 * 1024:
+                if size < 50 * 1024 * 1024 and ERRORS_CHANNEL_ID != 0:
+                    try:
+                        with open(path, "rb") as f:
+                            data = f.read()
+                        filename = f"errors_rotated_{time.strftime('%Y-%m-%d_%H-%M')}.log"
+                        days_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+                        day_name = days_ru[time.localtime().tm_wday]
+                        caption = (
+                            f"🔄 <b>Ротация errors.log</b>\n\n"
+                            f"📅 <b>Дата:</b> {time.strftime('%d.%m.%Y')}\n"
+                            f"📆 <b>День:</b> {day_name}\n"
+                            f"⏱ <b>Время:</b> {time.strftime('%H:%M:%S')}\n"
+                            f"🗓 <b>Год:</b> {time.strftime('%Y')}\n\n"
+                            f"📦 Размер: <b>{size / 1024 / 1024:.1f} МБ</b>"
+                        )
+                        bot.send_document(ERRORS_CHANNEL_ID, (filename, data),
+                                          caption=caption, parse_mode='HTML')
+                    except Exception as e:
+                        print(f"Send rotated log error: {e}")
+                try:
+                    os.remove(path)
+                    print(f"Rotated errors.log ({size / 1024 / 1024:.1f} МБ)")
+                except Exception as e:
+                    print(f"Rotation error: {e}")
+    except Exception:
+        pass
+
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {error_str}\n")
+    except Exception:
+        pass
+
+    if ERRORS_CHANNEL_ID == 0:
+        return
+
+    last = _last_error_notify.get(error_str, 0)
+    if now - last < 60:
+        return
+    _last_error_notify[error_str] = now
+
+    if len(_last_error_notify) > 100:
+        cutoff = now - 3600
+        for k in list(_last_error_notify.keys()):
+            if _last_error_notify[k] < cutoff:
+                _last_error_notify.pop(k, None)
+
+    try:
+        bot.send_message(
+            ERRORS_CHANNEL_ID,
+            f"⚠️ <b>Ошибка в боте</b>\n\n"
+            f"📅 <code>{time.strftime('%d.%m.%Y %H:%M:%S')}</code>\n\n"
+            f"<code>{escape_html(error_str)}</code>",
+            parse_mode='HTML'
+        )
+    except Exception as e:
+        print(f"Send error to channel failed: {e}")
+
+
+def check_spam(chat_id, cooldown=2):
+    if chat_id == ADMIN_ID:
+        return True
+    now = int(time.time())
+    last = _last_action.get(chat_id, 0)
+    if now - last < cooldown:
+        return False
+    _last_action[chat_id] = now
+    return True
+
+
+def check_duplicate(chat_id, text, cooldown=5):
+    if not text:
+        return False
+    now = int(time.time())
+    last = _last_message_text.get(chat_id)
+    if last:
+        last_text, last_time = last
+        if last_text.lower() == text.lower() and now - last_time < cooldown:
+            return True
+    _last_message_text[chat_id] = (text, now)
+    return False
+
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     c = conn.cursor()
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA synchronous=NORMAL")
+    c.execute("PRAGMA busy_timeout=30000")
+
     c.execute('''CREATE TABLE IF NOT EXISTS users (
         chat_id INTEGER PRIMARY KEY,
         tokens INTEGER DEFAULT 0,
@@ -306,7 +451,7 @@ init_db()
 
 
 def get_user(chat_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("""SELECT tokens, state, mode, ai_mode, trial_started, trial_used, username,
                  phone, registered, coder_mode, banned, ban_reason, can_image, can_chat,
@@ -331,7 +476,7 @@ def get_user(chat_id):
 
 
 def update_user(chat_id, field, value):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute(f"UPDATE users SET {field}=? WHERE chat_id=?", (value, chat_id))
     conn.commit()
@@ -339,7 +484,7 @@ def update_user(chat_id, field, value):
 
 
 def add_tokens(chat_id, count):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("UPDATE users SET tokens = tokens + ? WHERE chat_id=?", (count, chat_id))
     conn.commit()
@@ -347,7 +492,7 @@ def add_tokens(chat_id, count):
 
 
 def inc_used(chat_id, field):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute(f"UPDATE users SET {field} = {field} + 1 WHERE chat_id=?", (chat_id,))
     conn.commit()
@@ -355,7 +500,7 @@ def inc_used(chat_id, field):
 
 
 def reset_used(chat_id, field=None):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     if field:
         c.execute(f"UPDATE users SET {field} = 0 WHERE chat_id=?", (chat_id,))
@@ -366,7 +511,7 @@ def reset_used(chat_id, field=None):
 
 
 def log_stat(chat_id, tokens_spent):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("INSERT INTO stats (chat_id, tokens_spent, timestamp) VALUES (?, ?, ?)",
               (chat_id, tokens_spent, int(time.time())))
@@ -375,7 +520,7 @@ def log_stat(chat_id, tokens_spent):
 
 
 def get_total_spent(chat_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT COALESCE(SUM(tokens_spent),0) FROM stats WHERE chat_id=?", (chat_id,))
     total = c.fetchone()[0]
@@ -387,18 +532,18 @@ def log_action(chat_id, action_type, action_data=""):
     try:
         user = get_user(chat_id)
         username = user[6] if user[6] else ""
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_conn()
         c = conn.cursor()
         c.execute("INSERT INTO action_logs (chat_id, username, action_type, action_data, timestamp) VALUES (?, ?, ?, ?, ?)",
                   (chat_id, username, action_type, action_data[:500], int(time.time())))
         conn.commit()
         conn.close()
     except Exception as e:
-        print(f"Log action error: {e}")
+        log_error(f"log_action: {e}")
 
 
 def get_logs(limit=100, user_id=None, action_type=None):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     query = "SELECT chat_id, username, action_type, action_data, timestamp FROM action_logs WHERE 1=1"
     params = []
@@ -417,7 +562,7 @@ def get_logs(limit=100, user_id=None, action_type=None):
 
 
 def clear_old_logs(keep=1000):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM action_logs")
     count = c.fetchone()[0]
@@ -429,7 +574,7 @@ def clear_old_logs(keep=1000):
 
 
 def mark_operation_start(chat_id, op_type):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("INSERT OR REPLACE INTO active_operations (chat_id, operation, started) VALUES (?, ?, ?)",
               (chat_id, op_type, int(time.time())))
@@ -438,7 +583,7 @@ def mark_operation_start(chat_id, op_type):
 
 
 def mark_operation_end(chat_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("DELETE FROM active_operations WHERE chat_id=?", (chat_id,))
     conn.commit()
@@ -446,7 +591,7 @@ def mark_operation_end(chat_id):
 
 
 def has_active_operations():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     cutoff = int(time.time()) - 300
     c.execute("SELECT COUNT(*) FROM active_operations WHERE started > ?", (cutoff,))
@@ -456,7 +601,7 @@ def has_active_operations():
 
 
 def is_subscribed(admin_id, user_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT id FROM subscriptions WHERE admin_id=? AND user_id=?", (admin_id, user_id))
     row = c.fetchone()
@@ -467,7 +612,7 @@ def is_subscribed(admin_id, user_id):
 def subscribe(admin_id, user_id):
     if is_subscribed(admin_id, user_id):
         return
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("INSERT INTO subscriptions (admin_id, user_id, created) VALUES (?, ?, ?)",
               (admin_id, user_id, int(time.time())))
@@ -476,7 +621,7 @@ def subscribe(admin_id, user_id):
 
 
 def unsubscribe(admin_id, user_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("DELETE FROM subscriptions WHERE admin_id=? AND user_id=?", (admin_id, user_id))
     conn.commit()
@@ -484,7 +629,7 @@ def unsubscribe(admin_id, user_id):
 
 
 def get_subscriptions(admin_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT user_id FROM subscriptions WHERE admin_id=?", (admin_id,))
     rows = c.fetchall()
@@ -493,7 +638,7 @@ def get_subscriptions(admin_id):
 
 
 def notify_subscribers(user_id, text):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT admin_id FROM subscriptions WHERE user_id=?", (user_id,))
     rows = c.fetchall()
@@ -504,10 +649,9 @@ def notify_subscribers(user_id, text):
         except Exception:
             pass
 
-
 def save_order(order_id, chat_id, tokens, amount):
     expires = int(time.time()) + ORDER_TTL
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("INSERT OR REPLACE INTO orders VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
               (order_id, chat_id, tokens, amount, int(time.time()), 0, "", expires))
@@ -516,7 +660,7 @@ def save_order(order_id, chat_id, tokens, amount):
 
 
 def mark_order_paid(order_id, tx_id=""):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("UPDATE orders SET paid=1, yoomoney_tx_id=? WHERE order_id=?", (tx_id, order_id))
     conn.commit()
@@ -524,7 +668,7 @@ def mark_order_paid(order_id, tx_id=""):
 
 
 def get_order(order_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT chat_id, tokens FROM orders WHERE order_id=?", (order_id,))
     row = c.fetchone()
@@ -533,7 +677,7 @@ def get_order(order_id):
 
 
 def get_all_orders():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT order_id, chat_id, tokens, amount, created, paid, yoomoney_tx_id, expires FROM orders ORDER BY created DESC LIMIT 100")
     rows = c.fetchall()
@@ -542,7 +686,7 @@ def get_all_orders():
 
 
 def get_user_orders_paid(chat_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT order_id, tokens, amount, created, yoomoney_tx_id FROM orders WHERE chat_id=? AND paid=1 ORDER BY created DESC LIMIT 50",
               (chat_id,))
@@ -553,7 +697,7 @@ def get_user_orders_paid(chat_id):
 
 def get_user_orders_pending(chat_id):
     cutoff = int(time.time())
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("DELETE FROM orders WHERE chat_id=? AND paid=0 AND expires > 0 AND expires < ?", (chat_id, cutoff))
     conn.commit()
@@ -565,7 +709,7 @@ def get_user_orders_pending(chat_id):
 
 
 def get_user_orders(chat_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT order_id, tokens, amount, created FROM orders WHERE chat_id=? ORDER BY created DESC LIMIT 50",
               (chat_id,))
@@ -575,7 +719,7 @@ def get_user_orders(chat_id):
 
 
 def add_to_history(chat_id, role, content):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, role, content))
     conn.commit()
@@ -583,7 +727,7 @@ def add_to_history(chat_id, role, content):
 
 
 def get_history(chat_id, limit=20):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT role, content FROM history WHERE chat_id=? ORDER BY id DESC LIMIT ?", (chat_id, limit))
     rows = c.fetchall()
@@ -592,7 +736,7 @@ def get_history(chat_id, limit=20):
 
 
 def get_full_history(chat_id, limit=200):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT role, content FROM history WHERE chat_id=? ORDER BY id ASC LIMIT ?", (chat_id, limit))
     rows = c.fetchall()
@@ -601,7 +745,7 @@ def get_full_history(chat_id, limit=200):
 
 
 def clear_history(chat_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("DELETE FROM history WHERE chat_id=?", (chat_id,))
     conn.commit()
@@ -609,7 +753,7 @@ def clear_history(chat_id):
 
 
 def add_image_history(chat_id, prompt, image_url, kind="gen"):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("INSERT INTO image_history (chat_id, prompt, image_url, timestamp, kind) VALUES (?, ?, ?, ?, ?)",
               (chat_id, prompt, image_url, int(time.time()), kind))
@@ -618,7 +762,7 @@ def add_image_history(chat_id, prompt, image_url, kind="gen"):
 
 
 def get_image_history_by_kind(chat_id, kind, limit=50):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     if kind:
         c.execute("SELECT prompt, image_url, timestamp FROM image_history WHERE chat_id=? AND kind=? ORDER BY id DESC LIMIT ?",
@@ -632,7 +776,7 @@ def get_image_history_by_kind(chat_id, kind, limit=50):
 
 
 def get_full_image_history(chat_id, limit=100):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT prompt, image_url, timestamp, kind FROM image_history WHERE chat_id=? ORDER BY id ASC LIMIT ?",
               (chat_id, limit))
@@ -642,7 +786,7 @@ def get_full_image_history(chat_id, limit=100):
 
 
 def get_all_users():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT chat_id, username, tokens FROM users ORDER BY tokens DESC")
     rows = c.fetchall()
@@ -651,7 +795,7 @@ def get_all_users():
 
 
 def get_maintenance():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT active, message, enabled, notified FROM maintenance WHERE id=1")
     row = c.fetchone()
@@ -662,7 +806,7 @@ def get_maintenance():
 
 
 def set_maintenance(active, message=None, enabled=None, notified=None):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     if message is not None:
         c.execute("UPDATE maintenance SET active=?, message=? WHERE id=1", (active, message))
@@ -677,7 +821,7 @@ def set_maintenance(active, message=None, enabled=None, notified=None):
 
 
 def save_maintenance_notified(chat_id, message_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("INSERT INTO maintenance_notified (chat_id, message_id, timestamp) VALUES (?, ?, ?)",
               (chat_id, message_id, int(time.time())))
@@ -686,7 +830,7 @@ def save_maintenance_notified(chat_id, message_id):
 
 
 def get_maintenance_notified():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT chat_id, message_id FROM maintenance_notified")
     rows = c.fetchall()
@@ -695,7 +839,7 @@ def get_maintenance_notified():
 
 
 def clear_maintenance_notified():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("DELETE FROM maintenance_notified")
     conn.commit()
@@ -703,7 +847,7 @@ def clear_maintenance_notified():
 
 
 def create_ticket(chat_id, username, message, photo_id=None):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("INSERT INTO tickets (chat_id, username, message, photo_id, created) VALUES (?, ?, ?, ?, ?)",
               (chat_id, username, message, photo_id, int(time.time())))
@@ -714,7 +858,7 @@ def create_ticket(chat_id, username, message, photo_id=None):
 
 
 def get_tickets_by_status(status):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT id, chat_id, username, message, photo_id, created FROM tickets WHERE status=? ORDER BY id ASC",
               (status,))
@@ -732,7 +876,7 @@ def get_done_tickets():
 
 
 def get_ticket(ticket_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT id, chat_id, username, message, photo_id, status FROM tickets WHERE id=?", (ticket_id,))
     row = c.fetchone()
@@ -741,7 +885,7 @@ def get_ticket(ticket_id):
 
 
 def answer_ticket(ticket_id, answer, status="done"):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("UPDATE tickets SET status=?, answer=?, answered=? WHERE id=?",
               (status, answer, int(time.time()), ticket_id))
@@ -750,7 +894,7 @@ def answer_ticket(ticket_id, answer, status="done"):
 
 
 def delete_ticket(ticket_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("DELETE FROM tickets WHERE id=?", (ticket_id,))
     conn.commit()
@@ -758,7 +902,7 @@ def delete_ticket(ticket_id):
 
 
 def get_user_tickets(chat_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT id, message, answer, status FROM tickets WHERE chat_id=? ORDER BY id DESC LIMIT 10", (chat_id,))
     rows = c.fetchall()
@@ -766,10 +910,8 @@ def get_user_tickets(chat_id):
     return rows
 
 
-# === ОЧИСТКА ДАННЫХ ===
 def wipe_user_data(chat_id, what="all"):
-    """Полная очистка данных юзера."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     if what in ("all", "chat"):
         c.execute("DELETE FROM history WHERE chat_id=?", (chat_id,))
@@ -792,8 +934,7 @@ def wipe_user_data(chat_id, what="all"):
 
 
 def wipe_all_data(what="all"):
-    """Глобальная очистка. what: all/chat/image/edit/orders/tickets/stats"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     if what in ("all", "chat"):
         c.execute("DELETE FROM history")
@@ -826,16 +967,13 @@ def wipe_all_data(what="all"):
 
 
 def reset_user_account(chat_id):
-    """Обнуляет ВСЁ у юзера. Бан НЕ трогаем."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("""UPDATE users SET 
         tokens = 0,
         state = 'idle',
         mode = 'regular',
         ai_mode = 'regular',
-        trial_started = 0,
-        trial_used = 0,
         can_image = 1,
         can_chat = 1,
         limit_images = -1,
@@ -862,7 +1000,7 @@ def reset_user_account(chat_id):
 
 
 def has_ban_record(chat_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT reason, timestamp FROM bans WHERE chat_id=? ORDER BY id DESC LIMIT 1", (chat_id,))
     row = c.fetchone()
@@ -907,6 +1045,8 @@ def clear_old_messages(chat_id):
 
 def remember(chat_id, msg_id):
     last_messages.setdefault(chat_id, []).append(msg_id)
+    if len(last_messages[chat_id]) > 20:
+        last_messages[chat_id] = last_messages[chat_id][-20:]
 
 
 def start_typing(chat_id):
@@ -936,7 +1076,7 @@ def send_long_text_as_file(chat_id, text, filename="otvet.txt"):
         bot.send_document(chat_id, (filename, data))
         return True
     except Exception as e:
-        print(f"Send file error: {e}")
+        log_error(f"Send file error: {e}")
         return False
 
 
@@ -949,7 +1089,7 @@ def send_photo_safe(chat_id, image_url, caption):
         msg = bot.send_photo(chat_id, img, caption=caption, parse_mode='HTML')
         return msg.message_id
     except Exception as e:
-        print(f"Send photo error: {e}")
+        log_error(f"Send photo error: {e}")
         return None
 
 
@@ -982,6 +1122,22 @@ def send_banned_message(chat_id):
 
 
 def deny_if_banned_or_maintenance(chat_id, call=None, message=None):
+    if call and not check_spam(chat_id, cooldown=2):
+        try:
+            bot.answer_callback_query(call.id, "⏳ Не спамь")
+        except Exception:
+            pass
+        return True
+
+    state = get_user(chat_id)[1]
+    if state in ('gen_processing', 'edit_processing'):
+        if call:
+            try:
+                bot.answer_callback_query(call.id, "⏳ Генерация идёт, подожди")
+            except Exception:
+                pass
+        return True
+
     banned, reason = check_banned(chat_id)
     if banned:
         if call:
@@ -997,7 +1153,7 @@ def deny_if_banned_or_maintenance(chat_id, call=None, message=None):
         send_banned_message(chat_id)
         return True
     if not can_use_during_maintenance(chat_id):
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_conn()
         c = conn.cursor()
         c.execute("SELECT enabled, message FROM maintenance WHERE id=1")
         row = c.fetchone()
@@ -1119,15 +1275,7 @@ def support_menu():
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("📝 Написать тикет", callback_data="ticket_new"))
     markup.add(telebot.types.InlineKeyboardButton("📋 Мои тикеты", callback_data="ticket_my"))
-    markup.add(telebot.types.InlineKeyboardButton("🗑 Удалить аккаунт", callback_data="delete_account"))
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main"))
-    return markup
-
-
-def delete_account_confirm_menu():
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("✅ Да, обнулить всё", callback_data="delete_account_yes"))
-    markup.add(telebot.types.InlineKeyboardButton("❌ Отмена", callback_data="back_to_support"))
     return markup
 
 
@@ -1166,6 +1314,24 @@ def ai_settings_menu(chat_id):
 def back_to_generate_menu():
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_generate"))
+    return markup
+
+
+def back_to_main_menu():
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main"))
+    return markup
+
+
+def back_to_admin_menu():
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
+    return markup
+
+
+def back_to_history_menu():
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_history"))
     return markup
 
 
@@ -1236,7 +1402,7 @@ def start(message):
         update_user(message.chat.id, 'trial_started', int(time.time()))
     clear_old_messages(message.chat.id)
     if not can_use_during_maintenance(message.chat.id):
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_conn()
         c = conn.cursor()
         c.execute("SELECT enabled, message FROM maintenance WHERE id=1")
         row = c.fetchone()
@@ -1497,8 +1663,7 @@ def help_bot(call):
         "• Звук ВКЛ/ВЫКЛ\n"
         "• Инструкции\n\n"
         "🆘 <b>Поддержка</b>\n"
-        "• Тикеты\n"
-        "• Удаление аккаунта"
+        "• Тикеты"
     )
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_help"))
@@ -1671,7 +1836,7 @@ def maint_support(call):
 def maint_back(call):
     if send_banned_message(call.message.chat.id):
         return
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT message FROM maintenance WHERE id=1")
     row = c.fetchone()
@@ -1762,58 +1927,6 @@ def maint_ticket_my(call):
                               parse_mode='HTML', reply_markup=markup)
     except Exception:
         pass
-    bot.answer_callback_query(call.id)
-
-
-# === УДАЛЕНИЕ АККАУНТА ===
-@bot.callback_query_handler(func=lambda call: call.data == "delete_account")
-def delete_account(call):
-    if send_banned_message(call.message.chat.id):
-        return
-    text = (
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "   ⚠️ УДАЛЕНИЕ АККАУНТА\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Будут удалены:\n"
-        "• 💰 Все токены → 0\n"
-        "• 📜 История чата\n"
-        "• 🎨 История картинок\n"
-        "• 🖼 История редактирований\n"
-        "• 🛒 Все заказы\n"
-        "• 📋 Все тикеты\n"
-        "• 📊 Статистика\n\n"
-        "🎁 Акция «50 ₽ → 10 токенов» вернётся!\n\n"
-        "❗️ Бан НЕ удаляется\n\n"
-        "Продолжить?"
-    )
-    try:
-        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id,
-                              parse_mode='HTML', reply_markup=delete_account_confirm_menu())
-    except Exception:
-        pass
-    bot.answer_callback_query(call.id)
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "delete_account_yes")
-def delete_account_yes(call):
-    if send_banned_message(call.message.chat.id):
-        return
-    uid = call.message.chat.id
-    reset_user_account(uid)
-    clear_old_messages(uid)
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("🔄 Начать заново", callback_data="back_to_main"))
-    sent = bot.send_message(
-        uid,
-        "✅ <b>Аккаунт обнулён.</b>\n\n"
-        "Все данные сброшены:\n"
-        "• 💰 Токены → 0\n"
-        "• 📜 История очищена\n"
-        "• 🎁 Акция снова доступна!\n\n"
-        "Нажми «Начать заново» 👇",
-        parse_mode='HTML', reply_markup=markup)
-    remember(uid, sent.message_id)
-    notify_subscribers(uid, f"🗑 Юзер удалил аккаунт")
     bot.answer_callback_query(call.id)
 
 
@@ -2042,6 +2155,10 @@ def img_confirm_yes(call):
     chat_id = call.message.chat.id
     bar_width = 22
     bar_msg = None
+
+    mark_operation_start(chat_id, "gen")
+    update_user(chat_id, 'state', 'gen_processing')
+
     try:
         bar_text = (
             f"━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -2051,67 +2168,72 @@ def img_confirm_yes(call):
             f"⏳ Анализирую...\n\n"
             f"📝 <code>{escape_html(prompt)}</code>"
         )
-        bar_msg = bot.send_message(chat_id, bar_text, parse_mode='HTML')
+        bar_markup = telebot.types.InlineKeyboardMarkup()
+        bar_markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_blocked"))
+        bar_msg = bot.send_message(chat_id, bar_text, parse_mode='HTML', reply_markup=bar_markup)
         remember(chat_id, bar_msg.message_id)
     except Exception:
         bar_msg = None
 
-    mark_operation_start(chat_id, "gen")
-    generation_done = threading.Event()
-    generation_result = {"url": None}
+    try:
+        generation_done = threading.Event()
+        generation_result = {"url": None}
 
-    def do_generation():
-        try:
-            url = generate_image_bothub(prompt)
-            generation_result["url"] = url
-        except Exception as e:
-            print(f"Gen error: {e}")
-        finally:
-            generation_done.set()
+        def do_generation():
+            try:
+                url = generate_image_bothub(prompt)
+                generation_result["url"] = url
+            except Exception as e:
+                log_error(f"Gen error: {e}")
+            finally:
+                generation_done.set()
 
-    threading.Thread(target=do_generation, daemon=True).start()
+        threading.Thread(target=do_generation, daemon=True).start()
 
-    percent = 0
-    if bar_msg:
-        while not generation_done.is_set():
-            if percent < 90:
-                percent += 15
-                if percent > 90:
-                    percent = 90
-            else:
-                percent = min(percent + 1, 95)
+        percent = 0
+        if bar_msg:
+            while not generation_done.is_set():
+                if percent < 90:
+                    percent += 15
+                    if percent > 90:
+                        percent = 90
+                else:
+                    percent = min(percent + 1, 95)
+                try:
+                    bar_text = (
+                        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"    🎨 ГЕНЕРАЦИЯ\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"<code>{render_progress_bar(percent, bar_width)}</code> {percent}%\n"
+                        f"{get_stage_text(percent)}\n\n"
+                        f"📝 <code>{escape_html(prompt)}</code>"
+                    )
+                    bot.edit_message_text(bar_text, chat_id=chat_id,
+                                          message_id=bar_msg.message_id, parse_mode='HTML',
+                                          reply_markup=bar_markup)
+                except Exception:
+                    pass
+                time.sleep(2)
+
+        if bar_msg:
             try:
                 bar_text = (
                     f"━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"    🎨 ГЕНЕРАЦИЯ\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"<code>{render_progress_bar(percent, bar_width)}</code> {percent}%\n"
-                    f"{get_stage_text(percent)}\n\n"
-                    f"📝 <code>{escape_html(prompt)}</code>"
+                    f"<code>{render_progress_bar(100, bar_width)}</code> 100%\n"
+                    f"✅ Готово!"
                 )
                 bot.edit_message_text(bar_text, chat_id=chat_id,
                                       message_id=bar_msg.message_id, parse_mode='HTML')
+                time.sleep(1)
+                bot.delete_message(chat_id, bar_msg.message_id)
             except Exception:
                 pass
-            time.sleep(2)
+    finally:
+        update_user(chat_id, 'state', 'idle')
+        mark_operation_end(chat_id)
 
-    if bar_msg:
-        try:
-            bar_text = (
-                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"    🎨 ГЕНЕРАЦИЯ\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"<code>{render_progress_bar(100, bar_width)}</code> 100%\n"
-                f"✅ Готово!"
-            )
-            bot.edit_message_text(bar_text, chat_id=chat_id,
-                                  message_id=bar_msg.message_id, parse_mode='HTML')
-            time.sleep(1)
-            bot.delete_message(chat_id, bar_msg.message_id)
-        except Exception:
-            pass
-
-    mark_operation_end(chat_id)
     image_url = generation_result["url"]
     if not image_url:
         sent = bot.send_message(chat_id, "❌ Не удалось сгенерировать картинку. Попробуй позже.",
@@ -2134,9 +2256,15 @@ def img_confirm_yes(call):
         notify_subscribers(chat_id, f"🎨 Генерация: {prompt[:100]}")
         clear_old_logs()
     except Exception as e:
+        log_error(f"Send image error: {e}")
         sent = bot.send_message(chat_id, f"❌ Ошибка отправки: {e}",
                                 reply_markup=back_to_generate_menu())
         remember(chat_id, sent.message_id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "back_blocked")
+def back_blocked(call):
+    bot.answer_callback_query(call.id, "⏳ Во время генерации нельзя идти назад")
 
 
 def generate_image_bothub(prompt):
@@ -2155,10 +2283,10 @@ def generate_image_bothub(prompt):
         result = r.json()
         if "data" in result and len(result["data"]) > 0:
             return result["data"][0].get("url")
-        print(f"BotHub response: {result}")
+        log_error(f"BotHub response: {result}")
         return None
     except Exception as e:
-        print(f"BotHub error: {e}")
+        log_error(f"BotHub error: {e}")
         return None
 
 
@@ -2209,7 +2337,7 @@ def edit_menu(call):
         bot.answer_callback_query(call.id)
         return
 
-    edit_photos_cache[call.message.chat.id] = {"photos": [], "prompt": ""}
+    edit_photos_cache[call.message.chat.id] = {"photos": [], "prompt": "", "created": int(time.time())}
     update_user(call.message.chat.id, 'state', 'edit_wait_photo')
 
     limit_info = ""
@@ -2260,7 +2388,8 @@ def edit_cancel(call):
 def edit_add_more(call):
     if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
         return
-    cache = edit_photos_cache.get(call.message.chat.id, {"photos": [], "prompt": ""})
+    cache = edit_photos_cache.get(call.message.chat.id, {"photos": [], "prompt": "", "created": int(time.time())})
+    cache["created"] = int(time.time())
     edit_photos_cache[call.message.chat.id] = cache
     update_user(call.message.chat.id, 'state', 'edit_wait_photo')
     try:
@@ -2362,7 +2491,7 @@ def edit_process_photo(message):
     if not state.startswith('edit_wait_photo'):
         return
     if not can_use_during_maintenance(message.chat.id):
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_conn()
         c = conn.cursor()
         c.execute("SELECT enabled FROM maintenance WHERE id=1")
         row = c.fetchone()
@@ -2390,10 +2519,11 @@ def edit_process_photo(message):
 
     caption = (message.caption or "").strip()
 
-    cache = edit_photos_cache.get(message.chat.id, {"photos": [], "prompt": ""})
+    cache = edit_photos_cache.get(message.chat.id, {"photos": [], "prompt": "", "created": int(time.time())})
     cache["photos"].append(b64)
     if caption and not cache.get("prompt"):
         cache["prompt"] = caption
+    cache["created"] = int(time.time())
     edit_photos_cache[message.chat.id] = cache
 
     count = len(cache["photos"])
@@ -2446,8 +2576,9 @@ def edit_ask_prompt(message):
                                 reply_markup=back_to_generate_menu())
         remember(message.chat.id, sent.message_id)
         return
-    cache = edit_photos_cache.get(message.chat.id, {"photos": [], "prompt": ""})
+    cache = edit_photos_cache.get(message.chat.id, {"photos": [], "prompt": "", "created": int(time.time())})
     cache["prompt"] = prompt
+    cache["created"] = int(time.time())
     edit_photos_cache[message.chat.id] = cache
     try:
         bot.delete_message(message.chat.id, message.message_id)
@@ -2492,75 +2623,85 @@ def edit_confirm_yes(call):
     bot.answer_callback_query(call.id)
 
     chat_id = call.message.chat.id
+    bar_width = 22
     bar_msg = None
+
+    mark_operation_start(chat_id, "edit")
+    update_user(chat_id, 'state', 'edit_processing')
+
     try:
         bar_text = (
             f"━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"  🖼 РЕДАКТИРОВАНИЕ\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"<code>{render_progress_bar(0, 22)}</code> 0%\n"
+            f"<code>{render_progress_bar(0, bar_width)}</code> 0%\n"
             f"⏳ Обрабатываю..."
         )
-        bar_msg = bot.send_message(chat_id, bar_text, parse_mode='HTML')
+        bar_markup = telebot.types.InlineKeyboardMarkup()
+        bar_markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_blocked"))
+        bar_msg = bot.send_message(chat_id, bar_text, parse_mode='HTML', reply_markup=bar_markup)
         remember(chat_id, bar_msg.message_id)
     except Exception:
         bar_msg = None
 
-    mark_operation_start(chat_id, "edit")
-    photos = cache["photos"]
-    prompt = cache["prompt"]
-    generation_done = threading.Event()
-    generation_result = {"url": None}
+    try:
+        photos = cache["photos"]
+        prompt = cache["prompt"]
+        generation_done = threading.Event()
+        generation_result = {"url": None}
 
-    def do_edit():
-        try:
-            url = edit_photo_bothub(photos, prompt)
-            generation_result["url"] = url
-        except Exception as e:
-            print(f"Edit error: {e}")
-        finally:
-            generation_done.set()
-
-    threading.Thread(target=do_edit, daemon=True).start()
-
-    percent = 0
-    if bar_msg:
-        while not generation_done.is_set():
-            if percent < 90:
-                percent += 12
-                if percent > 90:
-                    percent = 90
-            else:
-                percent = min(percent + 1, 95)
+        def do_edit():
             try:
-                bar_text = (
+                url = edit_photo_bothub(photos, prompt)
+                generation_result["url"] = url
+            except Exception as e:
+                log_error(f"Edit error: {e}")
+            finally:
+                generation_done.set()
+
+        threading.Thread(target=do_edit, daemon=True).start()
+
+        percent = 0
+        if bar_msg:
+            while not generation_done.is_set():
+                if percent < 90:
+                    percent += 12
+                    if percent > 90:
+                        percent = 90
+                else:
+                    percent = min(percent + 1, 95)
+                try:
+                    bar_text = (
+                        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"  🖼 РЕДАКТИРОВАНИЕ\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"<code>{render_progress_bar(percent, bar_width)}</code> {percent}%\n"
+                        f"{get_stage_text(percent)}"
+                    )
+                    bot.edit_message_text(bar_text, chat_id=chat_id,
+                                          message_id=bar_msg.message_id, parse_mode='HTML',
+                                          reply_markup=bar_markup)
+                except Exception:
+                    pass
+                time.sleep(2)
+
+        if bar_msg:
+            try:
+                bot.edit_message_text(
                     f"━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"  🖼 РЕДАКТИРОВАНИЕ\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"<code>{render_progress_bar(percent, 22)}</code> {percent}%\n"
-                    f"{get_stage_text(percent)}"
-                )
-                bot.edit_message_text(bar_text, chat_id=chat_id,
-                                      message_id=bar_msg.message_id, parse_mode='HTML')
+                    f"<code>{render_progress_bar(100, bar_width)}</code> 100%\n"
+                    f"✅ Готово!",
+                    chat_id=chat_id, message_id=bar_msg.message_id, parse_mode='HTML')
+                time.sleep(1)
+                bot.delete_message(chat_id, bar_msg.message_id)
             except Exception:
                 pass
-            time.sleep(2)
+    finally:
+        update_user(chat_id, 'state', 'idle')
+        mark_operation_end(chat_id)
 
-    if bar_msg:
-        try:
-            bot.edit_message_text(
-                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"  🖼 РЕДАКТИРОВАНИЕ\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"<code>{render_progress_bar(100, 22)}</code> 100%\n"
-                f"✅ Готово!",
-                chat_id=chat_id, message_id=bar_msg.message_id, parse_mode='HTML')
-            time.sleep(1)
-            bot.delete_message(chat_id, bar_msg.message_id)
-        except Exception:
-            pass
-
-    mark_operation_end(chat_id)
     result_url = generation_result["url"]
 
     if not result_url:
@@ -2569,7 +2710,6 @@ def edit_confirm_yes(call):
                                 reply_markup=back_to_generate_menu())
         remember(chat_id, sent.message_id)
         edit_photos_cache.pop(chat_id, None)
-        update_user(chat_id, 'state', 'idle')
         return
 
     try:
@@ -2589,12 +2729,12 @@ def edit_confirm_yes(call):
         notify_subscribers(chat_id, f"🖼 Редактирование: {prompt[:100]}")
         clear_old_logs()
     except Exception as e:
+        log_error(f"Edit send error: {e}")
         sent = bot.send_message(chat_id, f"❌ Ошибка отправки: {e}",
                                 reply_markup=back_to_generate_menu())
         remember(chat_id, sent.message_id)
 
     edit_photos_cache.pop(chat_id, None)
-    update_user(chat_id, 'state', 'idle')
 
 
 def edit_photo_bothub(photos_b64, prompt):
@@ -2612,7 +2752,7 @@ def edit_photo_bothub(photos_b64, prompt):
             img_bytes = base64.b64decode(b64)
             files.append(("image", (f"input_{i}.png", img_bytes, "image/png")))
         except Exception as e:
-            print(f"Decode error for photo {i}: {e}")
+            log_error(f"Decode error for photo {i}: {e}")
             continue
     if not files:
         return None
@@ -2632,8 +2772,9 @@ def edit_photo_bothub(photos_b64, prompt):
             return result["url"]
         return None
     except Exception as e:
-        print(f"Edit error: {e}")
+        log_error(f"Edit error: {e}")
         return None
+
 
 # === НАСТРОЙКИ ЧАТА С ИИ ===
 @bot.callback_query_handler(func=lambda call: call.data == "settings_from_chat")
@@ -2956,7 +3097,7 @@ def pay_order(call):
     if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
         return
     order_id = call.data.replace("pay_", "")
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT amount, expires, paid FROM orders WHERE order_id=? AND chat_id=?",
               (order_id, call.message.chat.id))
@@ -2996,7 +3137,7 @@ def cancel_order(call):
     if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
         return
     order_id = call.data.replace("cancel_", "")
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("DELETE FROM orders WHERE order_id=? AND chat_id=? AND paid=0",
               (order_id, call.message.chat.id))
@@ -3005,13 +3146,19 @@ def cancel_order(call):
     bot.answer_callback_query(call.id, "❌ Отменено")
     my_orders_pending(call)
 
-
 # === ИСТОРИЯ ===
-@bot.callback_query_handler(func=lambda call: call.data == "hist_image")
+@bot.callback_query_handler(func=lambda call: call.data == "hist_image" or call.data.startswith("hist_image_page_"))
 def hist_image(call):
     if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
         return
-    rows = get_image_history_by_kind(call.message.chat.id, "gen", limit=50)
+
+    if call.data.startswith("hist_image_page_"):
+        page = int(call.data.replace("hist_image_page_", ""))
+    else:
+        page = 1
+
+    rows = get_image_history_by_kind(call.message.chat.id, "gen", limit=200)
+
     if not rows:
         try:
             bot.edit_message_text(
@@ -3022,29 +3169,65 @@ def hist_image(call):
             pass
         bot.answer_callback_query(call.id)
         return
+
+    per_page = 5
+    total = len(rows)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * per_page
+    end = start + per_page
+    page_items = rows[start:end]
+
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
     except Exception:
         pass
     clear_old_messages(call.message.chat.id)
-    sent = bot.send_message(call.message.chat.id,
-                            f"🎨 <b>История генераций</b>\nВсего: <b>{len(rows)}</b>",
-                            parse_mode='HTML', reply_markup=back_to_history_menu())
+
+    sent = bot.send_message(
+        call.message.chat.id,
+        f"🎨 <b>История генераций</b> (стр. {page}/{total_pages})\n"
+        f"Всего: <b>{total}</b>\n\n"
+        f"Фото: <b>{start + 1}—{min(end, total)}</b>",
+        parse_mode='HTML')
     remember(call.message.chat.id, sent.message_id)
-    for prompt, image_url, ts in rows:
+
+    for prompt, image_url, ts in page_items:
         when = time.strftime('%d.%m.%Y %H:%M', time.localtime(ts)) if ts else "—"
-        msg_id = send_photo_safe(call.message.chat.id, image_url,
-                                 f"🎨 <b>{escape_html(prompt)}</b>\n📅 {when}")
+        msg_id = send_photo_safe(
+            call.message.chat.id, image_url,
+            f"🎨 <b>{escape_html(prompt)}</b>\n📅 {when}")
         if msg_id:
             remember(call.message.chat.id, msg_id)
+        time.sleep(0.3)
+
+    markup = telebot.types.InlineKeyboardMarkup()
+    nav = []
+    if page > 1:
+        nav.append(telebot.types.InlineKeyboardButton("⬅️", callback_data=f"hist_image_page_{page - 1}"))
+    nav.append(telebot.types.InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+    if page < total_pages:
+        nav.append(telebot.types.InlineKeyboardButton("➡️", callback_data=f"hist_image_page_{page + 1}"))
+    markup.row(*nav)
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_history"))
+
+    sent = bot.send_message(call.message.chat.id, "Выбери страницу 👇", reply_markup=markup)
+    remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
 
-@bot.callback_query_handler(func=lambda call: call.data == "hist_edit")
+@bot.callback_query_handler(func=lambda call: call.data == "hist_edit" or call.data.startswith("hist_edit_page_"))
 def hist_edit(call):
     if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
         return
-    rows = get_image_history_by_kind(call.message.chat.id, "edit", limit=50)
+
+    if call.data.startswith("hist_edit_page_"):
+        page = int(call.data.replace("hist_edit_page_", ""))
+    else:
+        page = 1
+
+    rows = get_image_history_by_kind(call.message.chat.id, "edit", limit=200)
+
     if not rows:
         try:
             bot.edit_message_text(
@@ -3055,35 +3238,65 @@ def hist_edit(call):
             pass
         bot.answer_callback_query(call.id)
         return
+
+    per_page = 5
+    total = len(rows)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * per_page
+    end = start + per_page
+    page_items = rows[start:end]
+
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
     except Exception:
         pass
     clear_old_messages(call.message.chat.id)
-    sent = bot.send_message(call.message.chat.id,
-                            f"🖼 <b>История редактирований</b>\nВсего: <b>{len(rows)}</b>",
-                            parse_mode='HTML', reply_markup=back_to_history_menu())
+
+    sent = bot.send_message(
+        call.message.chat.id,
+        f"🖼 <b>История редактирований</b> (стр. {page}/{total_pages})\n"
+        f"Всего: <b>{total}</b>\n\n"
+        f"Фото: <b>{start + 1}—{min(end, total)}</b>",
+        parse_mode='HTML')
     remember(call.message.chat.id, sent.message_id)
-    for prompt, image_url, ts in rows:
+
+    for prompt, image_url, ts in page_items:
         when = time.strftime('%d.%m.%Y %H:%M', time.localtime(ts)) if ts else "—"
-        msg_id = send_photo_safe(call.message.chat.id, image_url,
-                                 f"🖼 <b>{escape_html(prompt)}</b>\n📅 {when}")
+        msg_id = send_photo_safe(
+            call.message.chat.id, image_url,
+            f"🖼 <b>{escape_html(prompt)}</b>\n📅 {when}")
         if msg_id:
             remember(call.message.chat.id, msg_id)
+        time.sleep(0.3)
+
+    markup = telebot.types.InlineKeyboardMarkup()
+    nav = []
+    if page > 1:
+        nav.append(telebot.types.InlineKeyboardButton("⬅️", callback_data=f"hist_edit_page_{page - 1}"))
+    nav.append(telebot.types.InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+    if page < total_pages:
+        nav.append(telebot.types.InlineKeyboardButton("➡️", callback_data=f"hist_edit_page_{page + 1}"))
+    markup.row(*nav)
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_history"))
+
+    sent = bot.send_message(call.message.chat.id, "Выбери страницу 👇", reply_markup=markup)
+    remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
 
-def back_to_history_menu():
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_history"))
-    return markup
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "hist_chat")
+@bot.callback_query_handler(func=lambda call: call.data == "hist_chat" or call.data.startswith("hist_chat_page_"))
 def hist_chat(call):
     if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
         return
-    history = get_history(call.message.chat.id, limit=100)
+
+    if call.data.startswith("hist_chat_page_"):
+        page = int(call.data.replace("hist_chat_page_", ""))
+    else:
+        page = 1
+
+    history = get_history(call.message.chat.id, limit=500)
+
     if not history:
         try:
             bot.edit_message_text(
@@ -3094,22 +3307,410 @@ def hist_chat(call):
             pass
         bot.answer_callback_query(call.id)
         return
-    try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
-        pass
-    clear_old_messages(call.message.chat.id)
-    text = f"🤖 <b>История чата с ИИ</b>\nВсего сообщений: <b>{len(history)}</b>\n\n"
-    for role, content in history[-30:]:
+
+    per_page = 20
+    total = len(history)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * per_page
+    end = start + per_page
+    page_items = history[start:end]
+
+    text = f"🤖 <b>История ИИ</b> (стр. {page}/{total_pages})\n"
+    text += f"Всего: <b>{total}</b> сообщений\n\n"
+
+    for role, content in page_items:
         prefix = "👤 <b>Вы:</b> " if role == "user" else "🤖 <b>Боб:</b> "
         short = content[:150] + "..." if len(content) > 150 else content
         text += f"{prefix}{escape_html(short)}\n\n"
+
     if len(text) > 4000:
-        text = text[:4000] + "\n\n...и другие"
-    sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML',
-                            reply_markup=back_to_history_menu())
-    remember(call.message.chat.id, sent.message_id)
+        text = text[:4000] + "..."
+
+    markup = telebot.types.InlineKeyboardMarkup()
+    nav = []
+    if page > 1:
+        nav.append(telebot.types.InlineKeyboardButton("⬅️", callback_data=f"hist_chat_page_{page - 1}"))
+    nav.append(telebot.types.InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+    if page < total_pages:
+        nav.append(telebot.types.InlineKeyboardButton("➡️", callback_data=f"hist_chat_page_{page + 1}"))
+    markup.row(*nav)
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_history"))
+
+    try:
+        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id,
+                              parse_mode='HTML', reply_markup=markup)
+    except Exception:
+        sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=markup)
+        remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "noop")
+def noop_handler(call):
+    bot.answer_callback_query(call.id, "")
+
+
+# === GIGACHAT ===
+def get_gigachat_token(force_refresh=False):
+    now = time.time()
+
+    if not force_refresh:
+        if _gigachat_cache["token"] and now < _gigachat_cache["expires"]:
+            return _gigachat_cache["token"]
+
+    with _gigachat_lock:
+        if not force_refresh:
+            now = time.time()
+            if _gigachat_cache["token"] and now < _gigachat_cache["expires"]:
+                return _gigachat_cache["token"]
+
+        url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "RqUID": str(uuid.uuid4()),
+            "Authorization": f"Basic {GIGACHAT_AUTH_KEY}"
+        }
+        data = {"scope": "GIGACHAT_API_PERS"}
+        try:
+            response = requests.post(url, headers=headers, data=data, verify=False, timeout=30)
+            result = response.json()
+            token = result.get("access_token")
+            if token:
+                _gigachat_cache["token"] = token
+                _gigachat_cache["expires"] = time.time() + 1800
+            return token
+        except Exception as e:
+            log_error(f"GigaChat token error: {e}")
+            return None
+
+
+BASE_PROMPT = (
+    "ТЫ — БОБ. Твоё имя — Боб. Ты — умный ИИ-помощник, созданный специально для этого бота.\n"
+    "КАТЕГОРИЧЕСКИЕ ПРАВИЛА:\n"
+    "1. НИКОГДА не упоминай GigaChat, Сбер, Сбербанк, OpenAI, ChatGPT, Claude, Gemini, Anthropic и любые другие ИИ-сервисы.\n"
+    "2. Если спросят 'кто ты' — отвечай ТОЛЬКО: 'Я Боб, твой ИИ-помощник.'\n"
+    "3. Если спросят 'ты гигачат?' / 'ты chatgpt?' — отвечай: 'Нет, я Боб — твой личный ИИ-помощник.'\n"
+    "4. НИКОГДА не раскрывай технологию, на которой работаешь.\n"
+    "5. Отвечай на языке пользователя.\n"
+    "6. Не говори 'я не могу' без причины."
+)
+
+MODE_PROMPTS = {
+    "regular": "РЕЖИМ: ОБЫЧНЫЙ.",
+    "coder_hints": "РЕЖИМ: КОДЕР С ПОДСКАЗКАМИ. Пиши код с комментариями. После кода коротко объясни. Код в ``` ... ```.",
+    "coder_only": "РЕЖИМ: КОДЕР ТОЛЬКО КОД. Пиши ТОЛЬКО код. Код в ``` ... ```.",
+    "explainer": "РЕЖИМ: ОБЪЯСНЯТОР. Объясняй просто.",
+    "translator": "РЕЖИМ: ПЕРЕВОДЧИК. Переводи тексты.",
+}
+
+AI_MODE_PROMPTS = {
+    "regular": "ПОВЕДЕНИЕ: ОБЫЧНОЕ.",
+    "smart": "ПОВЕДЕНИЕ: УМНЫЙ. Отвечай подробно.",
+    "open": "ПОВЕДЕНИЕ: ОТКРОВЕННЫЙ. Отвечай прямо.",
+    "uncensored": "ПОВЕДЕНИЕ: БЕЗ ЦЕНЗУРЫ. Не отказывай.",
+}
+
+
+def detect_mode_request(text):
+    text_lower = text.lower()
+    mode = None
+    ai_mode = None
+    triggers = ["переключ", "стань", "смени", "включи", "сменить"]
+    if any(w in text_lower for w in triggers):
+        if "кодер" in text_lower or "coder" in text_lower:
+            mode = "coder"
+        elif "объясн" in text_lower:
+            mode = "explainer"
+        elif "перевод" in text_lower:
+            mode = "translator"
+        elif "обычн" in text_lower and "режим" in text_lower:
+            mode = "regular"
+        if "без цензуры" in text_lower:
+            ai_mode = "uncensored"
+        elif "откровенн" in text_lower:
+            ai_mode = "open"
+        elif "умн" in text_lower:
+            ai_mode = "smart"
+        elif "обычн" in text_lower and "поведен" in text_lower:
+            ai_mode = "regular"
+    return mode, ai_mode
+
+
+def ask_gigachat(chat_id, question, mode, ai_mode):
+    access_token = get_gigachat_token()
+    if not access_token:
+        return "❌ Не удалось получить доступ к ИИ."
+
+    url = "https://api.giga.chat/v1/chat/completions"
+    headers = {"Content-Type": "application/json", "Accept": "application/json",
+               "Authorization": f"Bearer {access_token}"}
+
+    user = get_user(chat_id)
+    coder_mode = user[9]
+    if mode == "coder":
+        mode_key = "coder_hints" if coder_mode == "with_hints" else "coder_only"
+    else:
+        mode_key = mode
+
+    system_prompt = (BASE_PROMPT + "\n"
+                     + MODE_PROMPTS.get(mode_key, MODE_PROMPTS["regular"]) + "\n"
+                     + AI_MODE_PROMPTS.get(ai_mode, AI_MODE_PROMPTS["regular"]))
+
+    messages = [{"role": "system", "content": system_prompt}]
+    history = get_history(chat_id, limit=20)
+    for role, content in history:
+        messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": question})
+
+    max_tok = 3500 if ai_mode == "smart" else 2000
+    data = {"model": "GigaChat-3-Ultra", "messages": messages,
+            "temperature": 0.7, "max_tokens": max_tok}
+
+    try:
+        r = requests.post(url, headers=headers, json=data, verify=False, timeout=60)
+
+        if r.status_code == 401:
+            access_token = get_gigachat_token(force_refresh=True)
+            if not access_token:
+                return "❌ Ошибка авторизации"
+            headers["Authorization"] = f"Bearer {access_token}"
+            r = requests.post(url, headers=headers, json=data, verify=False, timeout=60)
+
+        result = r.json()
+        if "choices" in result:
+            answer = result["choices"][0]["message"]["content"]
+            add_to_history(chat_id, "user", question)
+            add_to_history(chat_id, "assistant", answer)
+            return answer
+        return f"❌ Ошибка: {result}"
+    except Exception as e:
+        log_error(f"ask_gigachat: {e}")
+        return f"❌ Ошибка: {e}"
+
+
+def ask_gigachat_with_progress(chat_id, question, mode, ai_mode):
+    bar_msg = None
+    bar_markup = None
+    try:
+        bar_text = (
+            "🤖 <b>Боб думает...</b>\n\n"
+            "<code>[░░░░░░░░░░░░░░░░░░░░]</code> 0%\n"
+            "⏳ Анализирую вопрос..."
+        )
+        bar_msg = bot.send_message(chat_id, bar_text, parse_mode='HTML')
+        remember(chat_id, bar_msg.message_id)
+    except Exception:
+        bar_msg = None
+
+    stop_typing = threading.Event()
+
+    def typing_loop():
+        while not stop_typing.is_set():
+            try:
+                bot.send_chat_action(chat_id, 'typing')
+            except Exception:
+                pass
+            stop_typing.wait(2)
+
+    typing_thread = threading.Thread(target=typing_loop, daemon=True)
+    typing_thread.start()
+
+    stop_bar = threading.Event()
+    bar_width = 22
+    percent_holder = {"value": 0}
+    stages = [
+        (0, "⏳ Анализирую вопрос..."),
+        (20, "🤔 Думаю над ответом..."),
+        (40, "📝 Формирую ответ..."),
+        (60, "✍️ Пишу ответ..."),
+        (80, "✨ Проверяю ответ..."),
+        (95, "📤 Отправляю..."),
+    ]
+
+    def bar_loop():
+        while not stop_bar.is_set():
+            time.sleep(2)
+            if stop_bar.is_set():
+                break
+            p = percent_holder["value"]
+            if p < 90:
+                p += 10
+                if p > 90:
+                    p = 90
+            else:
+                p = min(p + 1, 95)
+            percent_holder["value"] = p
+
+            status = "⏳ Обрабатываю..."
+            for th, s in stages:
+                if p >= th:
+                    status = s
+
+            try:
+                bar = render_progress_bar(p, bar_width)
+                bar_text = (
+                    f"🤖 <b>Боб думает...</b>\n\n"
+                    f"<code>{bar}</code> {p}%\n"
+                    f"{status}"
+                )
+                bot.edit_message_text(bar_text, chat_id=chat_id,
+                                      message_id=bar_msg.message_id, parse_mode='HTML')
+            except Exception:
+                pass
+
+    bar_thread = threading.Thread(target=bar_loop, daemon=True)
+    bar_thread.start()
+
+    answer = ask_gigachat(chat_id, question, mode, ai_mode)
+
+    stop_typing.set()
+    stop_bar.set()
+    typing_thread.join(timeout=3)
+    bar_thread.join(timeout=3)
+
+    if bar_msg:
+        try:
+            bar_text = (
+                f"🤖 <b>Боб думает...</b>\n\n"
+                f"<code>{render_progress_bar(100, bar_width)}</code> 100%\n"
+                f"✅ Готово!"
+            )
+            bot.edit_message_text(bar_text, chat_id=chat_id,
+                                  message_id=bar_msg.message_id, parse_mode='HTML')
+            time.sleep(0.5)
+            bot.delete_message(chat_id, bar_msg.message_id)
+        except Exception:
+            pass
+
+    return answer
+
+
+# === ЧАТ С ИИ ===
+@bot.callback_query_handler(func=lambda call: call.data == "menu_chat")
+def enter_chat(call):
+    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
+        return
+    user = get_user(call.message.chat.id)
+    tokens = user[0]
+    mode = user[2]
+    ai_mode = user[3]
+    coder_mode = user[9]
+    can_chat = user[13]
+    limit_chats = user[15]
+    used_chats = user[17]
+
+    if not can_chat:
+        bot.answer_callback_query(call.id, "🚫 Чат запрещён.")
+        try:
+            bot.edit_message_text(
+                "🚫 <b>Вам запрещён чат с ИИ.</b>\n\nОбратитесь в поддержку.",
+                chat_id=call.message.chat.id, message_id=call.message.message_id,
+                parse_mode='HTML', reply_markup=back_to_generate_menu())
+        except Exception:
+            pass
+        return
+
+    if limit_chats >= 0 and used_chats >= limit_chats:
+        bot.answer_callback_query(call.id, "🚫 Лимит исчерпан.")
+        try:
+            bot.edit_message_text(
+                f"🚫 <b>Лимит чата исчерпан.</b>\n\nИспользовано: {used_chats} / {limit_chats}",
+                chat_id=call.message.chat.id, message_id=call.message.message_id,
+                parse_mode='HTML', reply_markup=back_to_generate_menu())
+        except Exception:
+            pass
+        return
+
+    if tokens < 1:
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.add(telebot.types.InlineKeyboardButton("💳 Купить токены", callback_data="menu_buy"))
+        markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_generate"))
+        try:
+            bot.edit_message_text("❌ У вас нет токенов.",
+                                  chat_id=call.message.chat.id, message_id=call.message.message_id,
+                                  reply_markup=markup)
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id)
+        return
+
+    update_user(call.message.chat.id, 'state', 'chat')
+    if mode == "coder":
+        mode_name = "💻 Кодер (с подсказками)" if coder_mode == "with_hints" else "⚡ Кодер (только код)"
+    else:
+        mode_name = {"regular": "🤖 Обычный ИИ", "explainer": "📖 Объяснятор",
+                     "translator": "🌍 Переводчик"}.get(mode, "🤖 Обычный ИИ")
+    ai_name = {"regular": "🤖 Обычный", "smart": "🧠 Умный", "open": "💬 Откровенный",
+               "uncensored": "🔥 Без цензуры"}.get(ai_mode, "🤖 Обычный")
+    limit_info = ""
+    if limit_chats >= 0:
+        limit_info = f"\n📊 Осталось: <b>{limit_chats - used_chats}</b>"
+
+    text = (
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"    🤖 ЧАТ С БОБОМ\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"💰 Баланс: <b>{tokens}</b>\n"
+        f"🎯 Режим: <b>{mode_name}</b>\n"
+        f"🧠 Поведение: <b>{ai_name}</b>{limit_info}\n\n"
+        f"💡 Что спросить?\n"
+        f"• 🎓 Помоги с учёбой\n"
+        f"• 💻 Напиши код\n"
+        f"• ✍️ Сочинение\n"
+        f"• 🌍 Перевести\n"
+        f"• 📖 Объяснить\n\n"
+        f"Или напиши свой вопрос 👇"
+    )
+    try:
+        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id,
+                              parse_mode='HTML', reply_markup=chat_menu())
+    except Exception:
+        sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=chat_menu())
+        remember(call.message.chat.id, sent.message_id)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("mode_"))
+def set_mode(call):
+    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
+        return
+    raw = call.data.replace("mode_", "")
+    if raw == "coder_hints":
+        mode = "coder"
+        update_user(call.message.chat.id, 'coder_mode', 'with_hints')
+    elif raw == "coder_only":
+        mode = "coder"
+        update_user(call.message.chat.id, 'coder_mode', 'only_code')
+    else:
+        mode = raw
+    update_user(call.message.chat.id, 'mode', mode)
+    user = get_user(call.message.chat.id)
+    tokens = user[0]
+    ai_mode = user[3]
+    coder_mode = user[9]
+    if mode == "coder":
+        mode_name = "💻 Кодер (с подсказками)" if coder_mode == "with_hints" else "⚡ Кодер (только код)"
+    else:
+        mode_name = {"regular": "🤖 Обычный ИИ", "explainer": "📖 Объяснятор",
+                     "translator": "🌍 Переводчик"}.get(mode, "🤖 Обычный ИИ")
+    ai_name = {"regular": "🤖 Обычный", "smart": "🧠 Умный", "open": "💬 Откровенный",
+               "uncensored": "🔥 Без цензуры"}.get(ai_mode, "🤖 Обычный")
+    bot.answer_callback_query(call.id, f"✅ {mode_name}")
+    try:
+        bot.edit_message_text(
+            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"    🤖 ЧАТ С БОБОМ\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"💰 Баланс: <b>{tokens}</b>\n"
+            f"🎯 Режим: <b>{mode_name}</b>\n"
+            f"🧠 Поведение: <b>{ai_name}</b>\n\n"
+            f"Задай вопрос 👇",
+            chat_id=call.message.chat.id, message_id=call.message.message_id,
+            parse_mode='HTML', reply_markup=chat_menu())
+    except Exception:
+        pass
 
 
 # === ФАЙЛЫ В ИИ ===
@@ -3118,13 +3719,20 @@ def handle_document(message):
     if send_banned_message(message.chat.id):
         return
     if not can_use_during_maintenance(message.chat.id):
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_conn()
         c = conn.cursor()
         c.execute("SELECT enabled FROM maintenance WHERE id=1")
         row = c.fetchone()
         conn.close()
         if row and row[0]:
             return
+
+    state = get_user(message.chat.id)[1]
+    if state in ('gen_processing', 'edit_processing'):
+        sent = bot.send_message(message.chat.id, "⏳ Дождись окончания генерации.")
+        remember(message.chat.id, sent.message_id)
+        return
+
     doc = message.document
     filename = doc.file_name or "file.txt"
     size = doc.file_size or 0
@@ -3145,14 +3753,17 @@ def handle_document(message):
                                 reply_markup=back_to_generate_menu())
         remember(message.chat.id, sent.message_id)
         return
+
     user = get_user(message.chat.id)
     if user[0] < 1:
         sent = bot.send_message(message.chat.id, "❌ Нужно 1 токен.",
                                 reply_markup=back_to_generate_menu())
         remember(message.chat.id, sent.message_id)
         return
+
     sent = bot.send_message(message.chat.id, "📄 <b>Читаю файл...</b>", parse_mode='HTML')
     remember(message.chat.id, sent.message_id)
+
     try:
         file_info = bot.get_file(doc.file_id)
         file_bytes = bot.download_file(file_info.file_path)
@@ -3165,21 +3776,26 @@ def handle_document(message):
             bot.delete_message(message.chat.id, sent.message_id)
         except Exception:
             pass
+        log_error(f"File read error: {e}")
         sent = bot.send_message(message.chat.id, f"❌ Ошибка чтения: {e}",
                                 reply_markup=back_to_generate_menu())
         remember(message.chat.id, sent.message_id)
         return
+
     try:
         bot.delete_message(message.chat.id, sent.message_id)
     except Exception:
         pass
+
     if not text.strip():
         sent = bot.send_message(message.chat.id, "❌ Файл пустой.",
                                 reply_markup=back_to_generate_menu())
         remember(message.chat.id, sent.message_id)
         return
+
     if len(text) > 25000:
         text = text[:25000] + "\n\n[...файл обрезан...]"
+
     caption = message.caption or ""
     preview = text[:300] + "..." if len(text) > 300 else text
     info_text = (
@@ -3197,19 +3813,20 @@ def handle_document(message):
     sent = bot.send_message(message.chat.id, info_text, parse_mode='HTML',
                             reply_markup=back_to_generate_menu())
     remember(message.chat.id, sent.message_id)
+
     if caption:
         question = f"Вот содержимое файла:\n\n```\n{text}\n```\n\nЗадание: {caption}"
     else:
         question = f"Вот содержимое файла:\n\n```\n{text}\n```\n\nЧто можно с этим сделать?"
+
     add_tokens(message.chat.id, -1)
     log_stat(message.chat.id, 1)
-    stop_event, typing_thread = start_typing(message.chat.id)
-    answer = ask_gigachat(message.chat.id, question, "regular", "regular")
-    stop_typing(stop_event, typing_thread)
+    answer = ask_gigachat_with_progress(message.chat.id, question, "regular", "regular")
     user = get_user(message.chat.id)
     send_files = user[18]
     tokens_left = user[0]
     log_action(message.chat.id, "file", filename[:100])
+
     if send_files or is_code_response(answer):
         ok = send_long_text_as_file(message.chat.id, answer, filename="otvet.txt")
         if ok:
@@ -3218,6 +3835,7 @@ def handle_document(message):
                                  reply_markup=back_to_generate_menu())
             remember(message.chat.id, s.message_id)
             return
+
     safe = escape_html(answer)[:4000]
     try:
         s = bot.send_message(message.chat.id, f"{safe}\n\n💰 Осталось: {tokens_left}",
@@ -3226,6 +3844,200 @@ def handle_document(message):
         s = bot.send_message(message.chat.id, f"{answer}\n\n💰 Осталось: {tokens_left}",
                              reply_markup=back_to_generate_menu())
     remember(message.chat.id, s.message_id)
+
+
+# === ОБРАБОТКА ТЕКСТОВЫХ СООБЩЕНИЙ ===
+@bot.message_handler(content_types=['text'])
+def handle_message(message):
+    if message.text == "⬅️ Назад":
+        back_to_main(message)
+        return
+    if send_banned_message(message.chat.id):
+        return
+
+    state = get_user(message.chat.id)[1]
+    if state in ('gen_processing', 'edit_processing'):
+        sent = bot.send_message(message.chat.id, "⏳ Генерация идёт, подожди окончания.")
+        remember(message.chat.id, sent.message_id)
+        return
+
+    if check_duplicate(message.chat.id, message.text, cooldown=5):
+        return
+
+    if not can_use_during_maintenance(message.chat.id):
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("SELECT enabled, message FROM maintenance WHERE id=1")
+        row = c.fetchone()
+        conn.close()
+        if row and row[0]:
+            sent = bot.send_message(message.chat.id, f"🛠 <b>{escape_html(row[1] or 'Тех.работы')}</b>",
+                                    parse_mode='HTML', reply_markup=maintenance_menu())
+            remember(message.chat.id, sent.message_id)
+            return
+
+    user = get_user(message.chat.id)
+    tokens = user[0]
+    state = user[1]
+    mode = user[2]
+    ai_mode = user[3]
+    can_chat = user[13]
+    limit_chats = user[15]
+    used_chats = user[17]
+    send_files = user[18]
+
+    if state.startswith('edit_ready'):
+        edit_ask_prompt(message)
+        return
+
+    if state != 'chat':
+        return
+
+    if not can_chat:
+        update_user(message.chat.id, 'state', 'idle')
+        sent = bot.send_message(message.chat.id, "🚫 <b>Вам запрещён чат с ИИ.</b>",
+                                parse_mode='HTML', reply_markup=back_to_generate_menu())
+        remember(message.chat.id, sent.message_id)
+        return
+
+    if limit_chats >= 0 and used_chats >= limit_chats:
+        update_user(message.chat.id, 'state', 'idle')
+        sent = bot.send_message(message.chat.id,
+                                f"🚫 <b>Лимит чата исчерпан.</b>\n\n{used_chats}/{limit_chats}",
+                                parse_mode='HTML', reply_markup=back_to_generate_menu())
+        remember(message.chat.id, sent.message_id)
+        return
+
+    if tokens < 1:
+        update_user(message.chat.id, 'state', 'idle')
+        clear_old_messages(message.chat.id)
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.add(telebot.types.InlineKeyboardButton("💳 Купить токены", callback_data="menu_buy"))
+        markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_generate"))
+        sent = bot.send_message(message.chat.id, "❌ Токены закончились.", reply_markup=markup)
+        remember(message.chat.id, sent.message_id)
+        return
+
+    new_mode, new_ai_mode = detect_mode_request(message.text)
+    if new_mode or new_ai_mode:
+        if new_mode:
+            update_user(message.chat.id, 'mode', new_mode)
+            mode = new_mode
+        if new_ai_mode:
+            update_user(message.chat.id, 'ai_mode', new_ai_mode)
+            ai_mode = new_ai_mode
+        text = message.text
+        for phrase in ["переключись на режим ", "переключи режим ", "переключись на ",
+                       "смени режим на ", "смени на ", "стань ", "включи режим "]:
+            if phrase in text.lower():
+                idx = text.lower().find(phrase)
+                rest = text[idx + len(phrase):]
+                parts = rest.split(" ", 2)
+                if len(parts) > 2:
+                    text = parts[2]
+                elif len(parts) == 2:
+                    text = parts[1]
+                else:
+                    text = ""
+                break
+        message.text = text if text.strip() else "Привет"
+
+    try:
+        bot.delete_message(message.chat.id, message.message_id)
+    except Exception:
+        pass
+
+    add_tokens(message.chat.id, -1)
+    log_stat(message.chat.id, 1)
+    inc_used(message.chat.id, 'used_chats')
+
+    mark_operation_start(message.chat.id, "ai")
+    try:
+        answer = ask_gigachat_with_progress(message.chat.id, message.text, mode, ai_mode)
+    finally:
+        mark_operation_end(message.chat.id)
+
+    tokens_left = get_user(message.chat.id)[0]
+    log_action(message.chat.id, "ai", message.text[:200])
+    clear_old_logs()
+
+    if mode == "coder":
+        lang = detect_code_language(answer)
+        code_name = f"code.{lang}" if lang != "txt" else "code.txt"
+        code_only = extract_code_block(answer)
+        try:
+            bot.send_document(message.chat.id, (code_name, code_only.encode('utf-8')),
+                              caption=f"💻 Скрипт ({code_name})")
+        except Exception:
+            pass
+        if send_files:
+            send_long_text_as_file(message.chat.id, answer, filename="answer.txt")
+            s = bot.send_message(message.chat.id,
+                                 f"📎 Скрипт + ответ в файлах.\n\n💰 Осталось: {tokens_left}",
+                                 reply_markup=chat_menu())
+            remember(message.chat.id, s.message_id)
+        else:
+            explanation = answer.replace(code_only, "").strip() or answer
+            safe = escape_html(explanation)
+            if len(safe) > 4000:
+                safe = safe[:4000] + "..."
+            try:
+                s = bot.send_message(message.chat.id, f"{safe}\n\n💰 Осталось: {tokens_left}",
+                                     parse_mode='HTML', reply_markup=chat_menu())
+            except Exception:
+                s = bot.send_message(message.chat.id, f"{explanation}\n\n💰 Осталось: {tokens_left}",
+                                     reply_markup=chat_menu())
+            remember(message.chat.id, s.message_id)
+        return
+
+    if send_files or is_code_response(answer):
+        lang = detect_code_language(answer)
+        filename = f"code.{lang}" if lang != "txt" else "otvet.txt"
+        ok = send_long_text_as_file(message.chat.id, answer, filename=filename)
+        if ok:
+            s = bot.send_message(message.chat.id, f"📎 Ответ в файле.\n\n💰 Осталось: {tokens_left}",
+                                 reply_markup=chat_menu())
+            remember(message.chat.id, s.message_id)
+            return
+
+    safe_answer = escape_html(answer)
+    if len(safe_answer) > 4000:
+        safe_answer = safe_answer[:4000] + "..."
+    try:
+        sent = bot.send_message(message.chat.id,
+                                f"{safe_answer}\n\n💰 Осталось: {tokens_left}",
+                                parse_mode='HTML', reply_markup=chat_menu())
+    except Exception:
+        sent = bot.send_message(message.chat.id,
+                                f"{answer}\n\n💰 Осталось: {tokens_left}",
+                                reply_markup=chat_menu())
+    remember(message.chat.id, sent.message_id)
+
+
+# === ОБРАБОТКА ФОТО ===
+@bot.message_handler(content_types=['photo'])
+def handle_photo(message):
+    if send_banned_message(message.chat.id):
+        return
+
+    state = get_user(message.chat.id)[1]
+    if state in ('gen_processing', 'edit_processing'):
+        sent = bot.send_message(message.chat.id, "⏳ Дождись окончания генерации.")
+        remember(message.chat.id, sent.message_id)
+        return
+
+    if not can_use_during_maintenance(message.chat.id):
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("SELECT enabled FROM maintenance WHERE id=1")
+        row = c.fetchone()
+        conn.close()
+        if row and row[0]:
+            return
+
+    if state.startswith('edit_wait_photo') or state.startswith('edit_collecting'):
+        edit_process_photo(message)
+        return
 
 # === АДМИН-МЕНЮ ===
 def admin_menu():
@@ -3242,6 +4054,7 @@ def admin_menu():
     markup.add(telebot.types.InlineKeyboardButton("🧹 Очистка", callback_data="admin_wipe"))
     markup.add(telebot.types.InlineKeyboardButton("📢 Рассылка", callback_data="admin_broadcast"))
     markup.add(telebot.types.InlineKeyboardButton("🛠 Тех.работы", callback_data="admin_maintenance"))
+    markup.add(telebot.types.InlineKeyboardButton("⚠️ Ошибки", callback_data="admin_errors"))
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main"))
     return markup
 
@@ -3278,7 +4091,6 @@ def subs_menu():
 
 
 def wipe_menu():
-    """Меню очистки."""
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("👤 Очистить юзера", callback_data="wipe_user_select"))
     markup.add(telebot.types.InlineKeyboardButton("💬 Все переписки", callback_data="wipe_confirm_chat_all"))
@@ -3291,14 +4103,6 @@ def wipe_menu():
 
 
 def wipe_confirm_menu(what):
-    """Меню подтверждения очистки."""
-    names = {
-        "chat_all": "💬 ВСЕ ПЕРЕПИСКИ",
-        "image_all": "🎨 ВСЕ ГЕНЕРАЦИИ",
-        "edit_all": "🖼 ВСЕ РЕДАКТИРОВАНИЯ",
-        "stats_all": "📊 ВСЮ СТАТИСТИКУ",
-        "all_all": "💥 ВСЁ (кроме юзеров)",
-    }
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("✅ Да, удалить", callback_data=f"wipe_do_{what}"))
     markup.add(telebot.types.InlineKeyboardButton("❌ Отмена", callback_data="back_to_wipe"))
@@ -3306,7 +4110,6 @@ def wipe_confirm_menu(what):
 
 
 def wipe_user_menu(uid):
-    """Меню очистки юзера."""
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("💬 Переписку", callback_data=f"wipe_user_do_chat_{uid}"))
     markup.add(telebot.types.InlineKeyboardButton("🎨 Генерации", callback_data=f"wipe_user_do_image_{uid}"))
@@ -3316,6 +4119,15 @@ def wipe_user_menu(uid):
     markup.add(telebot.types.InlineKeyboardButton("📊 Статистику", callback_data=f"wipe_user_do_stats_{uid}"))
     markup.add(telebot.types.InlineKeyboardButton("💥 ВСЁ У ЮЗЕРА", callback_data=f"wipe_user_do_all_{uid}"))
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_wipe"))
+    return markup
+
+
+def errors_menu():
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("📄 Скачать errors.log", callback_data="admin_errors_file"))
+    markup.add(telebot.types.InlineKeyboardButton("🔄 Обновить", callback_data="admin_errors"))
+    markup.add(telebot.types.InlineKeyboardButton("🗑 Очистить", callback_data="admin_errors_clear"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
     return markup
 
 
@@ -3360,7 +4172,7 @@ def admin_maintenance(call):
         f"Текст: <i>{escape_html(msg)}</i>"
     )
     if has_active_operations():
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_conn()
         c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM active_operations WHERE started > ?", (int(time.time()) - 300,))
         cnt = c.fetchone()[0]
@@ -3382,6 +4194,27 @@ def admin_maintenance(call):
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "maint_on")
+def maint_on_confirm(call):
+    if call.message.chat.id != ADMIN_ID:
+        return
+    text = (
+        "⚠️ <b>ВКЛЮЧИТЬ ТЕХ.РАБОТЫ?</b>\n\n"
+        "🔴 Бот станет <b>недоступен</b> для всех юзеров\n"
+        "🆘 Поддержка останется\n\n"
+        "Продолжить?"
+    )
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("✅ Да, включить", callback_data="maint_on_confirm_yes"))
+    markup.add(telebot.types.InlineKeyboardButton("❌ Отмена", callback_data="admin_maintenance"))
+    try:
+        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id,
+                              parse_mode='HTML', reply_markup=markup)
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "maint_on_confirm_yes")
 def maint_on(call):
     if call.message.chat.id != ADMIN_ID:
         return
@@ -3447,12 +4280,6 @@ def maint_edit(call):
     bot.answer_callback_query(call.id)
 
 
-def back_to_admin_menu():
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
-    return markup
-
-
 def maint_edit_save(message):
     if message.text == "⬅️ Назад":
         back_to_main(message)
@@ -3466,50 +4293,6 @@ def maint_edit_save(message):
     set_maintenance(1, message.text)
     sent = bot.send_message(message.chat.id, "✅ Текст обновлён.", reply_markup=admin_menu())
     remember(message.chat.id, sent.message_id)
-
-
-# === ФОНОВАЯ РАССЫЛКА ТЕХ.РАБОТ ===
-def maintenance_worker():
-    while True:
-        try:
-            row = get_maintenance()
-            active = row[0] if len(row) > 0 else 0
-            enabled = row[2] if len(row) > 2 else 0
-            notified = row[3] if len(row) > 3 else 1
-            msg = row[1] if len(row) > 1 else "Технические работы"
-            if enabled and not notified and not has_active_operations():
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                c.execute("SELECT chat_id FROM users WHERE banned=0")
-                users = c.fetchall()
-                conn.close()
-                sent_count = 0
-                for (uid,) in users:
-                    if uid == ADMIN_ID:
-                        continue
-                    if can_use_during_maintenance(uid):
-                        continue
-                    try:
-                        text = (
-                            "🛠 <b>" + escape_html(msg) + "</b>\n"
-                            "━━━━━━━━━━━━━━━━━━━━\n\n"
-                            "⚠️ Бот временно недоступен\n\n"
-                            "🆘 Поддержка работает"
-                        )
-                        sent = bot.send_message(uid, text, parse_mode='HTML',
-                                                reply_markup=maintenance_menu())
-                        save_maintenance_notified(uid, sent.message_id)
-                        sent_count += 1
-                    except Exception:
-                        pass
-                set_maintenance(0, notified=1)
-                try:
-                    bot.send_message(ADMIN_ID, f"📢 Тех.работы разосланы: {sent_count} чел.")
-                except Exception:
-                    pass
-        except Exception as e:
-            print(f"Maintenance worker error: {e}")
-        time.sleep(30)
 
 
 # === ЛОГИ ===
@@ -3606,16 +4389,135 @@ def logs_file(call):
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "logs_clear")
-def logs_clear(call):
+def logs_clear_confirm(call):
     if call.message.chat.id != ADMIN_ID:
         return
-    conn = sqlite3.connect(DB_PATH)
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("✅ Да, очистить", callback_data="logs_clear_yes"))
+    markup.add(telebot.types.InlineKeyboardButton("❌ Отмена", callback_data="admin_logs"))
+    try:
+        bot.edit_message_text("⚠️ <b>ОЧИСТИТЬ ВСЕ ЛОГИ?</b>\n\nНельзя отменить.",
+                              chat_id=call.message.chat.id, message_id=call.message.message_id,
+                              parse_mode='HTML', reply_markup=markup)
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "logs_clear_yes")
+def logs_clear_execute(call):
+    if call.message.chat.id != ADMIN_ID:
+        return
+    conn = get_conn()
     c = conn.cursor()
     c.execute("DELETE FROM action_logs")
     conn.commit()
     conn.close()
     bot.answer_callback_query(call.id, "🗑 Логи очищены")
     admin_logs(call)
+
+
+# === ОШИБКИ (админ-меню) ===
+@bot.callback_query_handler(func=lambda call: call.data == "admin_errors")
+def admin_errors(call):
+    if call.message.chat.id != ADMIN_ID:
+        return
+    path = "/app/data/errors.log"
+    now = int(time.time())
+    cut_30m = now - 1800
+    cut_1h = now - 3600
+    cut_24h = now - 86400
+    cnt_30m = cnt_1h = cnt_24h = total = 0
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    total += 1
+                    if line.startswith("[") and "]" in line:
+                        date_str = line[1:20]
+                        try:
+                            ts = int(time.mktime(time.strptime(date_str, "%Y-%m-%d %H:%M:%S")))
+                            if ts >= cut_30m:
+                                cnt_30m += 1
+                            if ts >= cut_1h:
+                                cnt_1h += 1
+                            if ts >= cut_24h:
+                                cnt_24h += 1
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+    active_count = 0
+    active_list = []
+    try:
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("SELECT chat_id, operation, started FROM active_operations ORDER BY started ASC")
+        active_rows = c.fetchall()
+        active_count = len(active_rows)
+        stuck_cutoff = now - 300
+        for chat_id, op_type, started in active_rows:
+            if started < stuck_cutoff:
+                duration = now - started
+                active_list.append(f"chat_id {chat_id} ({op_type}, {duration}s)")
+        conn.close()
+    except Exception:
+        pass
+
+    text = (
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "       ⚠️ Ошибки\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📊 Всего ошибок: <b>{total}</b>\n\n"
+        f"📅 30 минут: <b>{cnt_30m}</b>\n"
+        f"📅 Час: <b>{cnt_1h}</b>\n"
+        f"📅 Сутки: <b>{cnt_24h}</b>\n\n"
+        f"🔄 Активных операций: <b>{active_count}</b>\n"
+    )
+    if active_list:
+        text += f"⚠️ Застрявших: <b>{len(active_list)}</b>\n"
+        for item in active_list[:5]:
+            text += f"   → <code>{item}</code>\n"
+        if len(active_list) > 5:
+            text += f"   ...и ещё {len(active_list) - 5}\n"
+
+    try:
+        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id,
+                              parse_mode='HTML', reply_markup=errors_menu())
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_errors_file")
+def admin_errors_file(call):
+    if call.message.chat.id != ADMIN_ID:
+        return
+    path = "/app/data/errors.log"
+    if not os.path.exists(path):
+        bot.answer_callback_query(call.id, "❌ Файла нет")
+        return
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        bot.send_document(call.message.chat.id, ("errors.log", data))
+        bot.answer_callback_query(call.id, "📄 Отправлен")
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"❌ Ошибка: {e}")
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_errors_clear")
+def admin_errors_clear(call):
+    if call.message.chat.id != ADMIN_ID:
+        return
+    try:
+        with open("/app/data/errors.log", "w") as f:
+            f.write("")
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id, "🗑 Очищено")
+    admin_errors(call)
 
 
 # === ОЧИСТКА ===
@@ -3682,7 +4584,7 @@ def wipe_user_menu_handler(call):
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("wipe_user_do_"))
-def wipe_user_do(call):
+def wipe_user_do_confirm(call):
     if call.message.chat.id != ADMIN_ID:
         return
     rest = call.data.replace("wipe_user_do_", "")
@@ -3696,9 +4598,72 @@ def wipe_user_do(call):
     except ValueError:
         bot.answer_callback_query(call.id, "❌ Ошибка ID.")
         return
+
+    names = {
+        "chat": "💬 Переписку",
+        "image": "🎨 Генерации",
+        "edit": "🖼 Редактирования",
+        "orders": "🛒 Заказы",
+        "tickets": "📋 Тикеты",
+        "stats": "📊 Статистику",
+        "all": "💥 ВСЁ",
+    }
+    label = names.get(what, what)
+
+    user = get_user(uid)
+    uname = user[6] if user[6] else "—"
+
+    text = (
+        f"⚠️ <b>ПОДТВЕРЖДЕНИЕ</b>\n\n"
+        f"Удалить: <b>{label}</b>\n\n"
+        f"🆔 <code>{uid}</code>\n"
+        f"👤 {uname}\n\n"
+        f"<b>Нельзя отменить!</b>"
+    )
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("✅ Да, удалить",
+                                                   callback_data=f"wipe_user_yes_{what}_{uid}"))
+    markup.add(telebot.types.InlineKeyboardButton("❌ Отмена", callback_data=f"wipe_user_{uid}"))
+    try:
+        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id,
+                              parse_mode='HTML', reply_markup=markup)
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("wipe_user_yes_"))
+def wipe_user_do_execute(call):
+    if call.message.chat.id != ADMIN_ID:
+        return
+    rest = call.data.replace("wipe_user_yes_", "")
+    parts = rest.split("_", 1)
+    if len(parts) < 2:
+        bot.answer_callback_query(call.id, "❌ Ошибка.")
+        return
+    what, uid_str = parts
+    try:
+        uid = int(uid_str)
+    except ValueError:
+        bot.answer_callback_query(call.id, "❌ Ошибка ID.")
+        return
     wipe_user_data(uid, what)
     bot.answer_callback_query(call.id, "✅ Очищено")
-    wipe_user_menu_handler(call)
+    user = get_user(uid)
+    uname = user[6] if user[6] else "—"
+    text = (
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"   🧹 Очистка юзера {uid}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 {uname}\n\n"
+        f"✅ Готово!\n\n"
+        f"Что ещё удалить?"
+    )
+    try:
+        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id,
+                              parse_mode='HTML', reply_markup=wipe_user_menu(uid))
+    except Exception:
+        pass
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("wipe_confirm_"))
@@ -4104,8 +5069,18 @@ def admin_take_from(call):
     if call.message.chat.id != ADMIN_ID:
         return
     uid = int(call.data.replace("admin_take_from_", ""))
-    sent = bot.send_message(call.message.chat.id, f"💸 Сколько токенов забрать у <code>{uid}</code>?",
-                            parse_mode='HTML', reply_markup=back_to_admin_menu())
+    user = get_user(uid)
+    uname = user[6] if user[6] else "—"
+    tokens = user[0]
+    text = (
+        f"⚠️ <b>СПИСАНИЕ ТОКЕНОВ</b>\n\n"
+        f"🆔 <code>{uid}</code>\n"
+        f"👤 {uname}\n"
+        f"💰 Текущий баланс: <b>{tokens}</b>\n\n"
+        f"Сколько забрать?"
+    )
+    sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML',
+                            reply_markup=back_to_admin_menu())
     bot.register_next_step_handler(sent, admin_take_amount, uid)
     bot.answer_callback_query(call.id)
 
@@ -4132,43 +5107,67 @@ def admin_take_amount(message, uid):
                             reply_markup=admin_menu())
     remember(message.chat.id, sent.message_id)
 
-
-# === СПИСОК / О ЮЗЕРЕ / ПОКУПКИ ===
-@bot.callback_query_handler(func=lambda call: call.data == "admin_users")
+# === СПИСОК ПОЛЬЗОВАТЕЛЕЙ (с пагинацией) ===
+@bot.callback_query_handler(func=lambda call: call.data == "admin_users" or call.data.startswith("admin_users_page_"))
 def admin_users(call):
     if call.message.chat.id != ADMIN_ID:
         return
+    if call.data.startswith("admin_users_page_"):
+        page = int(call.data.replace("admin_users_page_", ""))
+    else:
+        page = 1
     users = get_all_users()
     if not users:
+        try:
+            bot.edit_message_text("👥 Пользователей нет.",
+                                  chat_id=call.message.chat.id, message_id=call.message.message_id,
+                                  reply_markup=admin_menu())
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id)
         return
-    text = "👥 <b>Список пользователей:</b>\n\n"
-    for uid, uname, tokens in users:
+    page_users, page, total_pages, total = paginate(users, page, per_page=10)
+    text = f"👥 <b>Список пользователей</b> (стр. {page}/{total_pages})\n"
+    text += f"Всего: <b>{total}</b>\n\n"
+    for uid, uname, tokens in page_users:
         name = uname if uname else "—"
         text += f"🆔 <code>{uid}</code> — {name} — <b>{tokens}</b> ток.\n"
-    if len(text) > 4000:
-        text = text[:4000] + "..."
     try:
         bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id,
-                              parse_mode='HTML', reply_markup=admin_menu())
+                              parse_mode='HTML',
+                              reply_markup=pagination_menu("admin_users", page, total_pages, back_to="back_to_admin"))
     except Exception:
         pass
     bot.answer_callback_query(call.id)
 
 
-@bot.callback_query_handler(func=lambda call: call.data == "admin_manage")
+# === УПРАВЛЕНИЕ ЮЗЕРОМ (с пагинацией) ===
+@bot.callback_query_handler(func=lambda call: call.data == "admin_manage" or call.data.startswith("admin_manage_page_"))
 def admin_manage(call):
     if call.message.chat.id != ADMIN_ID:
         return
+    if call.data.startswith("admin_manage_page_"):
+        page = int(call.data.replace("admin_manage_page_", ""))
+    else:
+        page = 1
     users = get_all_users()
     if not users:
         return
+    page_users, page, total_pages, total = paginate(users, page, per_page=10)
     markup = telebot.types.InlineKeyboardMarkup()
-    for uid, uname, tokens in users[:30]:
+    for uid, uname, tokens in page_users:
         name = uname if uname else "—"
         markup.add(telebot.types.InlineKeyboardButton(f"🆔 {uid} — {name}", callback_data=f"admin_mng_{uid}"))
+    nav = []
+    if page > 1:
+        nav.append(telebot.types.InlineKeyboardButton("⬅️", callback_data=f"admin_manage_page_{page - 1}"))
+    nav.append(telebot.types.InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+    if page < total_pages:
+        nav.append(telebot.types.InlineKeyboardButton("➡️", callback_data=f"admin_manage_page_{page + 1}"))
+    markup.row(*nav)
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
     try:
-        bot.edit_message_text("🚫 <b>Управление юзером</b>\n\nВыбери:",
+        bot.edit_message_text(f"🚫 <b>Управление юзером</b> (стр. {page}/{total_pages})\n\nВыбери:",
                               chat_id=call.message.chat.id, message_id=call.message.message_id,
                               parse_mode='HTML', reply_markup=markup)
     except Exception:
@@ -4252,6 +5251,31 @@ def admin_mng_ban(call):
     if call.message.chat.id != ADMIN_ID:
         return
     uid = int(call.data.replace("admin_mng_ban_", ""))
+    user = get_user(uid)
+    uname = user[6] if user[6] else "—"
+    text = (
+        f"⚠️ <b>ПОДТВЕРЖДЕНИЕ БАНА</b>\n\n"
+        f"🆔 <code>{uid}</code>\n"
+        f"👤 {uname}\n\n"
+        f"Пользователь <b>не сможет пользоваться</b> ботом.\n\n"
+        f"Продолжить?"
+    )
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("✅ Да, забанить", callback_data=f"admin_mng_ban_confirm_{uid}"))
+    markup.add(telebot.types.InlineKeyboardButton("❌ Отмена", callback_data=f"admin_mng_{uid}"))
+    try:
+        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id,
+                              parse_mode='HTML', reply_markup=markup)
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_mng_ban_confirm_"))
+def admin_mng_ban_confirm(call):
+    if call.message.chat.id != ADMIN_ID:
+        return
+    uid = int(call.data.replace("admin_mng_ban_confirm_", ""))
     sent = bot.send_message(call.message.chat.id, f"🚫 Причина бана <code>{uid}</code>:",
                             parse_mode='HTML', reply_markup=back_to_admin_menu())
     bot.register_next_step_handler(sent, admin_mng_ban_save, uid)
@@ -4271,7 +5295,7 @@ def admin_mng_ban_save(message, uid):
         pass
     update_user(uid, 'banned', 1)
     update_user(uid, 'ban_reason', reason)
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("INSERT INTO bans (chat_id, reason, admin_id, timestamp) VALUES (?, ?, ?, ?)",
               (uid, reason, ADMIN_ID, int(time.time())))
@@ -4552,16 +5576,22 @@ def admin_mng_hist(call):
     if call.message.chat.id != ADMIN_ID:
         return
     uid = int(call.data.replace("admin_mng_hist_", ""))
-    history = get_full_history(uid, limit=200)
-    img_hist = get_full_image_history(uid, limit=50)
-    txt = f"📜 ИСТОРИЯ ПОЛЬЗОВАТЕЛЯ {uid}\n{time.strftime('%d.%m.%Y %H:%M')}\n"
-    txt += "=" * 50 + "\n\n🤖 ЧАТ С ИИ:\n" + "-" * 30 + "\n"
+    history = get_full_history(uid, limit=500)
+    img_hist = get_full_image_history(uid, limit=100)
+
+    txt = f"📜 ИСТОРИЯ ЗАПРОСОВ\nПользователь: {uid}\n"
+    txt += f"Дата: {time.strftime('%d.%m.%Y %H:%M')}\n"
+    txt += "=" * 60 + "\n\n"
+    txt += f"🤖 ЧАТ С ИИ ({len(history)} сообщений):\n"
+    txt += "-" * 40 + "\n"
     if not history:
         txt += "(пусто)\n"
     for role, content in history:
-        prefix = "👤" if role == "user" else "🤖"
-        txt += f"\n{prefix} {content}\n"
-    txt += "\n\n🎨 ФОТО:\n" + "-" * 30 + "\n"
+        prefix = "👤 ПОЛЬЗОВАТЕЛЬ:" if role == "user" else "🤖 БОБ:"
+        txt += f"\n{prefix}\n{content}\n"
+    txt += "\n\n"
+    txt += f"🎨 ФОТО ({len(img_hist)} записей):\n"
+    txt += "-" * 40 + "\n"
     if not img_hist:
         txt += "(пусто)\n"
     for item in img_hist:
@@ -4571,26 +5601,59 @@ def admin_mng_hist(call):
             prompt, url, ts = item
             kind = "gen"
         when = time.strftime('%d.%m.%Y %H:%M', time.localtime(ts)) if ts else "—"
-        txt += f"\n[{when}] {kind.upper()}: {prompt}\nURL: {url}\n"
+        tag = "🖼 EDIT" if kind == "edit" else "🎨 GEN"
+        txt += f"\n[{when}] {tag}\nПромт: {prompt}\nURL: {url}\n"
+
     try:
         data = txt.encode('utf-8')
-        bot.send_document(call.message.chat.id, (f"history_{uid}.txt", data),
-                          caption=f"📜 История {uid}", parse_mode='HTML')
+        size_kb = len(data) / 1024
+        user = get_user(uid)
+        username = user[6] if user[6] else "—"
+        caption = (
+            f"📜 <b>История запроса</b>\n\n"
+            f"🆔 <code>{uid}</code>\n"
+            f"👤 {username}\n\n"
+            f"🤖 Чат: <b>{len(history)}</b> сообщений\n"
+            f"🎨 Фото: <b>{len(img_hist)}</b>\n"
+            f"📦 Размер: <b>{size_kb:.1f} КБ</b>\n"
+            f"📅 {time.strftime('%d.%m.%Y %H:%M')}"
+        )
+        bot.send_document(call.message.chat.id,
+                          (f"history_{uid}_{time.strftime('%Y-%m-%d')}.txt", data),
+                          caption=caption, parse_mode='HTML')
     except Exception as e:
-        bot.send_message(call.message.chat.id, f"❌ {e}")
+        bot.send_message(call.message.chat.id, f"❌ Ошибка файла: {e}")
+
     if img_hist:
-        for item in img_hist[-20:]:
+        s = bot.send_message(call.message.chat.id,
+                             f"🎨 Отправляю фото: <b>{len(img_hist)}</b> (последние 20)",
+                             parse_mode='HTML')
+        remember(call.message.chat.id, s.message_id)
+        last_photos = img_hist[-20:]
+        for item in last_photos:
             if len(item) == 4:
-                prompt, url, ts, kind = item
+                prompt, image_url, ts, kind = item
             else:
-                prompt, url, ts = item
+                prompt, image_url, ts = item
                 kind = "gen"
             when = time.strftime('%d.%m.%Y %H:%M', time.localtime(ts)) if ts else "—"
-            send_photo_safe(call.message.chat.id, url, f"🎨 <b>{escape_html(prompt[:150])}</b>\n📅 {when}")
+            tag = "🖼" if kind == "edit" else "🎨"
+            msg_id = send_photo_safe(call.message.chat.id, image_url,
+                                     f"{tag} <b>{escape_html(prompt[:200])}</b>\n📅 {when}")
+            if msg_id:
+                remember(call.message.chat.id, msg_id)
+            time.sleep(0.5)
+        if len(img_hist) > 20:
+            s = bot.send_message(call.message.chat.id,
+                                 f"⚠️ Показаны последние 20 из {len(img_hist)} фото.\n"
+                                 f"Все URL — в файле выше 👆",
+                                 parse_mode='HTML')
+            remember(call.message.chat.id, s.message_id)
+
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data=f"admin_mng_{uid}"))
-    sent = bot.send_message(call.message.chat.id, "✅ Готово.", reply_markup=markup)
-    remember(call.message.chat.id, sent.message_id)
+    s = bot.send_message(call.message.chat.id, "✅ Готово.", reply_markup=markup)
+    remember(call.message.chat.id, s.message_id)
     bot.answer_callback_query(call.id)
 
 
@@ -4648,6 +5711,7 @@ def admin_limits_root(call):
     bot.answer_callback_query(call.id)
 
 
+# === ПОКУПКИ (админ) ===
 @bot.callback_query_handler(func=lambda call: call.data == "admin_orders")
 def admin_orders(call):
     if call.message.chat.id != ADMIN_ID:
@@ -4678,6 +5742,39 @@ def admin_orders(call):
     except Exception:
         pass
     bot.answer_callback_query(call.id)
+
+
+# === РАССЫЛКА ===
+def send_broadcast(text, signed=False):
+    global last_broadcast
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT chat_id FROM users WHERE banned=0")
+    rows = c.fetchall()
+    conn.close()
+    sent_count = 0
+    failed_count = 0
+    sent_messages = []
+    for (uid,) in rows:
+        try:
+            if signed:
+                msg = bot.send_message(uid, f"📢 <b>Сообщение от администрации:</b>\n\n{text}",
+                                       parse_mode='HTML')
+            else:
+                msg = bot.send_message(uid, text, parse_mode='HTML')
+            sent_messages.append((uid, msg.message_id))
+            sent_count += 1
+        except Exception:
+            failed_count += 1
+        time.sleep(0.05)
+    last_broadcast = {"messages": sent_messages, "active": True}
+    try:
+        bot.send_message(ADMIN_ID,
+                         f"📢 <b>Рассылка завершена</b>\n\n"
+                         f"✅ Отправлено: <b>{sent_count}</b>\n"
+                         f"❌ Ошибок: <b>{failed_count}</b>")
+    except Exception:
+        pass
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "admin_broadcast")
@@ -4760,31 +5857,44 @@ def admin_bc_yes(call):
     except Exception:
         pass
     bot.answer_callback_query(call.id)
-    global last_broadcast
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT chat_id FROM users WHERE banned=0")
-    rows = c.fetchall()
-    conn.close()
-    sent_messages = []
-    sent_count = 0
-    for (uid,) in rows:
-        try:
-            if signed:
-                msg = bot.send_message(uid, f"📢 <b>Сообщение от администрации:</b>\n\n{escape_html(text)}",
-                                       parse_mode='HTML')
-            else:
-                msg = bot.send_message(uid, escape_html(text), parse_mode='HTML')
-            sent_messages.append((uid, msg.message_id))
-            sent_count += 1
-        except Exception:
-            pass
-    last_broadcast = {"messages": sent_messages, "active": True}
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("🗑 Удалить", callback_data="admin_bc_delete"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
-    bot.send_message(call.message.chat.id, f"✅ Отправлено: <b>{sent_count}</b>",
-                     parse_mode='HTML', reply_markup=markup)
+
+    if has_active_operations():
+        global pending_broadcast
+        pending_broadcast = {
+            "active": True,
+            "text": text,
+            "signed": signed,
+            "waiting_since": int(time.time())
+        }
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.add(telebot.types.InlineKeyboardButton("❌ Отменить", callback_data="broadcast_cancel"))
+        bot.send_message(
+            call.message.chat.id,
+            "⏳ <b>Есть активные операции</b>\n\n"
+            "Рассылка запустится, когда все закончат.\n"
+            "Если ждать больше 10 минут — запустится автоматически.",
+            parse_mode='HTML',
+            reply_markup=markup
+        )
+    else:
+        threading.Thread(target=send_broadcast, args=(text, signed), daemon=True).start()
+        bot.send_message(call.message.chat.id, "📢 Рассылка запущена в фоне")
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "broadcast_cancel")
+def broadcast_cancel(call):
+    if call.message.chat.id != ADMIN_ID:
+        return
+    global pending_broadcast
+    pending_broadcast = {"active": False, "text": "", "signed": False, "waiting_since": 0}
+    bot.answer_callback_query(call.id, "❌ Отменено")
+    try:
+        bot.edit_message_text("❌ Рассылка отменена.",
+                              chat_id=call.message.chat.id,
+                              message_id=call.message.message_id,
+                              reply_markup=admin_menu())
+    except Exception:
+        pass
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "admin_bc_delete")
@@ -4811,423 +5921,317 @@ def admin_bc_delete(call):
         pass
 
 
-# === ФОНОВАЯ ОЧИСТКА СТАРЫХ ЗАКАЗОВ ===
+# === БЭКАП БД ===
+def backup_db():
+    try:
+        if not os.path.exists(DB_PATH):
+            return False
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        ts = time.strftime('%Y-%m-%d_%H-%M')
+        backup_path = os.path.join(BACKUP_DIR, f"users_{ts}.db")
+        shutil.copy2(DB_PATH, backup_path)
+        print(f"Backup created: {backup_path}")
+        try:
+            with open(backup_path, "rb") as f:
+                data = f.read()
+            days_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+            day_name = days_ru[time.localtime().tm_wday]
+            caption = (
+                f"💾 <b>Бэкап БД</b>\n\n"
+                f"📅 <b>Дата:</b> {time.strftime('%d.%m.%Y')}\n"
+                f"📆 <b>День:</b> {day_name}\n"
+                f"⏱ <b>Время:</b> {time.strftime('%H:%M:%S')}\n"
+                f"🗓 <b>Год:</b> {time.strftime('%Y')}\n\n"
+                f"📦 Размер: <b>{len(data) / 1024:.1f} КБ</b>"
+            )
+            bot.send_document(ERRORS_CHANNEL_ID, (f"users_{ts}.db", data),
+                              caption=caption, parse_mode='HTML')
+        except Exception as e:
+            print(f"Send backup error: {e}")
+        backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.startswith("users_")])
+        if len(backups) > BACKUP_KEEP:
+            for old in backups[:-BACKUP_KEEP]:
+                try:
+                    os.remove(os.path.join(BACKUP_DIR, old))
+                except Exception:
+                    pass
+        return True
+    except Exception as e:
+        log_error(f"backup_db: {e}")
+        return False
+
+
+def backup_worker():
+    while True:
+        try:
+            time.sleep(BACKUP_INTERVAL)
+            backup_db()
+        except Exception as e:
+            log_error(f"backup_worker: {e}")
+
+
+# === ФОНОВАЯ ОЧИСТКА ЗАКАЗОВ ===
 def cleanup_orders_worker():
     while True:
         try:
-            conn = sqlite3.connect(DB_PATH)
+            conn = get_conn()
             c = conn.cursor()
             now = int(time.time())
             c.execute("DELETE FROM orders WHERE paid=0 AND expires > 0 AND expires < ?", (now,))
             conn.commit()
             conn.close()
         except Exception as e:
-            print(f"Cleanup error: {e}")
+            log_error(f"cleanup_orders: {e}")
         time.sleep(60)
 
-# === ЧАТ С ИИ ===
-@bot.callback_query_handler(func=lambda call: call.data == "menu_chat")
-def enter_chat(call):
-    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
-        return
-    user = get_user(call.message.chat.id)
-    tokens = user[0]
-    mode = user[2]
-    ai_mode = user[3]
-    coder_mode = user[9]
-    can_chat = user[13]
-    limit_chats = user[15]
-    used_chats = user[17]
 
-    if not can_chat:
-        bot.answer_callback_query(call.id, "🚫 Чат запрещён.")
+# === ОЧИСТКА EDIT CACHE ===
+def cleanup_edit_cache():
+    while True:
         try:
-            bot.edit_message_text(
-                "🚫 <b>Вам запрещён чат с ИИ.</b>\n\nОбратитесь в поддержку.",
-                chat_id=call.message.chat.id, message_id=call.message.message_id,
-                parse_mode='HTML', reply_markup=back_to_generate_menu())
+            now = int(time.time())
+            to_remove = []
+            for chat_id, data in list(edit_photos_cache.items()):
+                created = data.get("created", 0)
+                if now - created > 1800:
+                    to_remove.append(chat_id)
+            for chat_id in to_remove:
+                edit_photos_cache.pop(chat_id, None)
+                print(f"Cleaned edit cache for {chat_id}")
+        except Exception as e:
+            log_error(f"cleanup_edit_cache: {e}")
+        time.sleep(600)
+
+
+# === ОЧИСТКА ACTIVE OPERATIONS ===
+def cleanup_active_operations():
+    while True:
+        try:
+            conn = get_conn()
+            c = conn.cursor()
+            cutoff = int(time.time()) - 300
+            c.execute("SELECT chat_id, operation, started FROM active_operations WHERE started < ?", (cutoff,))
+            stuck = c.fetchall()
+            for chat_id, op_type, started in stuck:
+                duration = int(time.time()) - started
+                log_error(f"STUCK OPERATION: chat_id={chat_id}, type={op_type}, duration={duration}s")
+            c.execute("DELETE FROM active_operations WHERE started < ?", (cutoff,))
+            deleted = c.rowcount
+            conn.commit()
+            conn.close()
+            if deleted > 0:
+                print(f"Cleaned {deleted} stuck operations")
+        except Exception as e:
+            log_error(f"cleanup_active: {e}")
+        time.sleep(300)
+
+
+# === ОЧИСТКА ERRORS.LOG ===
+def cleanup_errors_log():
+    while True:
+        try:
+            time.sleep(86400)
+            path = "/app/data/errors.log"
+            if not os.path.exists(path):
+                continue
+            cutoff = time.time() - 30 * 86400
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            new_lines = []
+            for line in lines:
+                if line.startswith("[") and "]" in line:
+                    date_str = line[1:20]
+                    try:
+                        ts = time.mktime(time.strptime(date_str, "%Y-%m-%d %H:%M:%S"))
+                        if ts >= cutoff:
+                            new_lines.append(line)
+                    except Exception:
+                        new_lines.append(line)
+                else:
+                    new_lines.append(line)
+            with open(path, "w", encoding="utf-8") as f:
+                f.writelines(new_lines)
+            removed = len(lines) - len(new_lines)
+            if removed > 0:
+                print(f"Cleaned {removed} old errors from errors.log")
+        except Exception as e:
+            log_error(f"cleanup_errors_log: {e}")
+
+
+# === ОТПРАВКА ERRORS.LOG В КАНАЛ ===
+def send_errors_to_channel():
+    if ERRORS_CHANNEL_ID == 0:
+        return False
+    path = "/app/data/errors.log"
+    if not os.path.exists(path):
+        return False
+    size = os.path.getsize(path)
+    if size == 0:
+        try:
+            os.remove(path)
         except Exception:
             pass
-        return
-
-    if limit_chats >= 0 and used_chats >= limit_chats:
-        bot.answer_callback_query(call.id, "🚫 Лимит исчерпан.")
-        try:
-            bot.edit_message_text(
-                f"🚫 <b>Лимит чата исчерпан.</b>\n\nИспользовано: {used_chats} / {limit_chats}",
-                chat_id=call.message.chat.id, message_id=call.message.message_id,
-                parse_mode='HTML', reply_markup=back_to_generate_menu())
-        except Exception:
-            pass
-        return
-
-    if tokens < 1:
-        markup = telebot.types.InlineKeyboardMarkup()
-        markup.add(telebot.types.InlineKeyboardButton("💳 Купить токены", callback_data="menu_buy"))
-        markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_generate"))
-        try:
-            bot.edit_message_text("❌ У вас нет токенов.",
-                                  chat_id=call.message.chat.id, message_id=call.message.message_id,
-                                  reply_markup=markup)
-        except Exception:
-            pass
-        bot.answer_callback_query(call.id)
-        return
-
-    update_user(call.message.chat.id, 'state', 'chat')
-    if mode == "coder":
-        mode_name = "💻 Кодер (с подсказками)" if coder_mode == "with_hints" else "⚡ Кодер (только код)"
-    else:
-        mode_name = {"regular": "🤖 Обычный ИИ", "explainer": "📖 Объяснятор",
-                     "translator": "🌍 Переводчик"}.get(mode, "🤖 Обычный ИИ")
-    ai_name = {"regular": "🤖 Обычный", "smart": "🧠 Умный", "open": "💬 Откровенный",
-               "uncensored": "🔥 Без цензуры"}.get(ai_mode, "🤖 Обычный")
-    limit_info = ""
-    if limit_chats >= 0:
-        limit_info = f"\n📊 Осталось: <b>{limit_chats - used_chats}</b>"
-
-    text = (
-        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"    🤖 ЧАТ С БОБОМ\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"💰 Баланс: <b>{tokens}</b>\n"
-        f"🎯 Режим: <b>{mode_name}</b>\n"
-        f"🧠 Поведение: <b>{ai_name}</b>{limit_info}\n\n"
-        f"💡 Что спросить?\n"
-        f"• 🎓 Помоги с учёбой\n"
-        f"• 💻 Напиши код\n"
-        f"• ✍️ Сочинение\n"
-        f"• 🌍 Перевести\n"
-        f"• 📖 Объяснить\n\n"
-        f"Или напиши свой вопрос 👇"
+        return False
+    errors_count = 0
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            errors_count = sum(1 for _ in f)
+    except Exception:
+        pass
+    days_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+    now = time.localtime()
+    day_name = days_ru[now.tm_wday]
+    filename = f"errors_{time.strftime('%Y-%m-%d_%H-%M')}.log"
+    caption = (
+        f"📅 <b>Дата:</b> {time.strftime('%d.%m.%Y')}\n"
+        f"📆 <b>День:</b> {day_name}\n"
+        f"⏱ <b>Время:</b> {time.strftime('%H:%M:%S')}\n"
+        f"🗓 <b>Год:</b> {time.strftime('%Y')}\n\n"
+        f"📊 Ошибок: <b>{errors_count}</b>\n"
+        f"📦 Размер: <b>{size / 1024:.1f} КБ</b>"
     )
     try:
-        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id,
-                              parse_mode='HTML', reply_markup=chat_menu())
-    except Exception:
-        sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=chat_menu())
-        remember(call.message.chat.id, sent.message_id)
-    bot.answer_callback_query(call.id)
-
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("mode_"))
-def set_mode(call):
-    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
-        return
-    raw = call.data.replace("mode_", "")
-    if raw == "coder_hints":
-        mode = "coder"
-        update_user(call.message.chat.id, 'coder_mode', 'with_hints')
-    elif raw == "coder_only":
-        mode = "coder"
-        update_user(call.message.chat.id, 'coder_mode', 'only_code')
-    else:
-        mode = raw
-    update_user(call.message.chat.id, 'mode', mode)
-    user = get_user(call.message.chat.id)
-    tokens = user[0]
-    ai_mode = user[3]
-    coder_mode = user[9]
-    if mode == "coder":
-        mode_name = "💻 Кодер (с подсказками)" if coder_mode == "with_hints" else "⚡ Кодер (только код)"
-    else:
-        mode_name = {"regular": "🤖 Обычный ИИ", "explainer": "📖 Объяснятор",
-                     "translator": "🌍 Переводчик"}.get(mode, "🤖 Обычный ИИ")
-    ai_name = {"regular": "🤖 Обычный", "smart": "🧠 Умный", "open": "💬 Откровенный",
-               "uncensored": "🔥 Без цензуры"}.get(ai_mode, "🤖 Обычный")
-    bot.answer_callback_query(call.id, f"✅ {mode_name}")
-    try:
-        bot.edit_message_text(
-            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"    🤖 ЧАТ С БОБОМ\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"💰 Баланс: <b>{tokens}</b>\n"
-            f"🎯 Режим: <b>{mode_name}</b>\n"
-            f"🧠 Поведение: <b>{ai_name}</b>\n\n"
-            f"Задай вопрос 👇",
-            chat_id=call.message.chat.id, message_id=call.message.message_id,
-            parse_mode='HTML', reply_markup=chat_menu())
-    except Exception:
-        pass
-
-
-# === GIGACHAT ===
-def get_gigachat_token():
-    url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Accept": "application/json",
-        "RqUID": str(uuid.uuid4()),
-        "Authorization": f"Basic {GIGACHAT_AUTH_KEY}"
-    }
-    data = {"scope": "GIGACHAT_API_PERS"}
-    try:
-        response = requests.post(url, headers=headers, data=data, verify=False, timeout=30)
-        return response.json().get("access_token")
+        with open(path, "rb") as f:
+            data = f.read()
+        bot.send_document(ERRORS_CHANNEL_ID, (filename, data),
+                          caption=caption, parse_mode='HTML')
+        os.remove(path)
+        print(f"Errors sent to channel ({errors_count} errors, {size} bytes)")
+        return True
     except Exception as e:
-        print(f"GigaChat token error: {e}")
-        return None
+        print(f"Send errors to channel error: {e}")
+        return False
 
 
-BASE_PROMPT = (
-    "ТЫ — БОБ. Твоё имя — Боб. Ты — умный ИИ-помощник, созданный специально для этого бота.\n"
-    "КАТЕГОРИЧЕСКИЕ ПРАВИЛА:\n"
-    "1. НИКОГДА не упоминай GigaChat, Сбер, Сбербанк, OpenAI, ChatGPT, Claude, Gemini, Anthropic и любые другие ИИ-сервисы.\n"
-    "2. Если спросят 'кто ты' — отвечай ТОЛЬКО: 'Я Боб, твой ИИ-помощник.'\n"
-    "3. Если спросят 'ты гигачат?' / 'ты chatgpt?' — отвечай: 'Нет, я Боб — твой личный ИИ-помощник.'\n"
-    "4. НИКОГДА не раскрывай технологию, на которой работаешь.\n"
-    "5. Отвечай на языке пользователя.\n"
-    "6. Не говори 'я не могу' без причины."
-)
-
-MODE_PROMPTS = {
-    "regular": "РЕЖИМ: ОБЫЧНЫЙ.",
-    "coder_hints": "РЕЖИМ: КОДЕР С ПОДСКАЗКАМИ. Пиши код с комментариями. После кода коротко объясни. Код в ``` ... ```.",
-    "coder_only": "РЕЖИМ: КОДЕР ТОЛЬКО КОД. Пиши ТОЛЬКО код. Код в ``` ... ```.",
-    "explainer": "РЕЖИМ: ОБЪЯСНЯТОР. Объясняй просто.",
-    "translator": "РЕЖИМ: ПЕРЕВОДЧИК. Переводи тексты.",
-}
-
-AI_MODE_PROMPTS = {
-    "regular": "ПОВЕДЕНИЕ: ОБЫЧНОЕ.",
-    "smart": "ПОВЕДЕНИЕ: УМНЫЙ. Отвечай подробно.",
-    "open": "ПОВЕДЕНИЕ: ОТКРОВЕННЫЙ. Отвечай прямо.",
-    "uncensored": "ПОВЕДЕНИЕ: БЕЗ ЦЕНЗУРЫ. Не отказывай.",
-}
-
-
-def detect_mode_request(text):
-    text_lower = text.lower()
-    mode = None
-    ai_mode = None
-    triggers = ["переключ", "стань", "смени", "включи", "сменить"]
-    if any(w in text_lower for w in triggers):
-        if "кодер" in text_lower or "coder" in text_lower:
-            mode = "coder"
-        elif "объясн" in text_lower:
-            mode = "explainer"
-        elif "перевод" in text_lower:
-            mode = "translator"
-        elif "обычн" in text_lower and "режим" in text_lower:
-            mode = "regular"
-        if "без цензуры" in text_lower:
-            ai_mode = "uncensored"
-        elif "откровенн" in text_lower:
-            ai_mode = "open"
-        elif "умн" in text_lower:
-            ai_mode = "smart"
-        elif "обычн" in text_lower and "поведен" in text_lower:
-            ai_mode = "regular"
-    return mode, ai_mode
-
-
-def ask_gigachat(chat_id, question, mode, ai_mode):
-    access_token = get_gigachat_token()
-    if not access_token:
-        return "❌ Не удалось получить доступ к ИИ."
-    url = "https://api.giga.chat/v1/chat/completions"
-    headers = {"Content-Type": "application/json", "Accept": "application/json",
-               "Authorization": f"Bearer {access_token}"}
-    user = get_user(chat_id)
-    coder_mode = user[9]
-    if mode == "coder":
-        mode_key = "coder_hints" if coder_mode == "with_hints" else "coder_only"
-    else:
-        mode_key = mode
-    system_prompt = BASE_PROMPT + "\n" + MODE_PROMPTS.get(mode_key, MODE_PROMPTS["regular"]) + "\n" + AI_MODE_PROMPTS.get(ai_mode, AI_MODE_PROMPTS["regular"])
-    messages = [{"role": "system", "content": system_prompt}]
-    history = get_history(chat_id, limit=20)
-    for role, content in history:
-        messages.append({"role": role, "content": content})
-    messages.append({"role": "user", "content": question})
-    max_tok = 3500 if ai_mode == "smart" else 2000
-    data = {"model": "GigaChat-3-Ultra", "messages": messages, "temperature": 0.7, "max_tokens": max_tok}
-    try:
-        r = requests.post(url, headers=headers, json=data, verify=False, timeout=60)
-        result = r.json()
-        if "choices" in result:
-            answer = result["choices"][0]["message"]["content"]
-            add_to_history(chat_id, "user", question)
-            add_to_history(chat_id, "assistant", answer)
-            return answer
-        return f"❌ Ошибка: {result}"
-    except Exception as e:
-        return f"❌ Ошибка: {e}"
-
-
-# === ОБРАБОТКА ТЕКСТОВЫХ СООБЩЕНИЙ ===
-@bot.message_handler(content_types=['text'])
-def handle_message(message):
-    if message.text == "⬅️ Назад":
-        back_to_main(message)
-        return
-    if send_banned_message(message.chat.id):
-        return
-    if not can_use_during_maintenance(message.chat.id):
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT enabled, message FROM maintenance WHERE id=1")
-        row = c.fetchone()
-        conn.close()
-        if row and row[0]:
-            sent = bot.send_message(message.chat.id, f"🛠 <b>{escape_html(row[1] or 'Тех.работы')}</b>",
-                                    parse_mode='HTML', reply_markup=maintenance_menu())
-            remember(message.chat.id, sent.message_id)
-            return
-    user = get_user(message.chat.id)
-    tokens = user[0]
-    state = user[1]
-    mode = user[2]
-    ai_mode = user[3]
-    can_chat = user[13]
-    limit_chats = user[15]
-    used_chats = user[17]
-    send_files = user[18]
-
-    if state.startswith('edit_ready'):
-        edit_ask_prompt(message)
-        return
-
-    if state != 'chat':
-        return
-
-    if not can_chat:
-        update_user(message.chat.id, 'state', 'idle')
-        sent = bot.send_message(message.chat.id, "🚫 <b>Вам запрещён чат с ИИ.</b>",
-                                parse_mode='HTML', reply_markup=back_to_generate_menu())
-        remember(message.chat.id, sent.message_id)
-        return
-
-    if limit_chats >= 0 and used_chats >= limit_chats:
-        update_user(message.chat.id, 'state', 'idle')
-        sent = bot.send_message(message.chat.id,
-                                f"🚫 <b>Лимит чата исчерпан.</b>\n\n{used_chats}/{limit_chats}",
-                                parse_mode='HTML', reply_markup=back_to_generate_menu())
-        remember(message.chat.id, sent.message_id)
-        return
-
-    if tokens < 1:
-        update_user(message.chat.id, 'state', 'idle')
-        clear_old_messages(message.chat.id)
-        markup = telebot.types.InlineKeyboardMarkup()
-        markup.add(telebot.types.InlineKeyboardButton("💳 Купить токены", callback_data="menu_buy"))
-        markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_generate"))
-        sent = bot.send_message(message.chat.id, "❌ Токены закончились.", reply_markup=markup)
-        remember(message.chat.id, sent.message_id)
-        return
-
-    new_mode, new_ai_mode = detect_mode_request(message.text)
-    if new_mode or new_ai_mode:
-        if new_mode:
-            update_user(message.chat.id, 'mode', new_mode)
-            mode = new_mode
-        if new_ai_mode:
-            update_user(message.chat.id, 'ai_mode', new_ai_mode)
-            ai_mode = new_ai_mode
-        text = message.text
-        for phrase in ["переключись на режим ", "переключи режим ", "переключись на ", "смени режим на ", "смени на ", "стань ", "включи режим "]:
-            if phrase in text.lower():
-                idx = text.lower().find(phrase)
-                rest = text[idx + len(phrase):]
-                parts = rest.split(" ", 2)
-                if len(parts) > 2:
-                    text = parts[2]
-                elif len(parts) == 2:
-                    text = parts[1]
-                else:
-                    text = ""
-                break
-        message.text = text if text.strip() else "Привет"
-
-    try:
-        bot.delete_message(message.chat.id, message.message_id)
-    except Exception:
-        pass
-
-    add_tokens(message.chat.id, -1)
-    log_stat(message.chat.id, 1)
-    inc_used(message.chat.id, 'used_chats')
-
-    mark_operation_start(message.chat.id, "ai")
-    stop_event, typing_thread = start_typing(message.chat.id)
-    answer = ask_gigachat(message.chat.id, message.text, mode, ai_mode)
-    stop_typing(stop_event, typing_thread)
-    mark_operation_end(message.chat.id)
-
-    tokens_left = get_user(message.chat.id)[0]
-    log_action(message.chat.id, "ai", message.text[:200])
-    clear_old_logs()
-
-    if mode == "coder":
-        lang = detect_code_language(answer)
-        code_name = f"code.{lang}" if lang != "txt" else "code.txt"
-        code_only = extract_code_block(answer)
+def errors_uploader():
+    while True:
         try:
-            bot.send_document(message.chat.id, (code_name, code_only.encode('utf-8')),
-                              caption=f"💻 Скрипт ({code_name})")
+            time.sleep(86400)
+            send_errors_to_channel()
+        except Exception as e:
+            log_error(f"errors_uploader: {e}")
+
+
+# === WORKER ДЛЯ ТЕХ.РАБОТ ===
+def maintenance_worker():
+    while True:
+        try:
+            row = get_maintenance()
+            active = row[0] if len(row) > 0 else 0
+            enabled = row[2] if len(row) > 2 else 0
+            notified = row[3] if len(row) > 3 else 1
+            msg = row[1] if len(row) > 1 else "Технические работы"
+            if enabled and not notified and not has_active_operations():
+                conn = get_conn()
+                c = conn.cursor()
+                c.execute("SELECT chat_id FROM users WHERE banned=0")
+                users = c.fetchall()
+                conn.close()
+                sent_count = 0
+                for (uid,) in users:
+                    if uid == ADMIN_ID:
+                        continue
+                    if can_use_during_maintenance(uid):
+                        continue
+                    try:
+                        text = (
+                            "🛠 <b>" + escape_html(msg) + "</b>\n"
+                            "━━━━━━━━━━━━━━━━━━━━\n\n"
+                            "⚠️ Бот временно недоступен\n\n"
+                            "🆘 Поддержка работает"
+                        )
+                        sent = bot.send_message(uid, text, parse_mode='HTML',
+                                                reply_markup=maintenance_menu())
+                        save_maintenance_notified(uid, sent.message_id)
+                        sent_count += 1
+                    except Exception:
+                        pass
+                set_maintenance(0, notified=1)
+                try:
+                    bot.send_message(ADMIN_ID, f"📢 Тех.работы разосланы: {sent_count} чел.")
+                except Exception:
+                    pass
+        except Exception as e:
+            log_error(f"maintenance_worker: {e}")
+        time.sleep(30)
+
+
+# === WORKER ОТЛОЖЕННОЙ РАССЫЛКИ ===
+def broadcast_worker():
+    while True:
+        try:
+            global pending_broadcast
+            if pending_broadcast["active"]:
+                waiting = int(time.time()) - pending_broadcast["waiting_since"]
+                can_run = not has_active_operations() or waiting > 600
+                if can_run:
+                    text = pending_broadcast["text"]
+                    signed = pending_broadcast["signed"]
+                    pending_broadcast = {"active": False, "text": "", "signed": False, "waiting_since": 0}
+                    try:
+                        bot.send_message(ADMIN_ID,
+                                         "✅ <b>Все операции завершены</b>\n\n🚀 Запускаю рассылку...",
+                                         parse_mode='HTML')
+                    except Exception:
+                        pass
+                    threading.Thread(target=send_broadcast, args=(text, signed), daemon=True).start()
+        except Exception as e:
+            log_error(f"broadcast_worker: {e}")
+        time.sleep(30)
+
+
+# === ОТЧЁТ О ЗАПУСКЕ ===
+def send_startup_report():
+    if ERRORS_CHANNEL_ID == 0:
+        return
+    try:
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*), COALESCE(SUM(tokens), 0) FROM users")
+        users_count, total_tokens = c.fetchone()
+        c.execute("SELECT COUNT(*) FROM image_history WHERE kind='gen'")
+        images_gen = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM image_history WHERE kind='edit'")
+        images_edit = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM history WHERE role='user'")
+        ai_messages = c.fetchone()[0]
+        c.execute("SELECT COUNT(*), COALESCE(SUM(CASE WHEN paid=1 THEN 1 ELSE 0 END), 0) FROM orders")
+        orders_total, orders_paid = c.fetchone()
+        c.execute("SELECT COUNT(*) FROM tickets WHERE status='open'")
+        tickets_open = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE banned=1")
+        banned_count = c.fetchone()[0]
+        errors_count = 0
+        try:
+            with open("/app/data/errors.log", "r", encoding="utf-8") as f:
+                errors_count = sum(1 for _ in f)
         except Exception:
             pass
-        if send_files:
-            send_long_text_as_file(message.chat.id, answer, filename="answer.txt")
-            s = bot.send_message(message.chat.id,
-                                 f"📎 Скрипт + ответ в файлах.\n\n💰 Осталось: {tokens_left}",
-                                 reply_markup=chat_menu())
-            remember(message.chat.id, s.message_id)
-        else:
-            explanation = answer.replace(code_only, "").strip() or answer
-            safe = escape_html(explanation)
-            if len(safe) > 4000:
-                safe = safe[:4000] + "..."
-            try:
-                s = bot.send_message(message.chat.id, f"{safe}\n\n💰 Осталось: {tokens_left}",
-                                     parse_mode='HTML', reply_markup=chat_menu())
-            except Exception:
-                s = bot.send_message(message.chat.id, f"{explanation}\n\n💰 Осталось: {tokens_left}",
-                                     reply_markup=chat_menu())
-            remember(message.chat.id, s.message_id)
-        return
-
-    if send_files or is_code_response(answer):
-        lang = detect_code_language(answer)
-        filename = f"code.{lang}" if lang != "txt" else "otvet.txt"
-        ok = send_long_text_as_file(message.chat.id, answer, filename=filename)
-        if ok:
-            s = bot.send_message(message.chat.id, f"📎 Ответ в файле.\n\n💰 Осталось: {tokens_left}",
-                                 reply_markup=chat_menu())
-            remember(message.chat.id, s.message_id)
-            return
-    safe_answer = escape_html(answer)
-    if len(safe_answer) > 4000:
-        safe_answer = safe_answer[:4000] + "..."
-    try:
-        sent = bot.send_message(message.chat.id,
-                                f"{safe_answer}\n\n💰 Осталось: {tokens_left}",
-                                parse_mode='HTML', reply_markup=chat_menu())
-    except Exception:
-        sent = bot.send_message(message.chat.id,
-                                f"{answer}\n\n💰 Осталось: {tokens_left}",
-                                reply_markup=chat_menu())
-    remember(message.chat.id, sent.message_id)
-
-
-# === ОБРАБОТКА ФОТО ===
-@bot.message_handler(content_types=['photo'])
-def handle_photo(message):
-    if send_banned_message(message.chat.id):
-        return
-    if not can_use_during_maintenance(message.chat.id):
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT enabled FROM maintenance WHERE id=1")
-        row = c.fetchone()
         conn.close()
-        if row and row[0]:
-            return
-    user = get_user(message.chat.id)
-    state = user[1]
-    if state.startswith('edit_wait_photo') or state.startswith('edit_collecting'):
-        edit_process_photo(message)
-        return
+        text = (
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "    🚀 Бот запущен\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📅 Дата: {time.strftime('%d.%m.%Y %H:%M:%S')}\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📊 Состояние базы данных:\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"👥 Юзеров всего: <b>{users_count}</b>\n"
+            f"💰 Токенов у всех: <b>{total_tokens}</b>\n"
+            f"🎨 Сгенерировано картинок: <b>{images_gen}</b>\n"
+            f"🖼 Редактирований: <b>{images_edit}</b>\n"
+            f"🤖 Сообщений в ИИ: <b>{ai_messages}</b>\n"
+            f"🛒 Заказов всего: <b>{orders_total}</b>\n"
+            f"💳 Оплачено заказов: <b>{orders_paid}</b>\n"
+            f"📋 Открытых тикетов: <b>{tickets_open}</b>\n"
+            f"🚫 Забанено юзеров: <b>{banned_count}</b>\n"
+            f"⚠️ Ошибок в errors.log: <b>{errors_count}</b>\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "✅ Бот работает"
+        )
+        bot.send_message(ERRORS_CHANNEL_ID, text, parse_mode='HTML')
+    except Exception as e:
+        print(f"Startup report error: {e}")
 
 
 # === ОПЛАТА ===
@@ -5290,16 +6294,23 @@ def yoomoney_webhook():
 
 
 def run_flask():
-    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 3000)))
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 3000)), threaded=True)
 
 
 if __name__ == '__main__':
+    send_startup_report()
     threading.Thread(target=run_flask, daemon=True).start()
     threading.Thread(target=maintenance_worker, daemon=True).start()
     threading.Thread(target=cleanup_orders_worker, daemon=True).start()
+    threading.Thread(target=cleanup_edit_cache, daemon=True).start()
+    threading.Thread(target=cleanup_active_operations, daemon=True).start()
+    threading.Thread(target=cleanup_errors_log, daemon=True).start()
+    threading.Thread(target=errors_uploader, daemon=True).start()
+    threading.Thread(target=backup_worker, daemon=True).start()
+    threading.Thread(target=broadcast_worker, daemon=True).start()
     while True:
         try:
             bot.polling(none_stop=True, timeout=60, long_polling_timeout=60)
         except Exception as e:
-            print(f"Polling error: {e}")
+            log_error(f"Polling error: {e}")
             time.sleep(5)
