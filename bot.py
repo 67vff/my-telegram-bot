@@ -43,6 +43,8 @@ ORDER_TTL = 1200
 BACKUP_INTERVAL = 3600
 BACKUP_KEEP = 24
 
+WEBAPP_URL = "https://bot-1790959533-7739-maks746395.bothost.tech/webapp/"
+
 last_broadcast = {"messages": [], "active": False}
 pending_broadcast = {"active": False, "text": "", "signed": False, "waiting_since": 0}
 edit_photos_cache = {}
@@ -1171,6 +1173,10 @@ def main_menu(chat_id=None):
     markup.add(telebot.types.InlineKeyboardButton("💳 Купить токены", callback_data="menu_buy"))
     markup.add(telebot.types.InlineKeyboardButton("⚙️ Настройки", callback_data="menu_settings"))
     markup.add(telebot.types.InlineKeyboardButton("🆘 Поддержка", callback_data="menu_support"))
+    markup.add(telebot.types.InlineKeyboardButton(
+        "📱 Открыть приложение",
+        web_app=telebot.types.WebAppInfo(url=WEBAPP_URL)
+    ))
     if chat_id == ADMIN_ID:
         markup.add(telebot.types.InlineKeyboardButton("👑 Админ-меню", callback_data="menu_admin"))
     return markup
@@ -2980,7 +2986,8 @@ def hist_image(call):
         return
 
     if call.data.startswith("hist_image_page_"):
-        page = int(call.data.replace("hist_image_page_", ""))
+        page_str = call.data.replace("hist_image_page_", "")
+        page = int(page_str) if page_str.isdigit() else 1
     else:
         page = 1
 
@@ -3049,7 +3056,8 @@ def hist_edit(call):
         return
 
     if call.data.startswith("hist_edit_page_"):
-        page = int(call.data.replace("hist_edit_page_", ""))
+        page_str = call.data.replace("hist_edit_page_", "")
+        page = int(page_str) if page_str.isdigit() else 1
     else:
         page = 1
 
@@ -3118,7 +3126,8 @@ def hist_chat(call):
         return
 
     if call.data.startswith("hist_chat_page_"):
-        page = int(call.data.replace("hist_chat_page_", ""))
+        page_str = call.data.replace("hist_chat_page_", "")
+        page = int(page_str) if page_str.isdigit() else 1
     else:
         page = 1
 
@@ -3935,6 +3944,7 @@ def maint_on_confirm(call):
     text = (
         "⚠️ <b>ВКЛЮЧИТЬ ТЕХ.РАБОТЫ?</b>\n\n"
         "🔴 Бот станет <b>недоступен</b> для всех юзеров\n"
+        "📱 Приложение тоже закроется\n"
         "🆘 Поддержка останется\n\n"
         "Продолжить?"
     )
@@ -4974,7 +4984,7 @@ def admin_manage(call):
     bot.answer_callback_query(call.id)
 
 
-# === ГЛАВНАЯ ФУНКЦИЯ УПРАВЛЕНИЯ (без _is_manage_root) ===
+# === ГЛАВНАЯ ФУНКЦИЯ УПРАВЛЕНИЯ ===
 @bot.callback_query_handler(func=lambda call: call.data.startswith("admin_mng_") and call.data.replace("admin_mng_", "").isdigit())
 def admin_mng_user(call):
     if call.message.chat.id != ADMIN_ID:
@@ -5039,7 +5049,7 @@ def admin_mng_user(call):
     bot.answer_callback_query(call.id)
 
 
-# === БАН (как в старом скрипте — сразу причина, без confirm) ===
+# === БАН ===
 @bot.callback_query_handler(func=lambda call: call.data.startswith("admin_mng_ban_"))
 def admin_mng_ban(call):
     if call.message.chat.id != ADMIN_ID:
@@ -6149,6 +6159,349 @@ def yoomoney_webhook():
         log_action(chat_id, "buy", f"{real_amount} ₽ → {tokens} токенов")
         notify_subscribers(chat_id, f"💳 Оплата: {real_amount} ₽ → {tokens} токенов")
     return jsonify({"status": "ok"}), 200
+
+# === WEBAPP API ===
+import hmac as _hmac
+import hashlib as _hashlib
+import json as _json
+
+
+def verify_init_data(init_data):
+    try:
+        parsed = urllib.parse.parse_qsl(init_data, keep_blank_values=True)
+        data_dict = dict(parsed)
+        received_hash = data_dict.pop("hash", "")
+        if not received_hash:
+            return None
+        data_check_string = "\n".join(
+            f"{k}={v}" for k, v in sorted(data_dict.items())
+        )
+        secret_key = _hmac.new(
+            b"WebAppData",
+            BOT_TOKEN.encode(),
+            _hashlib.sha256
+        ).digest()
+        calculated_hash = _hmac.new(
+            secret_key,
+            data_check_string.encode(),
+            _hashlib.sha256
+        ).hexdigest()
+        if not _hmac.compare_digest(calculated_hash, received_hash):
+            return None
+        user_str = data_dict.get("user", "")
+        if not user_str:
+            return None
+        return _json.loads(user_str)
+    except Exception as e:
+        log_error(f"verify_init_data: {e}")
+        return None
+
+
+def get_chat_id_from_init_data(init_data):
+    user = verify_init_data(init_data)
+    if not user:
+        return None
+    return user.get("id")
+
+
+WEBAPP_MAINTENANCE_HTML = '''<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+body{background:#17212b;color:#fff;font-family:-apple-system,Arial,sans-serif;
+text-align:center;padding:60px 20px;margin:0;}
+h1{font-size:80px;margin:0 0 20px;}
+h2{font-size:22px;font-weight:500;margin:0 0 20px;line-height:1.4;}
+p{font-size:16px;opacity:0.6;margin:0;}
+</style></head>
+<body>
+<h1>🛠</h1>
+<h2>MSG_PLACEHOLDER</h2>
+<p>Поддержка работает</p>
+</body></html>'''
+
+
+WEBAPP_HTML = '''<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>БОБ</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+background:var(--tg-theme-bg-color,#1a1a2e);color:var(--tg-theme-text-color,#fff);
+min-height:100vh;padding:16px;padding-bottom:80px;}
+.header{text-align:center;margin-bottom:20px;padding:20px;
+background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);border-radius:16px;}
+.header h1{font-size:26px;margin-bottom:8px;color:#fff;}
+.balance{font-size:18px;opacity:.95;color:#fff;}
+.balance b{color:#ffd700;}
+.menu{display:flex;flex-direction:column;gap:10px;}
+.btn{display:flex;align-items:center;gap:12px;padding:16px 18px;
+background:var(--tg-theme-secondary-bg-color,#16213e);border:none;border-radius:14px;
+color:var(--tg-theme-text-color,#fff);font-size:16px;font-weight:500;
+cursor:pointer;transition:all .15s;width:100%;text-align:left;}
+.btn:active{transform:scale(.97);opacity:.85;}
+.btn .emoji{font-size:22px;}
+.btn .arrow{margin-left:auto;opacity:.4;font-size:20px;}
+.screen{display:none;}
+.screen.active{display:block;}
+.screen-header{display:flex;align-items:center;margin-bottom:20px;padding:12px 16px;
+background:var(--tg-theme-secondary-bg-color,#16213e);border-radius:12px;}
+.back-btn{background:none;border:none;color:var(--tg-theme-text-color,#fff);
+font-size:22px;cursor:pointer;padding:4px 12px 4px 0;}
+.screen-title{font-size:17px;font-weight:600;}
+.buy-option{padding:18px;background:var(--tg-theme-secondary-bg-color,#16213e);
+border-radius:12px;margin-bottom:10px;cursor:pointer;text-align:center;
+font-size:16px;font-weight:500;transition:all .15s;}
+.buy-option:active{transform:scale(.98);}
+.history-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;}
+.history-item{background:var(--tg-theme-secondary-bg-color,#16213e);
+border-radius:12px;overflow:hidden;}
+.history-item img{width:100%;display:block;aspect-ratio:1;object-fit:cover;}
+.history-item .cap{padding:6px 8px;font-size:11px;opacity:.7;
+white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.loading{text-align:center;padding:40px;opacity:.5;font-size:15px;}
+.tabs{display:flex;gap:6px;margin-bottom:14px;}
+.tab{flex:1;padding:10px;background:var(--tg-theme-secondary-bg-color,#16213e);
+border:none;border-radius:10px;color:var(--tg-theme-text-color,#fff);
+font-size:13px;cursor:pointer;opacity:.6;}
+.tab.active{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);opacity:1;}
+.admin-section{margin-top:20px;padding-top:16px;border-top:1px solid rgba(255,255,255,.1);}
+.admin-title{font-size:13px;opacity:.5;margin-bottom:10px;text-align:center;
+text-transform:uppercase;letter-spacing:1px;}
+.err{color:#ff6b6b;text-align:center;padding:20px;font-size:14px;}
+</style>
+</head>
+<body>
+
+<div id="screen-main" class="screen active">
+    <div class="header">
+        <h1>🤖 БОБ</h1>
+        <div class="balance">💰 Токенов: <b id="tokens">...</b></div>
+    </div>
+    <div class="menu">
+        <button class="btn" onclick="openBot('menu_generate')">
+            <span class="emoji">🎨</span><span>Сгенерировать</span><span class="arrow">›</span>
+        </button>
+        <button class="btn" onclick="openBot('menu_chat')">
+            <span class="emoji">🤖</span><span>Чат с ИИ</span><span class="arrow">›</span>
+        </button>
+        <button class="btn" onclick="showScreen('history')">
+            <span class="emoji">📜</span><span>История</span><span class="arrow">›</span>
+        </button>
+        <button class="btn" onclick="showScreen('buy')">
+            <span class="emoji">💳</span><span>Купить токены</span><span class="arrow">›</span>
+        </button>
+        <button class="btn" onclick="openBot('menu_settings')">
+            <span class="emoji">⚙️</span><span>Настройки</span><span class="arrow">›</span>
+        </button>
+        <button class="btn" onclick="openBot('menu_support')">
+            <span class="emoji">🆘</span><span>Поддержка</span><span class="arrow">›</span>
+        </button>
+        <div id="admin-block" style="display:none;" class="admin-section">
+            <div class="admin-title">Админ</div>
+            <button class="btn" onclick="openBot('menu_admin')">
+                <span class="emoji">👑</span><span>Открыть админ-меню</span><span class="arrow">›</span>
+            </button>
+        </div>
+    </div>
+</div>
+
+<div id="screen-history" class="screen">
+    <div class="screen-header">
+        <button class="back-btn" onclick="showScreen('main')">←</button>
+        <span class="screen-title">📜 История</span>
+    </div>
+    <div class="tabs">
+        <button class="tab active" onclick="loadHistory('gen',this)">🎨 Генерации</button>
+        <button class="tab" onclick="loadHistory('edit',this)">🖼 Правки</button>
+    </div>
+    <div id="history-content"><div class="loading">Загрузка...</div></div>
+</div>
+
+<div id="screen-buy" class="screen">
+    <div class="screen-header">
+        <button class="back-btn" onclick="showScreen('main')">←</button>
+        <span class="screen-title">💳 Купить токены</span>
+    </div>
+    <div class="buy-option" onclick="buy(100,20)">💵 100 ₽ — 20 токенов</div>
+    <div class="buy-option" onclick="buy(250,50)">💵 250 ₽ — 50 токенов</div>
+    <div class="buy-option" onclick="buy(500,100)">💵 500 ₽ — 100 токенов</div>
+    <div class="buy-option" onclick="buy(1000,200)">💵 1000 ₽ — 200 токенов</div>
+</div>
+
+<script>
+const tg = window.Telegram.WebApp;
+tg.ready();
+tg.expand();
+const initData = tg.initData;
+
+function showScreen(name){
+    document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));
+    document.getElementById('screen-'+name).classList.add('active');
+    if(name==='history')loadHistory('gen',document.querySelector('.tab.active'));
+}
+
+async function apiCall(endpoint,data={}){
+    data.init_data=initData;
+    const res=await fetch('/webapp/api/'+endpoint,{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify(data),
+    });
+    return await res.json();
+}
+
+async function loadMe(){
+    try{
+        const d=await apiCall('me');
+        if(d.error){document.getElementById('tokens').textContent='ошибка';return;}
+        document.getElementById('tokens').textContent=d.tokens;
+        if(d.is_admin){document.getElementById('admin-block').style.display='block';}
+    }catch(e){
+        document.getElementById('tokens').textContent='ошибка';
+    }
+}
+
+async function loadHistory(kind,tabEl){
+    document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+    if(tabEl)tabEl.classList.add('active');
+    const c=document.getElementById('history-content');
+    c.innerHTML='<div class="loading">Загрузка...</div>';
+    try{
+        const d=await apiCall('history',{kind});
+        if(d.error){c.innerHTML='<div class="err">Ошибка: '+d.error+'</div>';return;}
+        if(!d.items||d.items.length===0){c.innerHTML='<div class="loading">История пуста</div>';return;}
+        let h='<div class="history-grid">';
+        for(const it of d.items){
+            h+='<div class="history-item"><img src="'+it.url+'" loading="lazy"><div class="cap">'+escapeHtml(it.prompt.substring(0,40))+'</div></div>';
+        }
+        h+='</div>';
+        c.innerHTML=h;
+    }catch(e){
+        c.innerHTML='<div class="err">Ошибка загрузки</div>';
+    }
+}
+
+function escapeHtml(t){const d=document.createElement('div');d.textContent=t;return d.innerHTML;}
+
+async function buy(amount,tokens){
+    try{
+        const d=await apiCall('buy',{amount,tokens});
+        if(d.error){tg.showAlert('Ошибка: '+d.error);return;}
+        tg.openLink(d.pay_url);
+    }catch(e){tg.showAlert('Ошибка: '+e.message);}
+}
+
+function openBot(callbackData){
+    tg.sendData(JSON.stringify({callback:callbackData}));
+    tg.close();
+}
+
+loadMe();
+</script>
+</body>
+</html>'''
+
+
+@app.route('/webapp/')
+def webapp_index():
+    try:
+        row = get_maintenance()
+        enabled = row[2] if len(row) > 2 else 0
+        if enabled:
+            msg = row[1] if len(row) > 1 else "Технические работы"
+            html = WEBAPP_MAINTENANCE_HTML.replace("MSG_PLACEHOLDER", escape_html(msg))
+            return html
+        return WEBAPP_HTML
+    except Exception as e:
+        log_error(f"webapp_index: {e}")
+        return WEBAPP_HTML
+
+
+@app.route('/webapp/api/me', methods=['POST'])
+def webapp_api_me():
+    try:
+        data = request.get_json() or {}
+        init_data = data.get("init_data", "")
+        chat_id = get_chat_id_from_init_data(init_data)
+        if not chat_id:
+            return jsonify({"error": "unauthorized"}), 401
+        user = get_user(chat_id)
+        return jsonify({
+            "chat_id": chat_id,
+            "tokens": user[0],
+            "is_admin": chat_id == ADMIN_ID,
+        })
+    except Exception as e:
+        log_error(f"webapp_api_me: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/webapp/api/history', methods=['POST'])
+def webapp_api_history():
+    try:
+        data = request.get_json() or {}
+        init_data = data.get("init_data", "")
+        kind = data.get("kind", "gen")
+        chat_id = get_chat_id_from_init_data(init_data)
+        if not chat_id:
+            return jsonify({"error": "unauthorized"}), 401
+        rows = get_image_history_by_kind(chat_id, kind, limit=50)
+        items = []
+        for prompt, image_url, ts in rows:
+            items.append({"prompt": prompt, "url": image_url, "ts": ts})
+        return jsonify({"items": items})
+    except Exception as e:
+        log_error(f"webapp_api_history: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/webapp/api/buy', methods=['POST'])
+def webapp_api_buy():
+    try:
+        data = request.get_json() or {}
+        init_data = data.get("init_data", "")
+        amount = int(data.get("amount", 0))
+        tokens = int(data.get("tokens", 0))
+        chat_id = get_chat_id_from_init_data(init_data)
+        if not chat_id:
+            return jsonify({"error": "unauthorized"}), 401
+        if amount <= 0 or tokens <= 0:
+            return jsonify({"error": "bad params"}), 400
+        order_id = f"ORD-{chat_id}-{tokens}-{amount}"
+        save_order(order_id, chat_id, tokens, amount)
+        pay_url = f"https://bot-1790959533-7739-maks746395.bothost.tech/pay/{amount}/{order_id}"
+        return jsonify({"pay_url": pay_url, "order_id": order_id})
+    except Exception as e:
+        log_error(f"webapp_api_buy: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# === ОБРАБОТКА tg.sendData ===
+@bot.message_handler(content_types=['web_app_data'])
+def handle_web_app_data(message):
+    try:
+        data_str = message.web_app_data.data
+        data = _json.loads(data_str)
+        callback = data.get("callback", "")
+        fake = type("C", (), {
+            "id": "webapp_" + str(int(time.time())),
+            "message": type("M", (), {
+                "chat": message.chat,
+                "message_id": 0,
+            })(),
+            "from_user": message.from_user,
+            "data": callback,
+        })()
+        bot.send_message(message.chat.id, f"✅ Открой бота: /start\n\n<i>Callback: {callback}</i>",
+                         parse_mode='HTML')
+    except Exception as e:
+        log_error(f"handle_web_app_data: {e}")
 
 
 def run_flask():
