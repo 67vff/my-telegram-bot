@@ -1,6 +1,6 @@
 # ============================================================
 # БОБ AI — Telegram Bot + WebApp
-# Часть 1: Импорты, конфиг, БД, утилиты, меню, пользователи
+# Часть 1: Импорты, конфиг, БД, утилиты, меню, пользователи, чаты
 # ============================================================
 
 import os
@@ -319,6 +319,17 @@ def init_db():
         role TEXT,
         content TEXT
     )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS chats (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER,
+        title TEXT DEFAULT 'Новый чат',
+        created INTEGER,
+        last_message INTEGER
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS user_settings (
+        chat_id INTEGER PRIMARY KEY,
+        theme TEXT DEFAULT 'ocean'
+    )''')
     c.execute('''CREATE TABLE IF NOT EXISTS image_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         chat_id INTEGER,
@@ -380,6 +391,7 @@ def init_db():
     )''')
     conn.commit()
 
+    # Миграции users
     for col, definition in [
         ("mode", "TEXT DEFAULT 'regular'"),
         ("ai_mode", "TEXT DEFAULT 'regular'"),
@@ -410,6 +422,7 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
+    # Миграции orders
     for col, definition in [
         ("created", "INTEGER DEFAULT 0"),
         ("paid", "INTEGER DEFAULT 0"),
@@ -422,6 +435,7 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
+    # Миграции image_history
     for col, definition in [
         ("timestamp", "INTEGER DEFAULT 0"),
         ("kind", "TEXT DEFAULT 'gen'"),
@@ -432,6 +446,7 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
+    # Миграции maintenance
     for col, definition in [
         ("message", "TEXT DEFAULT 'Технические работы, пожалуйста подождите'"),
         ("enabled", "INTEGER DEFAULT 0"),
@@ -443,6 +458,7 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
+    # Миграции bans
     for col, definition in [
         ("reason", "TEXT DEFAULT ''"),
         ("admin_id", "INTEGER DEFAULT 0"),
@@ -450,6 +466,16 @@ def init_db():
     ]:
         try:
             c.execute(f"ALTER TABLE bans ADD COLUMN {col} {definition}")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
+    # Миграции history (user_chat_id для системы чатов)
+    for col, definition in [
+        ("user_chat_id", "INTEGER DEFAULT 0"),
+    ]:
+        try:
+            c.execute(f"ALTER TABLE history ADD COLUMN {col} {definition}")
             conn.commit()
         except sqlite3.OperationalError:
             pass
@@ -658,36 +684,183 @@ def notify_subscribers(user_id, text):
             pass
 
 
-def add_to_history(chat_id, role, content):
+# ============================================================
+# СИСТЕМА ЧАТОВ (несколько чатов у одного пользователя)
+# ============================================================
+
+def get_or_create_active_chat(chat_id):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, role, content))
+    c.execute("SELECT id FROM chats WHERE chat_id=? ORDER BY last_message DESC LIMIT 1", (chat_id,))
+    row = c.fetchone()
+    if row:
+        conn.close()
+        return row[0]
+    now = int(time.time())
+    c.execute("INSERT INTO chats (chat_id, title, created, last_message) VALUES (?, ?, ?, ?)",
+              (chat_id, "Новый чат", now, now))
     conn.commit()
+    chat_db_id = c.lastrowid
     conn.close()
+    return chat_db_id
 
 
-def get_history(chat_id, limit=20):
+def create_new_chat(chat_id):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT role, content FROM history WHERE chat_id=? ORDER BY id DESC LIMIT ?", (chat_id, limit))
-    rows = c.fetchall()
+    now = int(time.time())
+    c.execute("INSERT INTO chats (chat_id, title, created, last_message) VALUES (?, ?, ?, ?)",
+              (chat_id, f"Чат {time.strftime('%d.%m %H:%M')}", now, now))
+    conn.commit()
+    chat_db_id = c.lastrowid
     conn.close()
-    return list(reversed(rows))
+    return chat_db_id
 
 
-def get_full_history(chat_id, limit=200):
+def get_user_chats(chat_id, limit=20):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT role, content FROM history WHERE chat_id=? ORDER BY id ASC LIMIT ?", (chat_id, limit))
+    c.execute("""SELECT id, title, created, last_message,
+                 (SELECT COUNT(*) FROM history WHERE user_chat_id = chats.id) as msg_count
+                 FROM chats WHERE chat_id=? ORDER BY last_message DESC LIMIT ?""",
+              (chat_id, limit))
     rows = c.fetchall()
     conn.close()
     return rows
 
 
-def clear_history(chat_id):
+def delete_chat(chat_id, chat_db_id):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("DELETE FROM history WHERE chat_id=?", (chat_id,))
+    c.execute("DELETE FROM chats WHERE id=? AND chat_id=?", (chat_db_id, chat_id))
+    c.execute("DELETE FROM history WHERE user_chat_id=? AND chat_id=?", (chat_db_id, chat_id))
+    conn.commit()
+    conn.close()
+
+
+def rename_chat(chat_id, chat_db_id, new_title):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("UPDATE chats SET title=? WHERE id=? AND chat_id=?", (new_title[:50], chat_db_id, chat_id))
+    conn.commit()
+    conn.close()
+
+
+def get_chat_by_id(chat_id, chat_db_id):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT id, title, created, last_message FROM chats WHERE id=? AND chat_id=?",
+              (chat_db_id, chat_id))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+
+def update_chat_title_from_message(chat_id, chat_db_id, message):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT title FROM chats WHERE id=? AND chat_id=?", (chat_db_id, chat_id))
+    row = c.fetchone()
+    if row and row[0] == "Новый чат":
+        title = message[:40] + ("..." if len(message) > 40 else "")
+        c.execute("UPDATE chats SET title=? WHERE id=?", (title, chat_db_id))
+    c.execute("UPDATE chats SET last_message=? WHERE id=?", (int(time.time()), chat_db_id))
+    conn.commit()
+    conn.close()
+
+
+def get_chat_messages(chat_id, chat_db_id, limit=100):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""SELECT role, content FROM history 
+                 WHERE chat_id=? AND user_chat_id=? 
+                 ORDER BY id ASC LIMIT ?""",
+              (chat_id, chat_db_id, limit))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def get_chat_title(chat_id, chat_db_id):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT title FROM chats WHERE id=? AND chat_id=?", (chat_db_id, chat_id))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return row[0]
+    return "Новый чат"
+
+
+def get_theme(chat_id):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT theme FROM user_settings WHERE chat_id=?", (chat_id,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return row[0]
+    return "ocean"
+
+
+def set_theme(chat_id, theme):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO user_settings (chat_id, theme) VALUES (?, ?)", (chat_id, theme))
+    conn.commit()
+    conn.close()
+
+
+# ============================================================
+# ИСТОРИЯ ЧАТА
+# ============================================================
+
+def add_to_history(chat_id, role, content, user_chat_id=None):
+    if user_chat_id is None:
+        user_chat_id = get_or_create_active_chat(chat_id)
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("INSERT INTO history (chat_id, role, content, user_chat_id) VALUES (?, ?, ?, ?)",
+              (chat_id, role, content, user_chat_id))
+    conn.commit()
+    conn.close()
+    update_chat_title_from_message(chat_id, user_chat_id, content)
+
+
+def get_history(chat_id, limit=20, user_chat_id=None):
+    if user_chat_id is None:
+        user_chat_id = get_or_create_active_chat(chat_id)
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""SELECT role, content FROM history 
+                 WHERE chat_id=? AND user_chat_id=? 
+                 ORDER BY id DESC LIMIT ?""",
+              (chat_id, user_chat_id, limit))
+    rows = c.fetchall()
+    conn.close()
+    return list(reversed(rows))
+
+
+def get_full_history(chat_id, limit=200, user_chat_id=None):
+    if user_chat_id is None:
+        user_chat_id = get_or_create_active_chat(chat_id)
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""SELECT role, content FROM history 
+                 WHERE chat_id=? AND user_chat_id=? 
+                 ORDER BY id ASC LIMIT ?""",
+              (chat_id, user_chat_id, limit))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def clear_history(chat_id, user_chat_id=None):
+    if user_chat_id is None:
+        user_chat_id = get_or_create_active_chat(chat_id)
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("DELETE FROM history WHERE chat_id=? AND user_chat_id=?", (chat_id, user_chat_id))
     conn.commit()
     conn.close()
 
@@ -1090,13 +1263,13 @@ def support_menu():
 def chat_menu():
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("➕ Новый чат", callback_data="new_chat"))
+    markup.add(telebot.types.InlineKeyboardButton("💬 Мои чаты", callback_data="my_chats"))
     markup.add(telebot.types.InlineKeyboardButton("⚙️ Настройки ИИ", callback_data="ai_bob_menu"))
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_generate"))
     return markup
 
 
 def ai_bob_menu(chat_id):
-    """Единое меню настроек ИИ: режим + поведение + ответы файлами."""
     user = get_user(chat_id)
     mode = user[2]
     coder_mode = user[9]
@@ -1356,7 +1529,80 @@ def start(message):
                                     parse_mode='HTML', reply_markup=maintenance_menu())
             remember(message.chat.id, sent.message_id)
             return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) > 1:
+        param = parts[1].strip().lower()
+        if param == "edit":
+            open_edit_mode(message.chat.id)
+            return
+        elif param == "support":
+            sent = bot.send_message(
+                message.chat.id,
+                "━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "     🆘 ПОДДЕРЖКА\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "Есть вопрос или проблема?",
+                parse_mode='HTML', reply_markup=support_menu())
+            remember(message.chat.id, sent.message_id)
+            return
+
     send_main_menu(message.chat.id)
+
+
+def open_edit_mode(chat_id):
+    user = get_user(chat_id)
+    tokens = user[0]
+    can_image = user[12]
+    limit_edits = user[20]
+    used_edits = user[19]
+
+    if not can_image:
+        sent = bot.send_message(chat_id, "🚫 <b>Вам запрещено редактирование фото.</b>",
+                                parse_mode='HTML', reply_markup=back_to_generate_menu())
+        remember(chat_id, sent.message_id)
+        return
+
+    if limit_edits >= 0 and used_edits >= limit_edits:
+        sent = bot.send_message(chat_id,
+                                f"🚫 <b>Лимит редактирований исчерпан.</b>\n\n{used_edits}/{limit_edits}",
+                                parse_mode='HTML', reply_markup=back_to_generate_menu())
+        remember(chat_id, sent.message_id)
+        return
+
+    if tokens < EDIT_COST:
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.add(telebot.types.InlineKeyboardButton("💳 Купить токены", callback_data="menu_buy"))
+        markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_generate"))
+        sent = bot.send_message(chat_id,
+                                f"❌ Нужно {EDIT_COST} токена для редактирования.\nУ вас: {tokens}.",
+                                reply_markup=markup)
+        remember(chat_id, sent.message_id)
+        return
+
+    edit_photos_cache[chat_id] = {"photos": [], "prompt": "", "created": int(time.time())}
+    update_user(chat_id, 'state', 'edit_wait_photo')
+
+    limit_info = ""
+    if limit_edits >= 0:
+        limit_info = f"\n📊 Осталось: <b>{limit_edits - used_edits}</b>"
+
+    sent = bot.send_message(
+        chat_id,
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"   🖼 РЕДАКТИРОВАНИЕ\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"1️⃣ Пришли фото\n"
+        f"2️⃣ Напиши задание\n"
+        f"3️⃣ Нажми «Готово»\n\n"
+        f"💡 Примеры:\n"
+        f"• убери фон\n"
+        f"• помести на пляж\n"
+        f"• сделай аниме\n\n"
+        f"💰 Стоимость: {EDIT_COST}💎{limit_info}\n\n"
+        f"📸 Пришли фото 👇",
+        parse_mode='HTML', reply_markup=edit_mode_menu())
+    remember(chat_id, sent.message_id)
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "back_to_main")
@@ -1467,29 +1713,22 @@ def back_to_orders(call):
 def back_to_chat(call):
     if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
         return
-    user = get_user(call.message.chat.id)
+    chat_id = call.message.chat.id
+    active_chat = get_or_create_active_chat(chat_id)
+    update_user(chat_id, 'state', f'chat:{active_chat}')
+    user = get_user(chat_id)
     tokens = user[0]
-    mode = user[2]
-    ai_mode = user[3]
-    coder_mode = user[9]
-    if mode == "coder":
-        mode_name = "💻 Кодер (с подсказками)" if coder_mode == "with_hints" else "⚡ Кодер (только код)"
-    else:
-        mode_name = {"regular": "🤖 Обычный ИИ", "explainer": "📖 Объяснятор",
-                     "translator": "🌍 Переводчик"}.get(mode, "🤖 Обычный ИИ")
-    ai_name = {"regular": "🤖 Обычный", "smart": "🧠 Умный", "open": "💬 Откровенный",
-               "uncensored": "🔥 Без цензуры"}.get(ai_mode, "🤖 Обычный")
+    title = get_chat_title(chat_id, active_chat)
     try:
         bot.edit_message_text(
             f"━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"    🤖 ЧАТ С БОБОМ\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"💰 Баланс: <b>{tokens}</b>\n"
-            f"🎯 Режим: <b>{mode_name}</b>\n"
-            f"🧠 Поведение: <b>{ai_name}</b>\n\n"
-            f"💡 Просто напиши сообщение 👇\n"
-            f"Или нажми ⚙️ для смены режима",
-            chat_id=call.message.chat.id, message_id=call.message.message_id,
+            f"💬 Чат: <b>{escape_html(title)}</b>\n"
+            f"💰 Баланс: <b>{tokens}</b>\n\n"
+            f"💡 Пиши сообщение 👇\n"
+            f"📜 Или открой «Мои чаты»",
+            chat_id=chat_id, message_id=call.message.message_id,
             parse_mode='HTML', reply_markup=chat_menu())
     except Exception:
         pass
@@ -1682,7 +1921,10 @@ def help_ai(call):
         "• 📖 Объяснятор\n"
         "• 🌍 Переводчик\n\n"
         "⚙️ <b>Поведение:</b>\n"
-        "• 🧠 Умный, 💬 Откровенный, 🔥 Без цензуры"
+        "• 🧠 Умный, 💬 Откровенный, 🔥 Без цензуры\n\n"
+        "💬 <b>Несколько чатов:</b>\n"
+        "Можно создавать разные чаты\n"
+        "и возвращаться к старым!"
     )
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_help"))
@@ -1749,44 +1991,190 @@ def help_edit(call):
     bot.answer_callback_query(call.id)
 
 
+# ============================================================
+# СИСТЕМА ЧАТОВ (callback handlers)
+# ============================================================
+
 @bot.callback_query_handler(func=lambda call: call.data == "new_chat")
 def new_chat_cmd(call):
     if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
         return
     chat_id = call.message.chat.id
-    clear_history(chat_id)
+    new_chat_db_id = create_new_chat(chat_id)
     _last_ai_message.pop(chat_id, None)
     log_action(chat_id, "ai", "new_chat")
-    try:
-        bot.answer_callback_query(call.id, "✅ История очищена")
-    except Exception:
-        pass
+    update_user(chat_id, 'state', f'chat:{new_chat_db_id}')
 
     user = get_user(chat_id)
     tokens = user[0]
-    mode = user[2]
-    ai_mode = user[3]
-    coder_mode = user[9]
-    if mode == "coder":
-        mode_name = "💻 Кодер (с подсказками)" if coder_mode == "with_hints" else "⚡ Кодер (только код)"
-    else:
-        mode_name = {"regular": "🤖 Обычный ИИ", "explainer": "📖 Объяснятор",
-                     "translator": "🌍 Переводчик"}.get(mode, "🤖 Обычный ИИ")
-    ai_name = {"regular": "🤖 Обычный", "smart": "🧠 Умный", "open": "💬 Откровенный",
-               "uncensored": "🔥 Без цензуры"}.get(ai_mode, "🤖 Обычный")
+    try:
+        bot.answer_callback_query(call.id, "✅ Новый чат создан")
+    except Exception:
+        pass
     try:
         bot.edit_message_text(
             f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"  ✅ НОВЫЙ ЧАТ НАЧАТ\n"
+            f"  ✅ НОВЫЙ ЧАТ СОЗДАН\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"💰 Баланс: <b>{tokens}</b>\n"
-            f"🎯 Режим: <b>{mode_name}</b>\n"
-            f"🧠 Поведение: <b>{ai_name}</b>\n\n"
-            f"💡 Просто напиши сообщение 👇",
+            f"💰 Баланс: <b>{tokens}</b>\n\n"
+            f"💡 Пиши первое сообщение 👇\n"
+            f"📜 Старые чаты: «💬 Мои чаты»",
             chat_id=chat_id, message_id=call.message.message_id,
             parse_mode='HTML', reply_markup=chat_menu())
     except Exception:
         pass
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "my_chats")
+def my_chats_handler(call):
+    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
+        return
+    chat_id = call.message.chat.id
+    chats = get_user_chats(chat_id, limit=20)
+    if not chats:
+        bot.answer_callback_query(call.id, "У вас пока нет чатов")
+        return
+    markup = telebot.types.InlineKeyboardMarkup()
+    for cid, title, created, last_msg, msg_count in chats:
+        when = time.strftime('%d.%m %H:%M', time.localtime(last_msg)) if last_msg else "—"
+        label = f"💬 {title[:30]} • {msg_count} • {when}"
+        markup.add(telebot.types.InlineKeyboardButton(label, callback_data=f"open_chat_{cid}"))
+    markup.add(telebot.types.InlineKeyboardButton("➕ Новый чат", callback_data="new_chat"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_chat"))
+    try:
+        bot.edit_message_text(
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "      💬 МОИ ЧАТЫ\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Выбери чат чтобы продолжить 👇",
+            chat_id=chat_id, message_id=call.message.message_id,
+            parse_mode='HTML', reply_markup=markup)
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("open_chat_"))
+def open_chat_handler(call):
+    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
+        return
+    chat_id = call.message.chat.id
+    try:
+        chat_db_id = int(call.data.replace("open_chat_", ""))
+    except ValueError:
+        return
+    chat_info = get_chat_by_id(chat_id, chat_db_id)
+    if not chat_info:
+        bot.answer_callback_query(call.id, "❌ Чат не найден")
+        return
+
+    update_user(chat_id, 'state', f'chat:{chat_db_id}')
+    # Обновляем last_message чтобы чат был первым в списке
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("UPDATE chats SET last_message=? WHERE id=?", (int(time.time()), chat_db_id))
+    conn.commit()
+    conn.close()
+
+    user = get_user(chat_id)
+    tokens = user[0]
+    title = chat_info[1]
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("🗑 Удалить чат", callback_data=f"del_chat_{chat_db_id}"))
+    markup.add(telebot.types.InlineKeyboardButton("✏️ Переименовать", callback_data=f"ren_chat_{chat_db_id}"))
+    markup.add(telebot.types.InlineKeyboardButton("➕ Новый чат", callback_data="new_chat"))
+    markup.add(telebot.types.InlineKeyboardButton("💬 Мои чаты", callback_data="my_chats"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_chat"))
+    try:
+        bot.edit_message_text(
+            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"     💬 ЧАТ ОТКРЫТ\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📌 <b>{escape_html(title)}</b>\n"
+            f"💰 Баланс: <b>{tokens}</b>\n\n"
+            f"💡 Пиши сообщение 👇",
+            chat_id=chat_id, message_id=call.message.message_id,
+            parse_mode='HTML', reply_markup=markup)
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id, "✅ Чат открыт")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("del_chat_"))
+def del_chat_handler(call):
+    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
+        return
+    chat_id = call.message.chat.id
+    try:
+        chat_db_id = int(call.data.replace("del_chat_", ""))
+    except ValueError:
+        return
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("✅ Да, удалить", callback_data=f"del_chat_yes_{chat_db_id}"))
+    markup.add(telebot.types.InlineKeyboardButton("❌ Отмена", callback_data=f"open_chat_{chat_db_id}"))
+    try:
+        bot.edit_message_text(
+            "⚠️ <b>Удалить этот чат?</b>\n\n"
+            "Все сообщения будут удалены безвозвратно.",
+            chat_id=chat_id, message_id=call.message.message_id,
+            parse_mode='HTML', reply_markup=markup)
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("del_chat_yes_"))
+def del_chat_yes(call):
+    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
+        return
+    chat_id = call.message.chat.id
+    try:
+        chat_db_id = int(call.data.replace("del_chat_yes_", ""))
+    except ValueError:
+        return
+    delete_chat(chat_id, chat_db_id)
+    # Открываем следующий чат или создаём новый
+    active = get_or_create_active_chat(chat_id)
+    update_user(chat_id, 'state', f'chat:{active}')
+    bot.answer_callback_query(call.id, "🗑 Чат удалён")
+    my_chats_handler(call)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("ren_chat_"))
+def ren_chat_handler(call):
+    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
+        return
+    chat_id = call.message.chat.id
+    try:
+        chat_db_id = int(call.data.replace("ren_chat_", ""))
+    except ValueError:
+        return
+    sent = bot.send_message(chat_id, "✏️ Введи новое название чата:", reply_markup=back_to_generate_menu())
+    remember(chat_id, sent.message_id)
+    bot.register_next_step_handler(sent, ren_chat_save, chat_db_id)
+    bot.answer_callback_query(call.id)
+
+
+def ren_chat_save(message, chat_db_id):
+    if message.text == "⬅️ Назад":
+        back_to_main_handler(message.chat.id, message=message)
+        return
+    if send_banned_message(message.chat.id):
+        return
+    new_title = (message.text or "").strip()
+    if not new_title:
+        sent = bot.send_message(message.chat.id, "❌ Пустое название.",
+                                reply_markup=back_to_generate_menu())
+        remember(message.chat.id, sent.message_id)
+        return
+    rename_chat(message.chat.id, chat_db_id, new_title)
+    try:
+        bot.delete_message(message.chat.id, message.message_id)
+    except Exception:
+        pass
+    sent = bot.send_message(message.chat.id, f"✅ Чат переименован: <b>{escape_html(new_title[:50])}</b>",
+                            parse_mode='HTML', reply_markup=chat_menu())
+    remember(message.chat.id, sent.message_id)
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "ai_bob_menu")
@@ -1839,7 +2227,7 @@ def toggle_send_files(call):
         pass
 
 # ============================================================
-# Часть 2: Генерация, GigaChat, чат, редактирование, файлы, история, покупки, тикеты
+# Часть 2: Генерация, GigaChat, чат с ИИ
 # ============================================================
 
 
@@ -2087,8 +2475,12 @@ def img_confirm_yes(call):
 
     image_url = generation_result["url"]
     if not image_url:
-        sent = bot.send_message(chat_id, "❌ Не удалось сгенерировать картинку. Попробуй позже.",
-                                reply_markup=back_to_generate_menu())
+        sent = bot.send_message(
+            chat_id,
+            "⚠️ <b>Сервис генерации временно недоступен.</b>\n\n"
+            "Попробуй позже. Токены <b>не списаны</b>.",
+            parse_mode='HTML',
+            reply_markup=back_to_generate_menu())
         remember(chat_id, sent.message_id)
         return
     try:
@@ -2122,14 +2514,24 @@ def generate_image_bothub(prompt):
     data = {
         "model": "gemini-2.5-flash-image",
         "prompt": prompt,
-        "response_format": "url"
+        "response_format": "url",
+        "max_tokens": 1500
     }
     try:
         r = requests.post(url, headers=headers, json=data, timeout=120)
         result = r.json()
         if "data" in result and len(result["data"]) > 0:
             return result["data"][0].get("url")
-        log_error(f"BotHub response: {result}")
+        if result.get("status") == "error":
+            err = result.get("error", {})
+            code = err.get("code", "")
+            msg = err.get("message", "")
+            if code == "NOT_ENOUGH_TOKENS":
+                log_error(f"⚠️ BotHub: закончился баланс! Пополни bothub.chat")
+            else:
+                log_error(f"BotHub error: {code} — {str(msg)[:200]}")
+            return None
+        log_error(f"BotHub response: {str(result)[:300]}")
         return None
     except Exception as e:
         log_error(f"BotHub error: {e}")
@@ -2225,7 +2627,7 @@ def detect_mode_request(text):
     return mode, ai_mode
 
 
-def ask_gigachat(chat_id, question, mode, ai_mode):
+def ask_gigachat(chat_id, question, mode, ai_mode, user_chat_id=None):
     access_token = get_gigachat_token()
     if not access_token:
         user = get_user(chat_id)
@@ -2245,7 +2647,7 @@ def ask_gigachat(chat_id, question, mode, ai_mode):
                      + MODE_PROMPTS.get(mode_key, MODE_PROMPTS["regular"]) + "\n"
                      + AI_MODE_PROMPTS.get(ai_mode, AI_MODE_PROMPTS["regular"]))
     messages = [{"role": "system", "content": system_prompt}]
-    history = get_history(chat_id, limit=20)
+    history = get_history(chat_id, limit=20, user_chat_id=user_chat_id)
     for role, content in history:
         messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": question})
@@ -2263,8 +2665,8 @@ def ask_gigachat(chat_id, question, mode, ai_mode):
         result = r.json()
         if "choices" in result:
             answer = result["choices"][0]["message"]["content"]
-            add_to_history(chat_id, "user", question)
-            add_to_history(chat_id, "assistant", answer)
+            add_to_history(chat_id, "user", question, user_chat_id=user_chat_id)
+            add_to_history(chat_id, "assistant", answer, user_chat_id=user_chat_id)
             return answer
         return f"❌ Ошибка: {result}"
     except Exception as e:
@@ -2274,7 +2676,7 @@ def ask_gigachat(chat_id, question, mode, ai_mode):
         return f"❌ Ошибка: {e}"
 
 
-def ask_gigachat_with_progress(chat_id, question, mode, ai_mode):
+def ask_gigachat_with_progress(chat_id, question, mode, ai_mode, user_chat_id=None):
     bar_msg = None
     try:
         bar_text = (
@@ -2341,7 +2743,7 @@ def ask_gigachat_with_progress(chat_id, question, mode, ai_mode):
 
     bar_thread = threading.Thread(target=bar_loop, daemon=True)
     bar_thread.start()
-    answer = ask_gigachat(chat_id, question, mode, ai_mode)
+    answer = ask_gigachat(chat_id, question, mode, ai_mode, user_chat_id=user_chat_id)
     stop_typing.set()
     stop_bar.set()
     typing_thread.join(timeout=3)
@@ -2370,11 +2772,9 @@ def ask_gigachat_with_progress(chat_id, question, mode, ai_mode):
 def enter_chat(call):
     if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
         return
-    user = get_user(call.message.chat.id)
+    chat_id = call.message.chat.id
+    user = get_user(chat_id)
     tokens = user[0]
-    mode = user[2]
-    ai_mode = user[3]
-    coder_mode = user[9]
     can_chat = user[13]
     limit_chats = user[15]
     used_chats = user[17]
@@ -2384,7 +2784,7 @@ def enter_chat(call):
         try:
             bot.edit_message_text(
                 "🚫 <b>Вам запрещён чат с ИИ.</b>\n\nОбратитесь в поддержку.",
-                chat_id=call.message.chat.id, message_id=call.message.message_id,
+                chat_id=chat_id, message_id=call.message.message_id,
                 parse_mode='HTML', reply_markup=back_to_generate_menu())
         except Exception:
             pass
@@ -2395,7 +2795,7 @@ def enter_chat(call):
         try:
             bot.edit_message_text(
                 f"🚫 <b>Лимит чата исчерпан.</b>\n\nИспользовано: {used_chats} / {limit_chats}",
-                chat_id=call.message.chat.id, message_id=call.message.message_id,
+                chat_id=chat_id, message_id=call.message.message_id,
                 parse_mode='HTML', reply_markup=back_to_generate_menu())
         except Exception:
             pass
@@ -2407,32 +2807,23 @@ def enter_chat(call):
         markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_generate"))
         try:
             bot.edit_message_text("❌ У вас нет токенов.",
-                                  chat_id=call.message.chat.id, message_id=call.message.message_id,
+                                  chat_id=chat_id, message_id=call.message.message_id,
                                   reply_markup=markup)
         except Exception:
             pass
         bot.answer_callback_query(call.id)
         return
 
-    update_user(call.message.chat.id, 'state', 'chat')
-    if mode == "coder":
-        mode_name = "💻 Кодер (с подсказками)" if coder_mode == "with_hints" else "⚡ Кодер (только код)"
-    else:
-        mode_name = {"regular": "🤖 Обычный ИИ", "explainer": "📖 Объяснятор",
-                     "translator": "🌍 Переводчик"}.get(mode, "🤖 Обычный ИИ")
-    ai_name = {"regular": "🤖 Обычный", "smart": "🧠 Умный", "open": "💬 Откровенный",
-               "uncensored": "🔥 Без цензуры"}.get(ai_mode, "🤖 Обычный")
-    limit_info = ""
-    if limit_chats >= 0:
-        limit_info = f"\n📊 Осталось: <b>{limit_chats - used_chats}</b>"
+    active_chat = get_or_create_active_chat(chat_id)
+    update_user(chat_id, 'state', f'chat:{active_chat}')
+    title = get_chat_title(chat_id, active_chat)
 
     text = (
         f"━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"    🤖 ЧАТ С БОБОМ\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"💰 Баланс: <b>{tokens}</b>\n"
-        f"🎯 Режим: <b>{mode_name}</b>\n"
-        f"🧠 Поведение: <b>{ai_name}</b>{limit_info}\n\n"
+        f"💬 Чат: <b>{escape_html(title)}</b>\n"
+        f"💰 Баланс: <b>{tokens}</b>\n\n"
         f"💡 Что можно написать:\n"
         f"• 🎓 Помоги с учёбой\n"
         f"• 💻 Напиши код на Python\n"
@@ -2441,16 +2832,16 @@ def enter_chat(call):
         f"• 📖 Объясни квантовую физику\n"
         f"• 💡 Придумай идею для бизнеса\n\n"
         f"📎 Можно прислать файл (.txt, .py, .js и др.)\n"
-        f"⚙️ Нажми кнопку ниже чтобы сменить режим 👇\n\n"
+        f"💬 Или открой «Мои чаты» 👇\n\n"
         f"✏️ Пиши свой вопрос:"
     )
     try:
-        bot.edit_message_text(text, chat_id=call.message.chat.id,
+        bot.edit_message_text(text, chat_id=chat_id,
                               message_id=call.message.message_id,
                               parse_mode='HTML', reply_markup=chat_menu())
     except Exception:
-        sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=chat_menu())
-        remember(call.message.chat.id, sent.message_id)
+        sent = bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=chat_menu())
+        remember(chat_id, sent.message_id)
     bot.answer_callback_query(call.id)
 
 
@@ -2511,11 +2902,24 @@ def handle_message(message):
     limit_chats = user[15]
     used_chats = user[17]
     send_files = user[18]
+
     if state.startswith('edit_ready'):
         edit_ask_prompt(message)
         return
-    if state != 'chat':
+
+    # Поддержка state = 'chat' или 'chat:123'
+    if not (state == 'chat' or state.startswith('chat:')):
         return
+
+    if state.startswith('chat:'):
+        try:
+            active_chat_id = int(state.split(':', 1)[1])
+        except (ValueError, IndexError):
+            active_chat_id = get_or_create_active_chat(message.chat.id)
+    else:
+        active_chat_id = get_or_create_active_chat(message.chat.id)
+        update_user(message.chat.id, 'state', f'chat:{active_chat_id}')
+
     if not can_chat:
         update_user(message.chat.id, 'state', 'idle')
         sent = bot.send_message(message.chat.id, "🚫 <b>Вам запрещён чат с ИИ.</b>",
@@ -2538,6 +2942,7 @@ def handle_message(message):
         sent = bot.send_message(message.chat.id, "❌ Токены закончились.", reply_markup=markup)
         remember(message.chat.id, sent.message_id)
         return
+
     new_mode, new_ai_mode = detect_mode_request(message.text)
     if new_mode or new_ai_mode:
         if new_mode:
@@ -2561,27 +2966,34 @@ def handle_message(message):
                     text = ""
                 break
         message.text = text if text.strip() else "Привет"
+
     try:
         bot.delete_message(message.chat.id, message.message_id)
     except Exception:
         pass
+
     add_tokens(message.chat.id, -1)
     log_stat(message.chat.id, 1)
     inc_used(message.chat.id, 'used_chats')
     mark_operation_start(message.chat.id, "ai")
+
     try:
-        answer = ask_gigachat_with_progress(message.chat.id, message.text, mode, ai_mode)
+        answer = ask_gigachat_with_progress(message.chat.id, message.text, mode, ai_mode,
+                                            user_chat_id=active_chat_id)
     finally:
         mark_operation_end(message.chat.id)
+
     tokens_left = get_user(message.chat.id)[0]
     log_action(message.chat.id, "ai", message.text[:200])
     clear_old_logs()
+
     old_ai_msg = _last_ai_message.get(message.chat.id)
     if old_ai_msg:
         try:
             bot.delete_message(message.chat.id, old_ai_msg)
         except Exception:
             pass
+
     if mode == "coder":
         lang = detect_code_language(answer)
         code_name = f"code.{lang}" if lang != "txt" else "code.txt"
@@ -2612,6 +3024,7 @@ def handle_message(message):
             remember(message.chat.id, s.message_id)
             _last_ai_message[message.chat.id] = s.message_id
         return
+
     if send_files or is_code_response(answer):
         lang = detect_code_language(answer)
         filename = f"code.{lang}" if lang != "txt" else "otvet.txt"
@@ -2622,6 +3035,7 @@ def handle_message(message):
             remember(message.chat.id, s.message_id)
             _last_ai_message[message.chat.id] = s.message_id
             return
+
     safe_answer = escape_html(answer)
     if len(safe_answer) > 4000:
         safe_answer = safe_answer[:4000] + "..."
@@ -2635,6 +3049,11 @@ def handle_message(message):
                                 reply_markup=chat_menu())
     remember(message.chat.id, sent.message_id)
     _last_ai_message[message.chat.id] = sent.message_id
+
+# ============================================================
+# Часть 3: Редактирование фото, файлы, история
+# ============================================================
+
 
 # =============================
 # РЕДАКТИРОВАНИЕ ФОТО
@@ -3048,9 +3467,12 @@ def edit_confirm_yes(call):
     result_url = generation_result["url"]
 
     if not result_url:
-        sent = bot.send_message(chat_id,
-                                "❌ Не удалось обработать фото. Попробуй позже.",
-                                reply_markup=back_to_generate_menu())
+        sent = bot.send_message(
+            chat_id,
+            "⚠️ <b>Сервис редактирования временно недоступен.</b>\n\n"
+            "Попробуй позже. Токены <b>не списаны</b>.",
+            parse_mode='HTML',
+            reply_markup=back_to_generate_menu())
         remember(chat_id, sent.message_id)
         edit_photos_cache.pop(chat_id, None)
         return
@@ -3102,7 +3524,8 @@ def edit_photo_bothub(photos_b64, prompt):
     data = {
         "model": "gemini-2.5-flash-image",
         "prompt": prompt,
-        "response_format": "url"
+        "response_format": "url",
+        "max_tokens": 1500
     }
     try:
         r = requests.post(url, headers=headers, data=data, files=files, timeout=180)
@@ -3111,6 +3534,14 @@ def edit_photo_bothub(photos_b64, prompt):
             return result["data"][0].get("url")
         if "url" in result:
             return result["url"]
+        if result.get("status") == "error":
+            err = result.get("error", {})
+            code = err.get("code", "")
+            msg = err.get("message", "")
+            if code == "NOT_ENOUGH_TOKENS":
+                log_error(f"⚠️ BotHub edit: закончился баланс!")
+            else:
+                log_error(f"BotHub edit error: {code} — {str(msg)[:200]}")
         return None
     except Exception as e:
         log_error(f"Edit error: {e}")
@@ -3225,13 +3656,26 @@ def handle_document(message):
     sent = bot.send_message(message.chat.id, info_text, parse_mode='HTML',
                             reply_markup=back_to_generate_menu())
     remember(message.chat.id, sent.message_id)
+
+    # Определяем активный чат
+    user = get_user(message.chat.id)
+    state = user[1]
+    if state.startswith('chat:'):
+        try:
+            active_chat_id = int(state.split(':', 1)[1])
+        except (ValueError, IndexError):
+            active_chat_id = get_or_create_active_chat(message.chat.id)
+    else:
+        active_chat_id = get_or_create_active_chat(message.chat.id)
+
     if caption:
         question = f"Вот содержимое файла:\n\n```\n{text}\n```\n\nЗадание: {caption}"
     else:
         question = f"Вот содержимое файла:\n\n```\n{text}\n```\n\nЧто можно с этим сделать?"
     add_tokens(message.chat.id, -1)
     log_stat(message.chat.id, 1)
-    answer = ask_gigachat_with_progress(message.chat.id, question, "regular", "regular")
+    answer = ask_gigachat_with_progress(message.chat.id, question, "regular", "regular",
+                                        user_chat_id=active_chat_id)
     user = get_user(message.chat.id)
     send_files = user[18]
     tokens_left = user[0]
@@ -3395,656 +3839,77 @@ def hist_chat(call):
         page = int(page_str) if page_str.isdigit() else 1
     else:
         page = 1
-    history = get_history(call.message.chat.id, limit=500)
-    if not history:
+
+    chat_id = call.message.chat.id
+    # Показываем список чатов
+    chats = get_user_chats(chat_id, limit=20)
+    if not chats:
         try:
             bot.edit_message_text(
-                "🤖 История чата пуста.",
-                chat_id=call.message.chat.id, message_id=call.message.message_id,
+                "🤖 У вас пока нет чатов.\n\nНачните чат с ИИ!",
+                chat_id=chat_id, message_id=call.message.message_id,
                 reply_markup=history_menu())
         except Exception:
             pass
         bot.answer_callback_query(call.id)
         return
-    per_page = 20
-    total = len(history)
-    total_pages = max(1, (total + per_page - 1) // per_page)
-    page = max(1, min(page, total_pages))
-    start = (page - 1) * per_page
-    end = start + per_page
-    page_items = history[start:end]
-    text = f"🤖 <b>История ИИ</b> (стр. {page}/{total_pages})\n"
-    text += f"Всего: <b>{total}</b> сообщений\n\n"
-    for role, content in page_items:
+
+    markup = telebot.types.InlineKeyboardMarkup()
+    for cid, title, created, last_msg, msg_count in chats:
+        when = time.strftime('%d.%m %H:%M', time.localtime(last_msg)) if last_msg else "—"
+        label = f"💬 {title[:30]} • {msg_count} • {when}"
+        markup.add(telebot.types.InlineKeyboardButton(label, callback_data=f"hist_view_{cid}"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_history"))
+
+    try:
+        bot.edit_message_text(
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "    🤖 ИСТОРИЯ ЧАТОВ\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Выбери чат чтобы посмотреть 👇",
+            chat_id=chat_id, message_id=call.message.message_id,
+            parse_mode='HTML', reply_markup=markup)
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("hist_view_"))
+def hist_view_chat(call):
+    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
+        return
+    chat_id = call.message.chat.id
+    try:
+        chat_db_id = int(call.data.replace("hist_view_", ""))
+    except ValueError:
+        return
+    messages = get_chat_messages(chat_id, chat_db_id, limit=100)
+    if not messages:
+        bot.answer_callback_query(call.id, "Чат пуст")
+        return
+    title = get_chat_title(chat_id, chat_db_id)
+    text = f"💬 <b>{escape_html(title)}</b>\n\n"
+    for role, content in messages:
         prefix = "👤 <b>Вы:</b> " if role == "user" else "🤖 <b>Боб:</b> "
         short = content[:150] + "..." if len(content) > 150 else content
         text += f"{prefix}{escape_html(short)}\n\n"
     if len(text) > 4000:
-        text = text[:4000] + "..."
+        # Отправим файлом
+        full_text = f"💬 {title}\n\n"
+        for role, content in messages:
+            prefix = "Вы: " if role == "user" else "Боб: "
+            full_text += f"{prefix}{content}\n\n"
+        send_long_text_as_file(chat_id, full_text, filename=f"chat_{chat_db_id}.txt")
+        bot.answer_callback_query(call.id, "📄 Отправлено файлом")
+        return
     markup = telebot.types.InlineKeyboardMarkup()
-    nav = []
-    if page > 1:
-        nav.append(telebot.types.InlineKeyboardButton("⬅️", callback_data=f"hist_chat_page_{page - 1}"))
-    nav.append(telebot.types.InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
-    if page < total_pages:
-        nav.append(telebot.types.InlineKeyboardButton("➡️", callback_data=f"hist_chat_page_{page + 1}"))
-    markup.row(*nav)
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_history"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="hist_chat"))
     try:
-        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id,
+        bot.edit_message_text(text, chat_id=chat_id, message_id=call.message.message_id,
                               parse_mode='HTML', reply_markup=markup)
     except Exception:
-        sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=markup)
-        remember(call.message.chat.id, sent.message_id)
-    bot.answer_callback_query(call.id)
-
-# =============================
-# ПОКУПКИ + ТИКЕТЫ
-# =============================
-
-def save_order(order_id, chat_id, tokens, amount):
-    expires = int(time.time()) + ORDER_TTL
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        "INSERT OR REPLACE INTO orders "
-        "(order_id, chat_id, tokens, amount, created, paid, yoomoney_tx_id, expires) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (order_id, chat_id, tokens, amount, int(time.time()), 0, "", expires)
-    )
-    conn.commit()
-    conn.close()
-
-
-def mark_order_paid(order_id, tx_id=""):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("UPDATE orders SET paid=1, yoomoney_tx_id=? WHERE order_id=?", (tx_id, order_id))
-    conn.commit()
-    conn.close()
-
-
-def get_order(order_id):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT chat_id, tokens FROM orders WHERE order_id=?", (order_id,))
-    row = c.fetchone()
-    conn.close()
-    return row
-
-
-def get_all_orders():
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT order_id, chat_id, tokens, amount, created, paid, yoomoney_tx_id, expires FROM orders ORDER BY created DESC LIMIT 100")
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-
-def get_user_orders_paid(chat_id):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT order_id, tokens, amount, created, yoomoney_tx_id FROM orders WHERE chat_id=? AND paid=1 ORDER BY created DESC LIMIT 50",
-              (chat_id,))
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-
-def get_user_orders_pending(chat_id):
-    cutoff = int(time.time())
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("DELETE FROM orders WHERE chat_id=? AND paid=0 AND expires > 0 AND expires < ?", (chat_id, cutoff))
-    conn.commit()
-    c.execute("SELECT order_id, tokens, amount, created, expires FROM orders WHERE chat_id=? AND paid=0 ORDER BY created DESC LIMIT 50",
-              (chat_id,))
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "menu_buy")
-def buy_tokens(call):
-    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
-        return
-    user = get_user(call.message.chat.id)
-    trial_started = user[4]
-    trial_used = user[5]
-    now = int(time.time())
-    show_gift = False
-    if not trial_used:
-        if trial_started == 0:
-            update_user(call.message.chat.id, 'trial_started', int(time.time()))
-            trial_started = now
-        if now - trial_started < TRIAL_WINDOW:
-            show_gift = True
-    tokens = user[0]
-    if show_gift:
-        left = TRIAL_WINDOW - (now - trial_started)
-        minutes = left // 60
-        text = (
-            "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "   🎁 ПОДАРОК ДЛЯ НОВЫХ\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🎫 <b>10 токенов</b> за <b>50 ₽</b>\n\n"
-            f"⏳ Осталось: <b>{minutes} мин</b>\n\n"
-            "💎 Текущий баланс: " + str(tokens)
-        )
-        try:
-            bot.edit_message_text(text, chat_id=call.message.chat.id,
-                                  message_id=call.message.message_id,
-                                  parse_mode='HTML', reply_markup=gift_menu())
-        except Exception:
-            sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=gift_menu())
-            remember(call.message.chat.id, sent.message_id)
-    else:
-        text = (
-            "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "   💳 ПОКУПКА ТОКЕНОВ\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"💎 Баланс: <b>{tokens}</b>\n\n"
-            "Выбери пакет 👇"
-        )
-        try:
-            bot.edit_message_text(text, chat_id=call.message.chat.id,
-                                  message_id=call.message.message_id,
-                                  parse_mode='HTML', reply_markup=buy_menu(call.message.chat.id))
-        except Exception:
-            sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML',
-                                    reply_markup=buy_menu(call.message.chat.id))
-            remember(call.message.chat.id, sent.message_id)
-    bot.answer_callback_query(call.id)
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "decline_gift")
-def decline_gift(call):
-    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
-        return
-    tokens = get_user(call.message.chat.id)[0]
-    text = (
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "   💳 ПОКУПКА ТОКЕНОВ\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"💎 Баланс: <b>{tokens}</b>\n\n"
-        "Выбери пакет 👇"
-    )
-    try:
-        bot.edit_message_text(text, chat_id=call.message.chat.id,
-                              message_id=call.message.message_id,
-                              parse_mode='HTML', reply_markup=buy_menu(call.message.chat.id))
-    except Exception:
-        pass
-    bot.answer_callback_query(call.id)
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "pack_trial")
-def pack_trial(call):
-    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
-        return
-    user = get_user(call.message.chat.id)
-    trial_started = user[4]
-    trial_used = user[5]
-    if trial_used:
-        bot.answer_callback_query(call.id, "❌ Подарок уже использован.")
-        return
-    if trial_started == 0:
-        trial_started = int(time.time())
-        update_user(call.message.chat.id, 'trial_started', trial_started)
-    if int(time.time()) - trial_started > TRIAL_WINDOW:
-        bot.answer_callback_query(call.id, "⏳ Время подарка истекло.")
-        return
-    update_user(call.message.chat.id, 'trial_used', 1)
-    create_invoice(call.message.chat.id, TRIAL_PRICE, TRIAL_TOKENS)
-    bot.answer_callback_query(call.id)
-
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("pack_"))
-def pack_selected(call):
-    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
-        return
-    if call.data == "pack_trial":
-        return
-    parts = call.data.split("_")
-    try:
-        amount = int(parts[1])
-        tokens = int(parts[2])
-    except (IndexError, ValueError):
-        return
-    create_invoice(call.message.chat.id, amount, tokens)
-    bot.answer_callback_query(call.id)
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "custom_amount")
-def custom_amount(call):
-    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
-        return
-    bot.answer_callback_query(call.id)
-    try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
-        pass
-    clear_old_messages(call.message.chat.id)
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_buy"))
-    text = (
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "    ✏️ СВОЯ СУММА\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Введи количество токенов\n"
-        f"от <b>{MIN_CUSTOM_TOKENS}</b> до <b>{MAX_CUSTOM_TOKENS}</b>\n\n"
-        f"💰 Цена: <b>5 ₽ за 1 токен</b>\n\n"
-        f"<i>Например: 100 токенов = 500 ₽</i>"
-    )
-    sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=markup)
-    remember(call.message.chat.id, sent.message_id)
-    bot.register_next_step_handler(sent, custom_tokens)
-
-
-def custom_tokens(message):
-    if message.text == "⬅️ Назад":
-        back_to_main_handler(message.chat.id, message=message)
-        return
-    if deny_if_banned_or_maintenance(message.chat.id, message=message):
-        return
-    try:
-        bot.delete_message(message.chat.id, message.message_id)
-    except Exception:
-        pass
-    clear_old_messages(message.chat.id)
-    try:
-        tokens = int(message.text)
-    except ValueError:
-        sent = bot.send_message(message.chat.id, "❌ Введи число.", reply_markup=back_to_generate_menu())
-        remember(message.chat.id, sent.message_id)
-        return
-    if tokens < MIN_CUSTOM_TOKENS or tokens > MAX_CUSTOM_TOKENS:
-        sent = bot.send_message(
-            message.chat.id,
-            f"❌ Неверно.\n\nМинимум: <b>{MIN_CUSTOM_TOKENS}</b>\nМаксимум: <b>{MAX_CUSTOM_TOKENS}</b>",
-            parse_mode='HTML', reply_markup=back_to_generate_menu())
-        remember(message.chat.id, sent.message_id)
-        return
-    amount = tokens * 5
-    create_invoice(message.chat.id, amount, tokens)
-
-
-def create_invoice(chat_id, amount, tokens):
-    order_id = f"ORD-{chat_id}-{tokens}-{amount}"
-    save_order(order_id, chat_id, tokens, amount)
-    pay_url = f"{PAY_BASE_URL}/pay/{amount}/{order_id}"
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton(text=f"💳 Оплатить {amount} ₽", url=pay_url))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_buy"))
-    sent = bot.send_message(
-        chat_id,
-        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"      🧾 СЧЁТ\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🆔 <code>{order_id}</code>\n"
-        f"🎫 Токенов: <b>{tokens}</b>\n"
-        f"💰 Сумма: <b>{amount} ₽</b>\n\n"
-        f"Нажми кнопку ниже 👇\n\n"
-        f"⏳ <i>Счёт действует 20 минут</i>",
-        parse_mode='HTML', reply_markup=markup)
-    remember(chat_id, sent.message_id)
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "menu_my_orders")
-def my_orders(call):
-    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
-        return
-    try:
-        bot.edit_message_text(
-            "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "      🛒 ПОКУПКИ\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━",
-            chat_id=call.message.chat.id, message_id=call.message.message_id,
-            parse_mode='HTML', reply_markup=orders_menu())
-    except Exception:
-        pass
-    bot.answer_callback_query(call.id)
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "my_orders_paid")
-def my_orders_paid(call):
-    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
-        return
-    rows = get_user_orders_paid(call.message.chat.id)
-    if not rows:
-        try:
-            bot.edit_message_text(
-                "✅ Завершённых покупок нет.",
-                chat_id=call.message.chat.id, message_id=call.message.message_id,
-                reply_markup=orders_menu())
-        except Exception:
-            pass
-        bot.answer_callback_query(call.id)
-        return
-    text = "✅ <b>Завершённые покупки:</b>\n\n"
-    for oid, tk, amt, created, tx_id in rows:
-        when = time.strftime('%d.%m.%Y %H:%M', time.localtime(created)) if created else "—"
-        text += f"🧾 <code>{oid}</code>\n💰 {amt} ₽ → <b>{tk}</b> ток.\n📅 {when}\n"
-        if tx_id:
-            text += f"🆔 TX: <code>{tx_id}</code>\n"
-        text += "\n"
-    if len(text) > 4000:
-        text = text[:4000] + "..."
-    try:
-        bot.edit_message_text(text, chat_id=call.message.chat.id,
-                              message_id=call.message.message_id,
-                              parse_mode='HTML', reply_markup=orders_menu())
-    except Exception:
-        pass
-    bot.answer_callback_query(call.id)
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "my_orders_pending")
-def my_orders_pending(call):
-    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
-        return
-    rows = get_user_orders_pending(call.message.chat.id)
-    if not rows:
-        try:
-            bot.edit_message_text(
-                "⏳ Незавершённых покупок нет.",
-                chat_id=call.message.chat.id, message_id=call.message.message_id,
-                reply_markup=orders_menu())
-        except Exception:
-            pass
-        bot.answer_callback_query(call.id)
-        return
-    text = "⏳ <b>Незавершённые покупки:</b>\n\n"
-    markup = telebot.types.InlineKeyboardMarkup()
-    now = int(time.time())
-    for oid, tk, amt, created, expires in rows:
-        left = max(0, expires - now) if expires else 0
-        minutes = left // 60
-        seconds = left % 60
-        text += f"🧾 <code>{oid}</code>\n💰 {amt} ₽ → <b>{tk}</b> ток.\n⏳ Осталось: {minutes}:{seconds:02d}\n\n"
-        markup.add(telebot.types.InlineKeyboardButton(f"💳 Оплатить {amt} ₽", callback_data=f"pay_{oid}"))
-        markup.add(telebot.types.InlineKeyboardButton(f"❌ Отменить #{oid[:15]}", callback_data=f"cancel_{oid}"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_orders"))
-    if len(text) > 4000:
-        text = text[:4000] + "..."
-    try:
-        bot.edit_message_text(text, chat_id=call.message.chat.id,
-                              message_id=call.message.message_id,
-                              parse_mode='HTML', reply_markup=markup)
-    except Exception:
-        pass
-    bot.answer_callback_query(call.id)
-
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("pay_"))
-def pay_order(call):
-    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
-        return
-    order_id = call.data.replace("pay_", "")
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT amount, expires, paid FROM orders WHERE order_id=? AND chat_id=?",
-              (order_id, call.message.chat.id))
-    row = c.fetchone()
-    conn.close()
-    if not row:
-        bot.answer_callback_query(call.id, "❌ Заказ не найден.")
-        return
-    amount, expires, paid = row
-    if paid:
-        bot.answer_callback_query(call.id, "✅ Уже оплачен.")
-        return
-    if expires and int(time.time()) > expires:
-        bot.answer_callback_query(call.id, "⏳ Время истекло.")
-        return
-    pay_url = f"{PAY_BASE_URL}/pay/{amount}/{order_id}"
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton(f"💳 Оплатить {amount} ₽", url=pay_url))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="my_orders_pending"))
-    try:
-        bot.edit_message_text(
-            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"      🧾 СЧЁТ\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🆔 <code>{order_id}</code>\n"
-            f"💰 Сумма: <b>{amount} ₽</b>\n\n"
-            f"Нажми кнопку ниже 👇",
-            chat_id=call.message.chat.id, message_id=call.message.message_id,
-            parse_mode='HTML', reply_markup=markup)
-    except Exception:
-        pass
-    bot.answer_callback_query(call.id)
-
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("cancel_"))
-def cancel_order(call):
-    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
-        return
-    order_id = call.data.replace("cancel_", "")
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("DELETE FROM orders WHERE order_id=? AND chat_id=? AND paid=0",
-              (order_id, call.message.chat.id))
-    conn.commit()
-    conn.close()
-    bot.answer_callback_query(call.id, "❌ Отменено")
-    my_orders_pending(call)
-
-
-# =============================
-# ТИКЕТЫ
-# =============================
-
-def create_ticket(chat_id, username, message, photo_id=None):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("INSERT INTO tickets (chat_id, username, message, photo_id, created) VALUES (?, ?, ?, ?, ?)",
-              (chat_id, username, message, photo_id, int(time.time())))
-    conn.commit()
-    ticket_id = c.lastrowid
-    conn.close()
-    return ticket_id
-
-
-def get_user_tickets(chat_id):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT id, message, answer, status FROM tickets WHERE chat_id=? ORDER BY id DESC LIMIT 10", (chat_id,))
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "ticket_new")
-def ticket_new(call):
-    if send_banned_message(call.message.chat.id):
-        return
-    muted, time_left = check_support_muted(call.message.chat.id)
-    if muted:
-        bot.answer_callback_query(call.id, f"🚫 Подожди {time_left}")
-        return
-    try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
-        pass
-    clear_old_messages(call.message.chat.id)
-    sent = bot.send_message(call.message.chat.id, "📝 Напишите ваш вопрос:",
-                            reply_markup=back_to_generate_menu())
-    remember(call.message.chat.id, sent.message_id)
-    bot.register_next_step_handler(sent, ticket_save)
-
-
-def ticket_save(message):
-    if message.text == "⬅️ Назад":
-        back_to_main_handler(message.chat.id, message=message)
-        return
-    if send_banned_message(message.chat.id):
-        return
-    muted, time_left = check_support_muted(message.chat.id)
-    if muted:
-        sent = bot.send_message(message.chat.id, f"🚫 Подожди {time_left}")
-        remember(message.chat.id, sent.message_id)
-        return
-    user = get_user(message.chat.id)
-    username = user[6] if user[6] else f"ID:{message.chat.id}"
-    text = message.text if message.text else "[без текста]"
-    ticket_id = create_ticket(message.chat.id, username, text)
-    try:
-        bot.delete_message(message.chat.id, message.message_id)
-    except Exception:
-        pass
-    sent = bot.send_message(message.chat.id, f"✅ <b>Тикет #{ticket_id} создан.</b>",
-                            parse_mode='HTML', reply_markup=back_to_generate_menu())
-    remember(message.chat.id, sent.message_id)
-    try:
-        bot.send_message(ADMIN_ID, f"🔔 Новый тикет #{ticket_id} от {username}\n\n{text}")
-    except Exception:
-        pass
-    notify_subscribers(message.chat.id, f"🎫 Новый тикет #{ticket_id}")
-    log_action(message.chat.id, "ticket", text[:100])
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "ticket_my")
-def ticket_my(call):
-    if send_banned_message(call.message.chat.id):
-        return
-    tickets = get_user_tickets(call.message.chat.id)
-    if not tickets:
-        bot.answer_callback_query(call.id, "У вас нет тикетов.")
-        return
-    text = "📋 <b>Ваши тикеты:</b>\n\n"
-    for tid, msg, ans, status in tickets:
-        st = {"open": "⏳ ожидает", "done": "✅ выполнен", "closed": "✅ отвечен"}.get(status, status)
-        text += f"<b>#{tid}</b> ({st})\n{escape_html(msg)}\n"
-        if ans:
-            text += f"💬 Ответ: {escape_html(ans)}\n"
-        text += "\n"
-    if len(text) > 4000:
-        text = text[:4000] + "..."
-    try:
-        bot.edit_message_text(text, chat_id=call.message.chat.id,
-                              message_id=call.message.message_id,
-                              parse_mode='HTML', reply_markup=back_to_generate_menu())
-    except Exception:
-        pass
-    bot.answer_callback_query(call.id)
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "maint_support")
-def maint_support(call):
-    if send_banned_message(call.message.chat.id):
-        return
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("📝 Написать тикет", callback_data="maint_ticket_new"))
-    markup.add(telebot.types.InlineKeyboardButton("📋 Мои тикеты", callback_data="maint_ticket_my"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="maint_back"))
-    try:
-        bot.edit_message_text(
-            "🆘 <b>Поддержка</b>\n────────────────\nЧто вы хотите сделать?",
-            chat_id=call.message.chat.id, message_id=call.message.message_id,
-            parse_mode='HTML', reply_markup=markup)
-    except Exception:
-        pass
-    bot.answer_callback_query(call.id)
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "maint_back")
-def maint_back(call):
-    if send_banned_message(call.message.chat.id):
-        return
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT message FROM maintenance WHERE id=1")
-    row = c.fetchone()
-    conn.close()
-    msg = row[0] if row and row[0] else "Технические работы"
-    try:
-        bot.edit_message_text(f"🛠 <b>{escape_html(msg)}</b>",
-                              chat_id=call.message.chat.id, message_id=call.message.message_id,
-                              parse_mode='HTML', reply_markup=maintenance_menu())
-    except Exception:
-        pass
-    bot.answer_callback_query(call.id)
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "maint_ticket_new")
-def maint_ticket_new(call):
-    if send_banned_message(call.message.chat.id):
-        return
-    muted, time_left = check_support_muted(call.message.chat.id)
-    if muted:
-        bot.answer_callback_query(call.id, f"🚫 Подожди {time_left}")
-        return
-    try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
-        pass
-    clear_old_messages(call.message.chat.id)
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="maint_support"))
-    sent = bot.send_message(call.message.chat.id, "📝 Напишите ваш вопрос:", reply_markup=markup)
-    remember(call.message.chat.id, sent.message_id)
-    bot.register_next_step_handler(sent, maint_ticket_save)
-
-
-def maint_ticket_save(message):
-    if message.text == "⬅️ Назад":
-        back_to_main_handler(message.chat.id, message=message)
-        return
-    if send_banned_message(message.chat.id):
-        return
-    muted, time_left = check_support_muted(message.chat.id)
-    if muted:
-        sent = bot.send_message(message.chat.id, f"🚫 Подожди {time_left}")
-        remember(message.chat.id, sent.message_id)
-        return
-    user = get_user(message.chat.id)
-    username = user[6] if user[6] else f"ID:{message.chat.id}"
-    text = message.text if message.text else "[без текста]"
-    ticket_id = create_ticket(message.chat.id, username, text)
-    try:
-        bot.delete_message(message.chat.id, message.message_id)
-    except Exception:
-        pass
-    clear_old_messages(message.chat.id)
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="maint_support"))
-    sent = bot.send_message(message.chat.id, f"✅ <b>Тикет #{ticket_id} создан.</b>",
-                            parse_mode='HTML', reply_markup=markup)
-    remember(message.chat.id, sent.message_id)
-    try:
-        bot.send_message(ADMIN_ID, f"🔔 Новый тикет #{ticket_id} от {username}\n\n{text}")
-    except Exception:
-        pass
-    notify_subscribers(message.chat.id, f"🎫 Новый тикет #{ticket_id}")
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "maint_ticket_my")
-def maint_ticket_my(call):
-    if send_banned_message(call.message.chat.id):
-        return
-    tickets = get_user_tickets(call.message.chat.id)
-    if not tickets:
-        bot.answer_callback_query(call.id, "У вас нет тикетов.")
-        return
-    text = "📋 <b>Ваши тикеты:</b>\n\n"
-    for tid, msg, ans, status in tickets:
-        st = {"open": "⏳ ожидает", "done": "✅ выполнен", "closed": "✅ отвечен"}.get(status, status)
-        text += f"<b>#{tid}</b> ({st})\n{escape_html(msg)}\n"
-        if ans:
-            text += f"💬 Ответ: {escape_html(ans)}\n"
-        text += "\n"
-    if len(text) > 4000:
-        text = text[:4000] + "..."
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="maint_support"))
-    try:
-        bot.edit_message_text(text, chat_id=call.message.chat.id,
-                              message_id=call.message.message_id,
-                              parse_mode='HTML', reply_markup=markup)
-    except Exception:
-        pass
+        sent = bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=markup)
+        remember(chat_id, sent.message_id)
     bot.answer_callback_query(call.id)
 
 # ============================================================
@@ -4444,6 +4309,7 @@ def wipe_user_data(chat_id, what="all"):
     c = conn.cursor()
     if what in ("all", "chat"):
         c.execute("DELETE FROM history WHERE chat_id=?", (chat_id,))
+        c.execute("DELETE FROM chats WHERE chat_id=?", (chat_id,))
     if what in ("all", "image"):
         c.execute("DELETE FROM image_history WHERE chat_id=? AND kind='gen'", (chat_id,))
     if what in ("all", "edit"):
@@ -4458,6 +4324,7 @@ def wipe_user_data(chat_id, what="all"):
         c.execute("DELETE FROM action_logs WHERE chat_id=?", (chat_id,))
         c.execute("DELETE FROM subscriptions WHERE user_id=?", (chat_id,))
         c.execute("DELETE FROM active_operations WHERE chat_id=?", (chat_id,))
+        c.execute("DELETE FROM user_settings WHERE chat_id=?", (chat_id,))
     conn.commit()
     conn.close()
 
@@ -4467,6 +4334,7 @@ def wipe_all_data(what="all"):
     c = conn.cursor()
     if what in ("all", "chat"):
         c.execute("DELETE FROM history")
+        c.execute("DELETE FROM chats")
     if what in ("all", "image"):
         c.execute("DELETE FROM image_history WHERE kind='gen'")
     if what in ("all", "edit"):
@@ -4482,6 +4350,7 @@ def wipe_all_data(what="all"):
         c.execute("DELETE FROM subscriptions")
         c.execute("DELETE FROM active_operations")
         c.execute("DELETE FROM maintenance_notified")
+        c.execute("DELETE FROM user_settings")
         c.execute("""UPDATE users SET 
             tokens = 0, state = 'idle', trial_started = 0, trial_used = 0,
             used_images = 0, used_chats = 0, used_edits = 0
@@ -5974,11 +5843,6 @@ def send_startup_report():
 # FLASK API ДЛЯ МИНИ-АППЫ
 # ============================================================
 
-import hmac as _hmac
-import hashlib as _hashlib
-import json as _json
-
-
 def verify_init_data(init_data):
     try:
         parsed = urllib.parse.parse_qsl(init_data, keep_blank_values=True)
@@ -5987,14 +5851,14 @@ def verify_init_data(init_data):
         if not received_hash:
             return None
         data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(data_dict.items()))
-        secret_key = _hmac.new(b"WebAppData", BOT_TOKEN.encode(), _hashlib.sha256).digest()
-        calculated_hash = _hmac.new(secret_key, data_check_string.encode(), _hashlib.sha256).hexdigest()
-        if not _hmac.compare_digest(calculated_hash, received_hash):
+        secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calculated_hash, received_hash):
             return None
         user_str = data_dict.get("user", "")
         if not user_str:
             return None
-        return _json.loads(user_str)
+        return json.loads(user_str)
     except Exception as e:
         log_error(f"verify_init_data: {e}")
         return None
@@ -6037,6 +5901,7 @@ def webapp_api_me():
         user = get_user(chat_id)
         if user[10]:
             return jsonify({"error": "banned", "reason": user[11] or "не указана"}), 403
+        theme = get_theme(chat_id)
         return jsonify({
             "chat_id": chat_id, "tokens": user[0], "mode": user[2], "ai_mode": user[3],
             "coder_mode": user[9], "is_admin": chat_id == ADMIN_ID,
@@ -6046,6 +5911,7 @@ def webapp_api_me():
             "limit_chats": user[15], "used_chats": user[17],
             "send_files": bool(user[18]), "sound_on": bool(user[23]),
             "username": user[6] or "",
+            "theme": theme,
         })
     except Exception as e:
         log_error(f"webapp_api_me: {e}")
@@ -6069,7 +5935,7 @@ def webapp_api_generate():
         try:
             image_url = generate_image_bothub(prompt)
             if not image_url:
-                return jsonify({"error": "Не удалось"}), 500
+                return jsonify({"error": "Сервис недоступен, попробуйте позже"}), 500
             add_tokens(chat_id, -IMAGE_COST)
             log_stat(chat_id, IMAGE_COST)
             add_image_history(chat_id, prompt, image_url, kind="gen")
@@ -6094,22 +5960,118 @@ def webapp_api_chat():
         question = (data.get("question") or "").strip()
         if not question:
             return jsonify({"error": "Пусто"}), 400
+        user_chat_db_id = data.get("chat_db_id", None)
+        if user_chat_db_id is None:
+            user_chat_db_id = get_or_create_active_chat(chat_id)
+        else:
+            user_chat_db_id = int(user_chat_db_id)
+
         user = get_user(chat_id)
         if user[10] or not user[13] or (user[15] >= 0 and user[17] >= user[15]) or user[0] < 1:
             return jsonify({"error": "Недоступно"}), 403
         mark_operation_start(chat_id, "ai")
         try:
-            answer = ask_gigachat(chat_id, question, user[2], user[3])
+            answer = ask_gigachat(chat_id, question, user[2], user[3], user_chat_id=user_chat_db_id)
             add_tokens(chat_id, -1)
             log_stat(chat_id, 1)
             inc_used(chat_id, 'used_chats')
             log_action(chat_id, "ai", question[:200])
             new_balance = get_user(chat_id)[0]
-            return jsonify({"answer": answer, "balance": new_balance})
+            title = get_chat_title(chat_id, user_chat_db_id)
+            return jsonify({"answer": answer, "balance": new_balance,
+                           "chat_db_id": user_chat_db_id, "title": title})
         finally:
             mark_operation_end(chat_id)
     except Exception as e:
         log_error(f"webapp_api_chat: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/webapp/api/chats/list', methods=['POST'])
+def webapp_api_chats_list():
+    try:
+        data = request.get_json() or {}
+        chat_id = api_auth(data)
+        if not chat_id:
+            return jsonify({"error": "unauthorized"}), 401
+        chats = get_user_chats(chat_id, limit=30)
+        items = []
+        for cid, title, created, last_msg, msg_count in chats:
+            items.append({
+                "id": cid,
+                "title": title,
+                "created": created,
+                "last_message": last_msg,
+                "msg_count": msg_count,
+            })
+        return jsonify({"items": items})
+    except Exception as e:
+        log_error(f"webapp_api_chats_list: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/webapp/api/chats/create', methods=['POST'])
+def webapp_api_chats_create():
+    try:
+        data = request.get_json() or {}
+        chat_id = api_auth(data)
+        if not chat_id:
+            return jsonify({"error": "unauthorized"}), 401
+        new_id = create_new_chat(chat_id)
+        title = get_chat_title(chat_id, new_id)
+        return jsonify({"ok": True, "chat_db_id": new_id, "title": title})
+    except Exception as e:
+        log_error(f"webapp_api_chats_create: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/webapp/api/chats/delete', methods=['POST'])
+def webapp_api_chats_delete():
+    try:
+        data = request.get_json() or {}
+        chat_id = api_auth(data)
+        if not chat_id:
+            return jsonify({"error": "unauthorized"}), 401
+        chat_db_id = int(data.get("chat_db_id", 0))
+        delete_chat(chat_id, chat_db_id)
+        return jsonify({"ok": True})
+    except Exception as e:
+        log_error(f"webapp_api_chats_delete: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/webapp/api/chats/rename', methods=['POST'])
+def webapp_api_chats_rename():
+    try:
+        data = request.get_json() or {}
+        chat_id = api_auth(data)
+        if not chat_id:
+            return jsonify({"error": "unauthorized"}), 401
+        chat_db_id = int(data.get("chat_db_id", 0))
+        new_title = (data.get("title") or "").strip()
+        if not new_title:
+            return jsonify({"error": "Пусто"}), 400
+        rename_chat(chat_id, chat_db_id, new_title)
+        return jsonify({"ok": True})
+    except Exception as e:
+        log_error(f"webapp_api_chats_rename: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/webapp/api/chats/messages', methods=['POST'])
+def webapp_api_chats_messages():
+    try:
+        data = request.get_json() or {}
+        chat_id = api_auth(data)
+        if not chat_id:
+            return jsonify({"error": "unauthorized"}), 401
+        chat_db_id = int(data.get("chat_db_id", 0))
+        messages = get_chat_messages(chat_id, chat_db_id, limit=200)
+        items = [{"role": r, "content": c} for r, c in messages]
+        title = get_chat_title(chat_id, chat_db_id)
+        return jsonify({"items": items, "title": title})
+    except Exception as e:
+        log_error(f"webapp_api_chats_messages: {e}")
         return jsonify({"error": str(e)}), 500
 
 
@@ -6136,9 +6098,14 @@ def webapp_api_history_chat():
         chat_id = api_auth(data)
         if not chat_id:
             return jsonify({"error": "unauthorized"}), 401
-        rows = get_history(chat_id, limit=100)
+        user_chat_db_id = data.get("chat_db_id", None)
+        if user_chat_db_id is None:
+            user_chat_db_id = get_or_create_active_chat(chat_id)
+        else:
+            user_chat_db_id = int(user_chat_db_id)
+        rows = get_chat_messages(chat_id, user_chat_db_id, limit=100)
         items = [{"role": r, "content": c} for r, c in rows]
-        return jsonify({"items": items})
+        return jsonify({"items": items, "chat_db_id": user_chat_db_id})
     except Exception as e:
         log_error(f"webapp_api_history_chat: {e}")
         return jsonify({"error": str(e)}), 500
@@ -6188,6 +6155,10 @@ def webapp_api_settings():
             new_val = 0 if user[23] else 1
             update_user(chat_id, 'sound_on', new_val)
             return jsonify({"ok": True, "value": new_val})
+        elif field == "theme":
+            theme = data.get("value", "ocean")
+            set_theme(chat_id, theme)
+            return jsonify({"ok": True, "theme": theme})
         else:
             return jsonify({"error": "bad field"}), 400
         return jsonify({"ok": True})
@@ -6203,9 +6174,9 @@ def webapp_api_new_chat():
         chat_id = api_auth(data)
         if not chat_id:
             return jsonify({"error": "unauthorized"}), 401
-        clear_history(chat_id)
+        new_id = create_new_chat(chat_id)
         log_action(chat_id, "ai", "new_chat")
-        return jsonify({"ok": True})
+        return jsonify({"ok": True, "chat_db_id": new_id})
     except Exception as e:
         log_error(f"webapp_api_new_chat: {e}")
         return jsonify({"error": str(e)}), 500
@@ -6252,6 +6223,12 @@ def webapp_api_file():
         if u[10] or not u[13] or (u[15] >= 0 and u[17] >= u[15]) or u[0] < 1:
             return jsonify({"error": "Недоступно"}), 403
 
+        chat_db_id = request.form.get("chat_db_id", "")
+        if chat_db_id and chat_db_id.isdigit():
+            chat_db_id = int(chat_db_id)
+        else:
+            chat_db_id = get_or_create_active_chat(chat_id)
+
         caption = (request.form.get("caption") or "").strip()
         if caption:
             prompt = f"Файл ({filename}):\n\n```\n{text}\n```\n\nЗадание: {caption}"
@@ -6260,7 +6237,7 @@ def webapp_api_file():
 
         mark_operation_start(chat_id, "ai")
         try:
-            answer = ask_gigachat(chat_id, prompt, u[2], u[3])
+            answer = ask_gigachat(chat_id, prompt, u[2], u[3], user_chat_id=chat_db_id)
         finally:
             mark_operation_end(chat_id)
 
@@ -6269,7 +6246,8 @@ def webapp_api_file():
         inc_used(chat_id, 'used_chats')
         log_action(chat_id, "file", filename[:100])
         new_balance = get_user(chat_id)[0]
-        return jsonify({"answer": answer, "filename": filename, "balance": new_balance})
+        return jsonify({"answer": answer, "filename": filename,
+                       "balance": new_balance, "chat_db_id": chat_db_id})
     except Exception as e:
         log_error(f"webapp_api_file: {e}")
         return jsonify({"error": str(e)}), 500
@@ -6331,9 +6309,12 @@ def webapp_api_admin_stats():
         images_gen = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM image_history WHERE kind='edit'")
         images_edit = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM chats")
+        chats_count = c.fetchone()[0]
         conn.close()
         return jsonify({"users": users_count, "tokens": total_tokens,
-                       "images_gen": images_gen, "images_edit": images_edit})
+                       "images_gen": images_gen, "images_edit": images_edit,
+                       "chats": chats_count})
     except Exception as e:
         log_error(f"webapp_api_admin_stats: {e}")
         return jsonify({"error": str(e)}), 500
@@ -6396,653 +6377,472 @@ WEBAPP_HTML = r'''<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>🐟 Боб AI</title>
+<title>Боб AI</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
 html,body{overscroll-behavior:none;}
+
 :root{
-  --bg:#0a1628;
-  --bg2:#0d1f38;
-  --card:#132a45;
-  --card2:#1a3757;
-  --text:#e8f4ff;
-  --primary:#4a9eff;
-  --primary-dark:#2c7be5;
-  --primary-light:#7bc0ff;
+  --bg:#0a1628;--bg2:#0d1f38;--card:#132a45;--card2:#1a3757;
+  --text:#e8f4ff;--primary:#4a9eff;--primary-dark:#2c7be5;--primary-light:#7bc0ff;
   --grad:linear-gradient(180deg,#5ba8ff 0%,#2c7be5 50%,#1a5fb4 100%);
   --grad-header:linear-gradient(180deg,#4a9eff 0%,#2c7be5 60%,#1a5fb4 100%);
-  --danger:#ff5c5c;
-  --success:#4ade80;
-  --warning:#fbbf24;
+  --danger:#ff5c5c;--success:#4ade80;--warning:#fbbf24;
+  --border:rgba(74,158,255,0.3);--glow:rgba(74,158,255,0.5);
 }
+
+body[data-theme="ocean"]{
+  --bg:#0a1628;--bg2:#0d1f38;--card:#132a45;--card2:#1a3757;
+  --text:#e8f4ff;--primary:#4a9eff;--primary-dark:#2c7be5;--primary-light:#7bc0ff;
+  --grad:linear-gradient(180deg,#5ba8ff 0%,#2c7be5 50%,#1a5fb4 100%);
+  --grad-header:linear-gradient(180deg,#4a9eff 0%,#2c7be5 60%,#1a5fb4 100%);
+  --border:rgba(74,158,255,0.3);--glow:rgba(74,158,255,0.5);
+}
+body[data-theme="night"]{
+  --bg:#000;--bg2:#0a0a0a;--card:#1a1a1a;--card2:#252525;
+  --text:#e0e0e0;--primary:#888;--primary-dark:#666;--primary-light:#aaa;
+  --grad:linear-gradient(180deg,#4a4a4a 0%,#2a2a2a 50%,#1a1a1a 100%);
+  --grad-header:linear-gradient(180deg,#3a3a3a 0%,#222 60%,#111 100%);
+  --border:rgba(150,150,150,0.2);--glow:rgba(150,150,150,0.3);
+}
+body[data-theme="sakura"]{
+  --bg:#2a0f1e;--bg2:#3a1527;--card:#4a1e33;--card2:#5a2440;
+  --text:#ffe8f0;--primary:#ff6fa5;--primary-dark:#e04a82;--primary-light:#ffa5c8;
+  --grad:linear-gradient(180deg,#ff8fb8 0%,#e04a82 50%,#a02560 100%);
+  --grad-header:linear-gradient(180deg,#ff6fa5 0%,#e04a82 60%,#a02560 100%);
+  --border:rgba(255,111,165,0.3);--glow:rgba(255,111,165,0.5);
+}
+body[data-theme="forest"]{
+  --bg:#0a1f12;--bg2:#0d2a17;--card:#13371f;--card2:#1a4528;
+  --text:#e0ffe8;--primary:#4ade80;--primary-dark:#22a85b;--primary-light:#86efac;
+  --grad:linear-gradient(180deg,#6ee89a 0%,#22a85b 50%,#0e6b38 100%);
+  --grad-header:linear-gradient(180deg,#4ade80 0%,#22a85b 60%,#0e6b38 100%);
+  --border:rgba(74,222,128,0.3);--glow:rgba(74,222,128,0.5);
+}
+body[data-theme="fire"]{
+  --bg:#2a0808;--bg2:#3a0d0d;--card:#4a1515;--card2:#5a1a1a;
+  --text:#ffe8e0;--primary:#ff6b3d;--primary-dark:#e04a1a;--primary-light:#ff9c78;
+  --grad:linear-gradient(180deg,#ff8b5a 0%,#e04a1a 50%,#a02500 100%);
+  --grad-header:linear-gradient(180deg,#ff6b3d 0%,#e04a1a 60%,#a02500 100%);
+  --border:rgba(255,107,61,0.3);--glow:rgba(255,107,61,0.5);
+}
+body[data-theme="ice"]{
+  --bg:#0a1e2a;--bg2:#0d2a38;--card:#133a4a;--card2:#1a4a5a;
+  --text:#e0f8ff;--primary:#5ddcff;--primary-dark:#2aa8cc;--primary-light:#a0eeff;
+  --grad:linear-gradient(180deg,#8ae4ff 0%,#2aa8cc 50%,#006680 100%);
+  --grad-header:linear-gradient(180deg,#5ddcff 0%,#2aa8cc 60%,#006680 100%);
+  --border:rgba(93,220,255,0.3);--glow:rgba(93,220,255,0.5);
+}
+body[data-theme="gold"]{
+  --bg:#1a1400;--bg2:#2a2000;--card:#3a2c00;--card2:#4a3a00;
+  --text:#fff8e0;--primary:#ffb800;--primary-dark:#cc8a00;--primary-light:#ffd75c;
+  --grad:linear-gradient(180deg,#ffd75c 0%,#cc8a00 50%,#805500 100%);
+  --grad-header:linear-gradient(180deg,#ffb800 0%,#cc8a00 60%,#805500 100%);
+  --border:rgba(255,184,0,0.3);--glow:rgba(255,184,0,0.5);
+}
+body[data-theme="neon"]{
+  --bg:#0d0022;--bg2:#150033;--card:#200a44;--card2:#2a1055;
+  --text:#f0e0ff;--primary:#c04dff;--primary-dark:#9520dd;--primary-light:#e08cff;
+  --grad:linear-gradient(180deg,#d47aff 0%,#9520dd 50%,#5c0d99 100%);
+  --grad-header:linear-gradient(180deg,#c04dff 0%,#9520dd 60%,#5c0d99 100%);
+  --border:rgba(192,77,255,0.3);--glow:rgba(192,77,255,0.6);
+}
+body[data-theme="coffee"]{
+  --bg:#1a1008;--bg2:#2a1a0d;--card:#3a2515;--card2:#4a301a;
+  --text:#f5e6d0;--primary:#c8945a;--primary-dark:#a06b30;--primary-light:#e0b088;
+  --grad:linear-gradient(180deg,#e0b088 0%,#a06b30 50%,#6b4518 100%);
+  --grad-header:linear-gradient(180deg,#c8945a 0%,#a06b30 60%,#6b4518 100%);
+  --border:rgba(200,148,90,0.3);--glow:rgba(200,148,90,0.5);
+}
+body[data-theme="light"]{
+  --bg:#f0f4f8;--bg2:#e8eef5;--card:#fff;--card2:#f8fafc;
+  --text:#1a2a3a;--primary:#2c7be5;--primary-dark:#1a5fb4;--primary-light:#5ba8ff;
+  --grad:linear-gradient(180deg,#5ba8ff 0%,#2c7be5 50%,#1a5fb4 100%);
+  --grad-header:linear-gradient(180deg,#4a9eff 0%,#2c7be5 60%,#1a5fb4 100%);
+  --border:rgba(44,123,229,0.25);--glow:rgba(44,123,229,0.3);
+}
+
 body{
   font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
   background:linear-gradient(180deg,var(--bg) 0%,var(--bg2) 100%);
-  color:var(--text);
-  min-height:100vh;
-  padding-bottom:20px;
-  position:relative;
-  overflow-x:hidden;
+  color:var(--text);min-height:100vh;padding-bottom:20px;
+  position:relative;overflow-x:hidden;
+  transition:background 0.3s,color 0.3s;
 }
-
-/* === ВОЛНЫ ФОНА === */
 body::before{
-  content:"";
-  position:fixed;
-  bottom:0;left:0;right:0;
-  height:280px;
-  background:
-    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1200 120'%3E%3Cpath d='M0,60 C150,100 350,20 600,60 C850,100 1050,20 1200,60 L1200,120 L0,120 Z' fill='%234a9eff' opacity='0.08'/%3E%3Cpath d='M0,80 C200,40 400,120 600,80 C800,40 1000,120 1200,80 L1200,120 L0,120 Z' fill='%232c7be5' opacity='0.06'/%3E%3C/svg%3E") repeat-x;
-  background-size:1200px 120px;
-  pointer-events:none;
-  z-index:0;
-  animation:waveMove 25s linear infinite;
+  content:"";position:fixed;bottom:0;left:0;right:0;height:280px;
+  background:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1200 120'%3E%3Cpath d='M0,60 C150,100 350,20 600,60 C850,100 1050,20 1200,60 L1200,120 L0,120 Z' fill='%234a9eff' opacity='0.08'/%3E%3C/svg%3E") repeat-x;
+  background-size:1200px 120px;pointer-events:none;z-index:0;
+  animation:waveMove 25s linear infinite;opacity:0.6;
 }
-@keyframes waveMove{
-  from{background-position:0 0;}
-  to{background-position:1200px 0;}
-}
-
-/* === РЫБКИ === */
+@keyframes waveMove{from{background-position:0 0;}to{background-position:1200px 0;}}
 .fish{
-  position:fixed;
-  font-size:24px;
-  opacity:0.15;
-  pointer-events:none;
-  z-index:0;
+  position:fixed;font-size:24px;opacity:0.12;pointer-events:none;z-index:0;
   animation:fishSwim 30s linear infinite;
-  filter:drop-shadow(0 0 6px rgba(74,158,255,0.6));
 }
 .fish:nth-child(1){top:12%;animation-duration:32s;animation-delay:0s;font-size:22px;}
 .fish:nth-child(2){top:28%;animation-duration:42s;animation-delay:-8s;font-size:18px;}
 .fish:nth-child(3){top:48%;animation-duration:38s;animation-delay:-18s;font-size:30px;}
 .fish:nth-child(4){top:68%;animation-duration:45s;animation-delay:-4s;font-size:20px;}
 .fish:nth-child(5){top:82%;animation-duration:36s;animation-delay:-14s;font-size:26px;}
-@keyframes fishSwim{
-  from{transform:translateX(-120px);}
-  to{transform:translateX(calc(100vw + 120px));}
-}
+@keyframes fishSwim{from{transform:translateX(-120px);}to{transform:translateX(calc(100vw + 120px));}}
 
-/* === ШАПКА === */
 .app-header{
-  position:sticky;
-  top:0;
-  z-index:100;
-  background:var(--grad-header);
-  padding:14px 16px;
-  display:flex;
-  align-items:center;
-  gap:12px;
-  box-shadow:
-    0 4px 20px rgba(74,158,255,0.5),
+  position:sticky;top:0;z-index:100;
+  background:var(--grad-header);padding:14px 16px;
+  display:flex;align-items:center;gap:12px;
+  box-shadow:0 4px 20px var(--glow),
     inset 0 1px 0 rgba(255,255,255,0.35),
     inset 0 -1px 0 rgba(0,0,0,0.25);
   border-bottom:2px solid rgba(255,255,255,0.15);
-  position:relative;
-  overflow:hidden;
+  position:relative;overflow:hidden;
 }
 .app-header::before{
-  content:"";
-  position:absolute;
-  top:0;left:0;right:0;
-  height:50%;
+  content:"";position:absolute;top:0;left:0;right:0;height:50%;
   background:linear-gradient(180deg,rgba(255,255,255,0.3) 0%,transparent 100%);
   pointer-events:none;
 }
 .app-header .logo{
   width:40px;height:40px;flex-shrink:0;
   background:linear-gradient(180deg,rgba(255,255,255,0.45) 0%,rgba(255,255,255,0.15) 100%);
-  border-radius:12px;
-  display:flex;align-items:center;justify-content:center;
-  box-shadow:
-    inset 0 1px 0 rgba(255,255,255,0.6),
-    inset 0 -1px 0 rgba(0,0,0,0.15),
-    0 2px 8px rgba(0,0,0,0.2);
-  position:relative;
-  z-index:1;
-  font-size:22px;
+  border-radius:12px;display:flex;align-items:center;justify-content:center;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.6),
+    inset 0 -1px 0 rgba(0,0,0,0.15),0 2px 8px rgba(0,0,0,0.2);
+  position:relative;z-index:1;font-size:22px;
 }
 .app-header .title{
-  font-size:20px;
-  font-weight:800;
-  color:#fff;
-  flex:1;
+  font-size:20px;font-weight:800;color:#fff;flex:1;
   text-shadow:0 2px 4px rgba(0,0,0,0.4), 0 0 20px rgba(255,255,255,0.3);
-  letter-spacing:0.5px;
-  position:relative;z-index:1;
+  letter-spacing:0.5px;position:relative;z-index:1;
 }
 .app-header .balance{
-  font-size:14px;
-  color:#fff;
+  font-size:14px;color:#fff;
   background:linear-gradient(180deg,rgba(255,255,255,0.35) 0%,rgba(255,255,255,0.15) 100%);
-  padding:8px 14px;
-  border-radius:20px;
-  font-weight:800;
+  padding:8px 14px;border-radius:20px;font-weight:800;
   display:flex;align-items:center;gap:6px;
-  box-shadow:
-    inset 0 1px 0 rgba(255,255,255,0.5),
-    inset 0 -1px 0 rgba(0,0,0,0.15),
-    0 2px 8px rgba(0,0,0,0.2);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.5),
+    inset 0 -1px 0 rgba(0,0,0,0.15),0 2px 8px rgba(0,0,0,0.2);
   position:relative;z-index:1;
   text-shadow:0 1px 2px rgba(0,0,0,0.3);
 }
 
-/* === КОНТЕЙНЕР === */
 .container{padding:16px;padding-bottom:100px;position:relative;z-index:1;}
 
-/* === КНОПКИ === */
 .btn{
-  display:flex;
-  align-items:center;
-  gap:14px;
-  padding:16px 20px;
+  display:flex;align-items:center;gap:14px;padding:16px 20px;
   background:linear-gradient(180deg,var(--card2) 0%,var(--card) 100%);
-  border:1px solid rgba(74,158,255,0.35);
-  border-radius:14px;
-  color:var(--text);
-  font-size:16px;
-  font-weight:600;
-  cursor:pointer;
-  transition:all 0.15s;
-  width:100%;
-  text-align:left;
-  box-shadow:
-    inset 0 1px 0 rgba(255,255,255,0.12),
-    0 2px 8px rgba(0,0,0,0.3);
-  margin-bottom:10px;
-  position:relative;
-  overflow:hidden;
+  border:1px solid var(--border);border-radius:14px;
+  color:var(--text);font-size:16px;font-weight:600;
+  cursor:pointer;transition:all 0.15s;
+  width:100%;text-align:left;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.12),0 2px 8px rgba(0,0,0,0.3);
+  margin-bottom:10px;position:relative;overflow:hidden;
 }
 .btn::before{
-  content:"";
-  position:absolute;
-  top:0;left:0;right:0;
-  height:50%;
-  background:linear-gradient(180deg,rgba(74,158,255,0.15) 0%,transparent 100%);
-  pointer-events:none;
+  content:"";position:absolute;top:0;left:0;right:0;height:50%;
+  background:linear-gradient(180deg,var(--glow) 0%,transparent 100%);
+  opacity:0.15;pointer-events:none;
 }
-.btn:active{
-  transform:scale(0.98);
-  box-shadow:
-    inset 0 2px 8px rgba(0,0,0,0.5),
-    0 0 20px rgba(74,158,255,0.5);
-}
+.btn:active{transform:scale(0.98);
+  box-shadow:inset 0 2px 8px rgba(0,0,0,0.5),0 0 20px var(--glow);}
 .btn .ico{
   width:44px;height:44px;flex-shrink:0;
   display:flex;align-items:center;justify-content:center;
-  border-radius:12px;
-  background:linear-gradient(180deg,rgba(74,158,255,0.35) 0%,rgba(44,123,229,0.15) 100%);
-  box-shadow:
-    inset 0 1px 0 rgba(255,255,255,0.35),
+  border-radius:12px;background:linear-gradient(180deg,var(--glow) 0%,transparent 100%);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.35),
     inset 0 -1px 0 rgba(0,0,0,0.2);
-  position:relative;z-index:1;
-  font-size:22px;
+  position:relative;z-index:1;font-size:22px;opacity:0.9;
 }
 .btn .lbl{flex:1;position:relative;z-index:1;}
-.btn .arrow{
-  opacity:0.6;font-size:24px;
-  color:var(--primary-light);
-  position:relative;z-index:1;
-  filter:drop-shadow(0 0 6px rgba(74,158,255,0.7));
-}
+.btn .arrow{opacity:0.6;font-size:24px;color:var(--primary-light);
+  position:relative;z-index:1;filter:drop-shadow(0 0 6px var(--glow));}
 
-/* === ЭКРАНЫ === */
 .screen{display:none;}
 .screen.active{display:block;animation:fadeIn 0.25s;}
-@keyframes fadeIn{
-  from{opacity:0;transform:translateY(10px);}
-  to{opacity:1;transform:translateY(0);}
-}
+@keyframes fadeIn{from{opacity:0;transform:translateY(10px);}to{opacity:1;transform:translateY(0);}}
+
 .screen-header{
-  display:flex;align-items:center;gap:12px;
-  padding:12px 16px;
+  display:flex;align-items:center;gap:12px;padding:12px 16px;
   background:linear-gradient(180deg,var(--card2) 0%,var(--card) 100%);
-  border-radius:14px;
-  margin-bottom:16px;
+  border-radius:14px;margin-bottom:16px;
   position:sticky;top:76px;z-index:50;
-  border:1px solid rgba(74,158,255,0.3);
+  border:1px solid var(--border);
   box-shadow:inset 0 1px 0 rgba(255,255,255,0.12), 0 4px 12px rgba(0,0,0,0.35);
 }
-.back-btn{
-  background:none;border:none;color:var(--primary-light);
+.back-btn{background:none;border:none;color:var(--primary-light);
   font-size:24px;cursor:pointer;padding:4px 10px 4px 0;
   display:flex;align-items:center;
-  filter:drop-shadow(0 0 6px rgba(74,158,255,0.7));
-}
+  filter:drop-shadow(0 0 6px var(--glow));}
 .back-btn:active{opacity:0.6;}
-.screen-title{
-  font-size:17px;font-weight:700;flex:1;
-  text-shadow:0 1px 2px rgba(0,0,0,0.4);
-}
+.screen-title{font-size:17px;font-weight:700;flex:1;
+  text-shadow:0 1px 2px rgba(0,0,0,0.4);}
 
-/* === ИНПУТЫ === */
 .input-wrap{margin-bottom:14px;}
 .input-wrap textarea,.input-wrap input{
   width:100%;padding:14px 16px;
-  background:var(--card);
-  border:1px solid rgba(74,158,255,0.25);
-  border-radius:14px;
-  color:var(--text);
-  font-size:15px;
-  font-family:inherit;
-  resize:none;
-  outline:none;
+  background:var(--card);border:1px solid var(--border);
+  border-radius:14px;color:var(--text);font-size:15px;
+  font-family:inherit;resize:none;outline:none;
   box-shadow:inset 0 2px 6px rgba(0,0,0,0.3);
 }
 .input-wrap textarea:focus,.input-wrap input:focus{
   border-color:var(--primary);
-  box-shadow:inset 0 2px 6px rgba(0,0,0,0.3), 0 0 12px rgba(74,158,255,0.4);
+  box-shadow:inset 0 2px 6px rgba(0,0,0,0.3), 0 0 12px var(--glow);
 }
 .input-wrap textarea{min-height:100px;}
 
-/* === КНОПКА ДЕЙСТВИЯ === */
 .action-btn{
   width:100%;padding:16px;border:none;border-radius:14px;
-  background:var(--grad);
-  color:#fff;font-size:16px;font-weight:700;
+  background:var(--grad);color:#fff;font-size:16px;font-weight:700;
   cursor:pointer;transition:all 0.15s;
-  box-shadow:
-    inset 0 1px 0 rgba(255,255,255,0.4),
-    inset 0 -1px 0 rgba(0,0,0,0.25),
-    0 4px 16px rgba(102,126,234,0.5);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.4),
+    inset 0 -1px 0 rgba(0,0,0,0.25),0 4px 16px var(--glow);
   text-shadow:0 1px 2px rgba(0,0,0,0.3);
 }
 .action-btn:active{transform:scale(0.98);opacity:0.9;}
 .action-btn:disabled{opacity:0.5;cursor:not-allowed;}
 .action-btn.secondary{
   background:linear-gradient(180deg,var(--card2),var(--card));
-  border:1px solid rgba(74,158,255,0.3);
-  color:var(--text);
+  border:1px solid var(--border);color:var(--text);
   box-shadow:inset 0 1px 0 rgba(255,255,255,0.1), 0 2px 8px rgba(0,0,0,0.3);
   text-shadow:none;
 }
 
-/* === ЧАТ === */
-.chat-messages{
-  display:flex;flex-direction:column;gap:12px;margin-bottom:16px;
-  min-height:200px;
-}
-.msg{
-  max-width:85%;padding:12px 16px;border-radius:16px;
+.chat-messages{display:flex;flex-direction:column;gap:12px;margin-bottom:16px;min-height:200px;}
+.msg{max-width:85%;padding:12px 16px;border-radius:16px;
   font-size:15px;line-height:1.45;word-wrap:break-word;
-  white-space:pre-wrap;
-  animation:msgIn 0.25s;
-}
+  white-space:pre-wrap;animation:msgIn 0.25s;}
 @keyframes msgIn{from{opacity:0;transform:translateY(8px);}to{opacity:1;transform:translateY(0);}}
-.msg.user{
-  align-self:flex-end;
-  background:var(--grad);
-  color:#fff;
+.msg.user{align-self:flex-end;background:var(--grad);color:#fff;
   border-bottom-right-radius:4px;
-  box-shadow:
-    inset 0 1px 0 rgba(255,255,255,0.35),
-    0 4px 12px rgba(44,123,229,0.4);
-}
-.msg.bot{
-  align-self:flex-start;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.35),0 4px 12px var(--glow);}
+.msg.bot{align-self:flex-start;
   background:linear-gradient(180deg,var(--card2),var(--card));
-  color:var(--text);
-  border-bottom-left-radius:4px;
-  border:1px solid rgba(74,158,255,0.25);
-  box-shadow:inset 0 1px 0 rgba(255,255,255,0.08), 0 2px 8px rgba(0,0,0,0.25);
-}
-.chat-hints{
-  padding:16px;
-  background:rgba(74,158,255,0.08);
-  border:1px solid rgba(74,158,255,0.25);
-  border-radius:14px;
-  margin-bottom:12px;
-  font-size:13px;
-  line-height:1.6;
-}
-.chat-hints .title{
-  font-weight:700;
-  color:var(--primary-light);
-  margin-bottom:8px;
-  font-size:14px;
-}
-.chat-hints .hint{
-  opacity:0.85;
-  padding:3px 0;
-}
+  color:var(--text);border-bottom-left-radius:4px;
+  border:1px solid var(--border);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.08), 0 2px 8px rgba(0,0,0,0.25);}
+
+.chat-hints{padding:16px;background:var(--glow);opacity:0.85;
+  border:1px solid var(--border);border-radius:14px;
+  margin-bottom:12px;font-size:13px;line-height:1.6;}
+.chat-hints .title{font-weight:700;color:var(--primary-light);
+  margin-bottom:8px;font-size:14px;}
+.chat-hints .hint{opacity:0.9;padding:3px 0;}
 .chat-hints .hint .emoji{margin-right:6px;}
-.chat-mode-badge{
-  display:flex;gap:8px;padding:0 0 10px 0;flex-wrap:wrap;
-}
-.badge{
-  padding:6px 12px;
-  background:linear-gradient(180deg,rgba(74,158,255,0.3),rgba(74,158,255,0.1));
-  border:1px solid rgba(74,158,255,0.4);
-  border-radius:16px;
-  font-size:12px;
-  font-weight:600;
-  color:var(--primary-light);
-  box-shadow:inset 0 1px 0 rgba(255,255,255,0.2);
-}
 
-/* === ПРОГРЕСС === */
+.chat-mode-badge{display:flex;gap:8px;padding:0 0 10px 0;flex-wrap:wrap;}
+.badge{padding:6px 12px;
+  background:linear-gradient(180deg,var(--glow),transparent);
+  border:1px solid var(--border);border-radius:16px;
+  font-size:12px;font-weight:600;color:var(--primary-light);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.2);}
+
 .progress-wrap{margin:20px 0;}
-.progress-bar{
-  width:100%;height:10px;
-  background:rgba(10,22,40,0.8);
+.progress-bar{width:100%;height:10px;background:rgba(0,0,0,0.4);
   border-radius:10px;overflow:hidden;
-  border:1px solid rgba(74,158,255,0.3);
-  box-shadow:inset 0 2px 6px rgba(0,0,0,0.5);
-}
-.progress-fill{
-  height:100%;
-  background:var(--grad);
-  border-radius:10px;
+  border:1px solid var(--border);
+  box-shadow:inset 0 2px 6px rgba(0,0,0,0.5);}
+.progress-fill{height:100%;background:var(--grad);border-radius:10px;
   transition:width 0.3s ease;
-  box-shadow:0 0 16px rgba(74,158,255,0.8), inset 0 1px 0 rgba(255,255,255,0.4);
-}
-.progress-text{
-  text-align:center;margin-top:12px;font-size:14px;
-  color:var(--primary-light);
-  font-weight:600;
-  text-shadow:0 0 8px rgba(74,158,255,0.5);
-}
+  box-shadow:0 0 16px var(--glow), inset 0 1px 0 rgba(255,255,255,0.4);}
+.progress-text{text-align:center;margin-top:12px;font-size:14px;
+  color:var(--primary-light);font-weight:600;
+  text-shadow:0 0 8px var(--glow);}
 
-/* === РЕЗУЛЬТАТ === */
-.result-img{
-  width:100%;border-radius:16px;
-  box-shadow:
-    0 8px 32px rgba(74,158,255,0.4),
-    0 0 0 1px rgba(74,158,255,0.3);
-  margin-bottom:16px;display:block;
-}
-.result-caption{
-  text-align:center;font-size:14px;
-  color:var(--primary-light);
-  margin-bottom:16px;padding:0 10px;
-  font-weight:600;
-}
+.result-img{width:100%;border-radius:16px;
+  box-shadow:0 8px 32px var(--glow), 0 0 0 1px var(--border);
+  margin-bottom:16px;display:block;}
+.result-caption{text-align:center;font-size:14px;
+  color:var(--primary-light);margin-bottom:16px;padding:0 10px;font-weight:600;}
 
-/* === ЗАГРУЗКА/ОШИБКИ === */
-.loading{
-  text-align:center;padding:60px 20px;
-  color:var(--primary-light);
-  font-size:15px;
-  animation:pulse 1.5s ease-in-out infinite;
-}
+.loading{text-align:center;padding:60px 20px;
+  color:var(--primary-light);font-size:15px;
+  animation:pulse 1.5s ease-in-out infinite;}
 @keyframes pulse{0%,100%{opacity:0.5;}50%{opacity:1;}}
-.err{
-  color:var(--danger);text-align:center;
-  padding:40px 20px;font-size:15px;
-  background:rgba(255,92,92,0.1);
-  border:1px solid rgba(255,92,92,0.3);
-  border-radius:12px;
-}
+.err{color:var(--danger);text-align:center;padding:40px 20px;font-size:15px;
+  background:rgba(255,92,92,0.1);border:1px solid rgba(255,92,92,0.3);
+  border-radius:12px;}
 
-/* === ТАБЫ === */
-.tabs{
-  display:flex;gap:8px;margin-bottom:16px;
-  background:var(--card);
-  padding:5px;border-radius:14px;
-  border:1px solid rgba(74,158,255,0.2);
-  box-shadow:inset 0 2px 6px rgba(0,0,0,0.3);
-}
-.tab{
-  flex:1;padding:11px;background:none;border:none;
-  border-radius:10px;color:var(--text);
-  font-size:14px;font-weight:600;cursor:pointer;
-  opacity:0.6;transition:all 0.15s;
-}
-.tab.active{
-  background:var(--grad);
-  opacity:1;
-  box-shadow:
-    inset 0 1px 0 rgba(255,255,255,0.35),
-    0 2px 8px rgba(44,123,229,0.4);
-}
+.tabs{display:flex;gap:8px;margin-bottom:16px;background:var(--card);
+  padding:5px;border-radius:14px;border:1px solid var(--border);
+  box-shadow:inset 0 2px 6px rgba(0,0,0,0.3);}
+.tab{flex:1;padding:11px;background:none;border:none;
+  border-radius:10px;color:var(--text);font-size:14px;font-weight:600;
+  cursor:pointer;opacity:0.6;transition:all 0.15s;}
+.tab.active{background:var(--grad);opacity:1;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.35),0 2px 8px var(--glow);}
 
-/* === ИСТОРИЯ === */
-.history-grid{
-  display:grid;
-  grid-template-columns:1fr 1fr;
-  gap:10px;
-}
-.history-item{
-  background:linear-gradient(180deg,var(--card2),var(--card));
+.history-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+.history-item{background:linear-gradient(180deg,var(--card2),var(--card));
   border-radius:14px;overflow:hidden;
-  box-shadow:
-    inset 0 1px 0 rgba(255,255,255,0.08),
-    0 2px 8px rgba(0,0,0,0.3);
-  border:1px solid rgba(74,158,255,0.2);
-}
-.history-item img{
-  width:100%;display:block;aspect-ratio:1;
-  object-fit:cover;background:#000;cursor:pointer;
-}
-.history-item .cap{
-  padding:8px 10px;font-size:11px;
-  color:var(--primary-light);
-  white-space:nowrap;overflow:hidden;
-  text-overflow:ellipsis;
-  background:rgba(0,0,0,0.3);
-  font-weight:600;
-}
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.08), 0 2px 8px rgba(0,0,0,0.3);
+  border:1px solid var(--border);}
+.history-item img{width:100%;display:block;aspect-ratio:1;
+  object-fit:cover;background:#000;cursor:pointer;}
+.history-item .cap{padding:8px 10px;font-size:11px;
+  color:var(--primary-light);white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis;background:rgba(0,0,0,0.3);font-weight:600;}
 
-/* === ПОКУПКА === */
-.buy-option{
-  padding:18px;
+.buy-option{padding:18px;
   background:linear-gradient(180deg,var(--card2),var(--card));
-  border:1px solid rgba(74,158,255,0.25);
-  border-radius:14px;
-  margin-bottom:10px;cursor:pointer;
-  text-align:center;font-size:16px;
-  font-weight:700;transition:all 0.15s;
+  border:1px solid var(--border);border-radius:14px;
+  margin-bottom:10px;cursor:pointer;text-align:center;
+  font-size:16px;font-weight:700;transition:all 0.15s;
   display:flex;align-items:center;justify-content:center;gap:10px;
   box-shadow:inset 0 1px 0 rgba(255,255,255,0.08), 0 2px 8px rgba(0,0,0,0.3);
-  position:relative;
-  overflow:hidden;
-}
-.buy-option::before{
-  content:"";
-  position:absolute;top:0;left:0;right:0;height:50%;
-  background:linear-gradient(180deg,rgba(74,158,255,0.12) 0%,transparent 100%);
-  pointer-events:none;
-}
+  position:relative;overflow:hidden;}
+.buy-option::before{content:"";position:absolute;top:0;left:0;right:0;height:50%;
+  background:linear-gradient(180deg,var(--glow) 0%,transparent 100%);
+  opacity:0.12;pointer-events:none;}
 .buy-option:active{transform:scale(0.98);opacity:0.85;}
-.buy-option.best{
-  border-color:var(--primary);
-  background:linear-gradient(180deg,rgba(74,158,255,0.25),rgba(44,123,229,0.15));
-  box-shadow:
-    inset 0 1px 0 rgba(255,255,255,0.2),
-    0 0 24px rgba(74,158,255,0.5);
-}
+.buy-option.best{border-color:var(--primary);
+  background:linear-gradient(180deg,var(--glow),transparent);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.2),0 0 24px var(--glow);}
 
-/* === СЕКЦИИ === */
-.section-title{
-  font-size:12px;color:var(--primary-light);
-  text-transform:uppercase;
-  letter-spacing:1.5px;
+.section-title{font-size:12px;color:var(--primary-light);
+  text-transform:uppercase;letter-spacing:1.5px;
   margin:20px 0 10px;font-weight:700;padding-left:4px;
-  text-shadow:0 0 8px rgba(74,158,255,0.5);
-}
+  text-shadow:0 0 8px var(--glow);}
 
-/* === НАСТРОЙКИ === */
-.setting-row{
-  display:flex;align-items:center;justify-content:space-between;
-  padding:16px;
-  background:linear-gradient(180deg,var(--card2),var(--card));
+.setting-row{display:flex;align-items:center;justify-content:space-between;
+  padding:16px;background:linear-gradient(180deg,var(--card2),var(--card));
   border-radius:14px;margin-bottom:10px;
-  border:1px solid rgba(74,158,255,0.25);
-  cursor:pointer;
-  box-shadow:inset 0 1px 0 rgba(255,255,255,0.08), 0 2px 8px rgba(0,0,0,0.25);
-}
-.setting-row .lbl{
-  font-size:15px;
-  display:flex;align-items:center;gap:12px;
-  font-weight:600;
-}
-.setting-row .toggle{
-  width:50px;height:28px;border-radius:20px;
-  background:rgba(10,22,40,0.8);
-  position:relative;cursor:pointer;
+  border:1px solid var(--border);cursor:pointer;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.08), 0 2px 8px rgba(0,0,0,0.25);}
+.setting-row .lbl{font-size:15px;display:flex;align-items:center;
+  gap:12px;font-weight:600;}
+.setting-row .toggle{width:50px;height:28px;border-radius:20px;
+  background:rgba(0,0,0,0.5);position:relative;cursor:pointer;
   transition:background 0.2s;flex-shrink:0;
-  border:1px solid rgba(74,158,255,0.3);
-  box-shadow:inset 0 2px 4px rgba(0,0,0,0.5);
-}
-.setting-row .toggle.on{
-  background:var(--grad);
-  box-shadow:
-    inset 0 2px 4px rgba(0,0,0,0.3),
-    0 0 16px rgba(74,158,255,0.6);
-}
-.setting-row .toggle::after{
-  content:"";position:absolute;
+  border:1px solid var(--border);
+  box-shadow:inset 0 2px 4px rgba(0,0,0,0.5);}
+.setting-row .toggle.on{background:var(--grad);
+  box-shadow:inset 0 2px 4px rgba(0,0,0,0.3),0 0 16px var(--glow);}
+.setting-row .toggle::after{content:"";position:absolute;
   top:3px;left:3px;width:20px;height:20px;
-  border-radius:50%;background:#fff;
-  transition:transform 0.2s;
-  box-shadow:0 2px 6px rgba(0,0,0,0.4);
-}
+  border-radius:50%;background:#fff;transition:transform 0.2s;
+  box-shadow:0 2px 6px rgba(0,0,0,0.4);}
 .setting-row .toggle.on::after{transform:translateX(22px);}
 
-/* === РЕЖИМЫ === */
-.mode-option{
-  padding:14px 18px;
+.mode-option{padding:14px 18px;
   background:linear-gradient(180deg,var(--card2),var(--card));
-  border:1px solid rgba(74,158,255,0.25);
-  border-radius:12px;
+  border:1px solid var(--border);border-radius:12px;
   margin-bottom:8px;cursor:pointer;
   display:flex;align-items:center;gap:12px;
-  font-size:15px;font-weight:500;
-  transition:all 0.15s;
-  box-shadow:inset 0 1px 0 rgba(255,255,255,0.06), 0 2px 6px rgba(0,0,0,0.2);
-}
+  font-size:15px;font-weight:500;transition:all 0.15s;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.06), 0 2px 6px rgba(0,0,0,0.2);}
 .mode-option:active{transform:scale(0.98);}
-.mode-option.active{
-  border-color:var(--primary);
-  background:linear-gradient(180deg,rgba(74,158,255,0.25),rgba(44,123,229,0.15));
-  box-shadow:
-    inset 0 1px 0 rgba(255,255,255,0.15),
-    0 0 16px rgba(74,158,255,0.4);
-}
-.mode-option .check{
-  margin-left:auto;font-size:20px;
+.mode-option.active{border-color:var(--primary);
+  background:linear-gradient(180deg,var(--glow),transparent);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.15),0 0 16px var(--glow);}
+.mode-option .check{margin-left:auto;font-size:20px;
   color:var(--primary-light);opacity:0;
-  filter:drop-shadow(0 0 6px rgba(74,158,255,0.9));
-}
+  filter:drop-shadow(0 0 6px var(--glow));}
 .mode-option.active .check{opacity:1;}
 
-/* === ФАЙЛ === */
-.upload-preview{
-  margin-top:14px;padding:14px;
-  background:rgba(74,158,255,0.12);
-  border-radius:12px;
-  border:1px solid rgba(74,158,255,0.4);
-  font-size:13px;
-}
-.upload-preview .name{font-weight:700;margin-bottom:4px;word-break:break-all;color:var(--primary-light);}
-.upload-preview .size{opacity:0.7;font-size:11px;}
+.upload-preview{margin-top:14px;padding:14px;
+  background:var(--glow);opacity:0.2;
+  border-radius:12px;border:1px solid var(--border);font-size:13px;}
+.upload-preview .name{font-weight:700;margin-bottom:4px;
+  word-break:break-all;color:var(--primary-light);}
+.upload-preview .size{opacity:0.9;font-size:11px;}
 
-/* === МОДАЛКА === */
-.modal-overlay{
-  position:fixed;top:0;left:0;right:0;bottom:0;
-  background:rgba(0,0,0,0.75);
-  z-index:1000;display:none;
+.modal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;
+  background:rgba(0,0,0,0.75);z-index:1000;display:none;
   align-items:center;justify-content:center;padding:24px;
-  backdrop-filter:blur(4px);
-}
+  backdrop-filter:blur(4px);}
 .modal-overlay.active{display:flex;}
-.modal-box{
-  background:linear-gradient(180deg,var(--card2),var(--card));
-  border-radius:20px;padding:24px;
-  width:100%;max-width:340px;
-  border:1px solid rgba(74,158,255,0.35);
-  box-shadow:0 20px 60px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.12);
-}
+.modal-box{background:linear-gradient(180deg,var(--card2),var(--card));
+  border-radius:20px;padding:24px;width:100%;max-width:340px;
+  border:1px solid var(--border);
+  box-shadow:0 20px 60px rgba(0,0,0,0.6),
+    inset 0 1px 0 rgba(255,255,255,0.12);}
 .modal-title{font-size:18px;font-weight:700;margin-bottom:12px;text-align:center;}
 .modal-text{font-size:14px;opacity:0.8;margin-bottom:20px;text-align:center;}
 .modal-buttons{display:flex;gap:10px;}
-.modal-btn{
-  flex:1;padding:14px;border:none;border-radius:12px;
-  font-size:15px;font-weight:600;cursor:pointer;
-}
-.modal-btn.cancel{background:rgba(74,158,255,0.15);color:var(--text);border:1px solid rgba(74,158,255,0.25);}
-.modal-btn.confirm{background:var(--grad);color:#fff;box-shadow:0 4px 12px rgba(74,158,255,0.5);}
+.modal-btn{flex:1;padding:14px;border:none;border-radius:12px;
+  font-size:15px;font-weight:600;cursor:pointer;}
+.modal-btn.cancel{background:var(--glow);opacity:0.3;
+  color:var(--text);border:1px solid var(--border);}
+.modal-btn.confirm{background:var(--grad);color:#fff;
+  box-shadow:0 4px 12px var(--glow);}
 
-/* === СТАТИСТИКА === */
-.stats-grid{
-  display:grid;grid-template-columns:1fr 1fr;
-  gap:10px;margin-bottom:16px;
-}
-.stat-card{
-  padding:18px;
+.stats-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px;}
+.stat-card{padding:18px;
   background:linear-gradient(180deg,var(--card2),var(--card));
-  border-radius:14px;
-  border:1px solid rgba(74,158,255,0.3);
+  border-radius:14px;border:1px solid var(--border);
   box-shadow:inset 0 1px 0 rgba(255,255,255,0.08), 0 2px 8px rgba(0,0,0,0.3);
-  text-align:center;
-}
-.stat-card .num{
-  font-size:26px;font-weight:800;
-  color:var(--primary-light);
-  margin-bottom:4px;
-  text-shadow:0 0 16px rgba(74,158,255,0.7);
-}
-.stat-card .lbl{font-size:12px;color:#8fb8dc;font-weight:600;}
+  text-align:center;}
+.stat-card .num{font-size:26px;font-weight:800;
+  color:var(--primary-light);margin-bottom:4px;
+  text-shadow:0 0 16px var(--glow);}
+.stat-card .lbl{font-size:12px;opacity:0.7;font-weight:600;}
 
-/* === ТИКЕТЫ === */
-.ticket-card{
-  background:linear-gradient(180deg,var(--card2),var(--card));
-  border:1px solid rgba(74,158,255,0.25);
-  border-radius:14px;padding:14px;margin-bottom:10px;
-  box-shadow:inset 0 1px 0 rgba(255,255,255,0.06), 0 2px 8px rgba(0,0,0,0.25);
-}
-.ticket-card .head{
-  display:flex;justify-content:space-between;
-  margin-bottom:8px;font-size:12px;
-}
-.ticket-card .status{
-  padding:2px 10px;border-radius:8px;font-weight:700;
-}
-.ticket-card .status.open{
-  background:rgba(251,191,36,0.2);
-  color:var(--warning);
-  border:1px solid rgba(251,191,36,0.4);
-}
-.ticket-card .status.done{
-  background:rgba(74,222,128,0.2);
-  color:var(--success);
-  border:1px solid rgba(74,222,128,0.4);
-}
+.ticket-card{background:linear-gradient(180deg,var(--card2),var(--card));
+  border:1px solid var(--border);border-radius:14px;
+  padding:14px;margin-bottom:10px;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.06), 0 2px 8px rgba(0,0,0,0.25);}
+.ticket-card .head{display:flex;justify-content:space-between;
+  margin-bottom:8px;font-size:12px;}
+.ticket-card .status{padding:2px 10px;border-radius:8px;font-weight:700;}
+.ticket-card .status.open{background:rgba(251,191,36,0.2);
+  color:var(--warning);border:1px solid rgba(251,191,36,0.4);}
+.ticket-card .status.done{background:rgba(74,222,128,0.2);
+  color:var(--success);border:1px solid rgba(74,222,128,0.4);}
 .ticket-card .msg{font-size:14px;line-height:1.4;margin-bottom:6px;}
-.ticket-card .answer{
-  font-size:13px;padding:10px;
-  background:rgba(74,158,255,0.12);
-  border-radius:10px;
-  border-left:3px solid var(--primary);
-  margin-top:8px;
-}
+.ticket-card .answer{font-size:13px;padding:10px;
+  background:var(--glow);opacity:0.2;
+  border-radius:10px;border-left:3px solid var(--primary);
+  margin-top:8px;}
 
-/* === ПОДДЕРЖКА === */
-.support-btn{
-  display:flex;align-items:center;justify-content:center;gap:10px;
-  padding:18px;width:100%;
+.theme-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+.theme-card{padding:14px;border-radius:14px;cursor:pointer;
+  border:2px solid var(--border);transition:all 0.15s;
+  text-align:center;font-size:13px;font-weight:700;}
+.theme-card:active{transform:scale(0.97);}
+.theme-card.active{border-color:var(--primary);
+  box-shadow:0 0 20px var(--glow);}
+.theme-card .preview{height:40px;border-radius:8px;
+  margin-bottom:8px;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.3);}
+
+.chat-item{display:flex;align-items:center;gap:12px;
+  padding:14px 16px;
   background:linear-gradient(180deg,var(--card2),var(--card));
-  border:1px solid rgba(74,158,255,0.35);
-  border-radius:14px;color:var(--text);
-  font-size:16px;font-weight:600;
-  cursor:pointer;margin-bottom:10px;
-  box-shadow:inset 0 1px 0 rgba(255,255,255,0.1), 0 2px 8px rgba(0,0,0,0.3);
-  transition:all 0.15s;
-}
-.support-btn:active{transform:scale(0.98);}
+  border:1px solid var(--border);border-radius:14px;
+  margin-bottom:8px;cursor:pointer;transition:all 0.15s;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.06), 0 2px 8px rgba(0,0,0,0.25);}
+.chat-item:active{transform:scale(0.98);}
+.chat-item.current{border-color:var(--primary);
+  box-shadow:0 0 16px var(--glow);}
+.chat-item .ico2{width:38px;height:38px;flex-shrink:0;
+  display:flex;align-items:center;justify-content:center;
+  border-radius:10px;font-size:20px;
+  background:linear-gradient(180deg,var(--glow),transparent);
+  opacity:0.9;}
+.chat-item .info{flex:1;min-width:0;}
+.chat-item .info .name{font-size:14px;font-weight:700;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  margin-bottom:2px;}
+.chat-item .info .meta{font-size:11px;opacity:0.6;}
+.chat-item .actions{display:flex;gap:6px;flex-shrink:0;}
+.chat-item .actions .mini-btn{width:32px;height:32px;
+  border-radius:8px;border:1px solid var(--border);
+  background:var(--card);color:var(--text);
+  display:flex;align-items:center;justify-content:center;
+  cursor:pointer;font-size:14px;padding:0;}
+.chat-item .actions .mini-btn:active{transform:scale(0.9);}
 </style>
 </head>
-<body>
+<body data-theme="ocean">
 
-<!-- РЫБКИ -->
 <div class="fish">🐟</div>
 <div class="fish">🐠</div>
 <div class="fish">🐡</div>
 <div class="fish">🐟</div>
 <div class="fish">🦈</div>
 
-<!-- ШАПКА -->
 <div class="app-header">
   <div class="logo">🐟</div>
   <div class="title">Боб AI</div>
@@ -7051,7 +6851,6 @@ body::before{
 
 <div class="container">
 
-<!-- ГЛАВНОЕ МЕНЮ -->
 <div id="screen-main" class="screen active">
   <button class="btn" id="btn-open-generate">
     <div class="ico">🎨</div>
@@ -7090,7 +6889,6 @@ body::before{
   </button>
 </div>
 
-<!-- ГЕНЕРАЦИЯ -->
 <div id="screen-generate" class="screen">
   <div class="screen-header">
     <button class="back-btn" id="btn-back-gen">←</button>
@@ -7111,15 +6909,28 @@ body::before{
   <div id="gen-result" style="display:none;"></div>
 </div>
 
-<!-- ЧАТ -->
 <div id="screen-chat" class="screen">
   <div class="screen-header">
     <button class="back-btn" id="btn-back-chat">←</button>
     <span class="screen-title">🤖 Чат с Бобом</span>
+    <button class="back-btn" id="btn-open-chats" title="Мои чаты">💬</button>
     <button class="back-btn" id="btn-chat-settings" title="Настройки ИИ">⚙️</button>
     <button class="back-btn" id="btn-new-chat" title="Новый чат">➕</button>
   </div>
+
   <div class="chat-mode-badge" id="chat-badges"></div>
+  <div id="chat-current-title" style="font-size:13px;font-weight:700;color:var(--primary-light);padding:0 4px 10px;"></div>
+
+  <div class="input-wrap" id="chat-input-wrap">
+    <textarea id="chat-input" placeholder="Задай вопрос Бобу..." style="min-height:80px;"></textarea>
+  </div>
+
+  <div id="file-preview" style="display:none;" class="upload-preview"></div>
+
+  <input type="file" id="chat-file-input" accept=".txt,.md,.csv,.json,.xml,.yaml,.yml,.py,.js,.html,.css,.php,.java,.c,.cpp,.go,.rs,.rb,.sh,.bat,.log,.ini,.cfg,.sql,.srt,.vtt,.tex,.env,.gitignore" style="display:none;">
+
+  <button class="action-btn secondary" id="btn-attach" style="margin-bottom:10px;">📎 Прикрепить файл</button>
+
   <div class="chat-hints" id="chat-hints">
     <div class="title">💡 Что можно написать:</div>
     <div class="hint"><span class="emoji">🎓</span>Помоги с домашкой по физике</div>
@@ -7128,19 +6939,22 @@ body::before{
     <div class="hint"><span class="emoji">🌍</span>Перевести на английский: «Привет, как дела?»</div>
     <div class="hint"><span class="emoji">📖</span>Объясни квантовую физику простыми словами</div>
     <div class="hint"><span class="emoji">💡</span>Придумай идею для бизнеса в IT</div>
-    <div class="hint" style="margin-top:8px;opacity:0.7;">📎 Можно прислать файл (.txt, .py, .js, .json и др.)</div>
   </div>
+
   <div class="chat-messages" id="chat-messages"></div>
-  <div id="file-preview" style="display:none;" class="upload-preview"></div>
-  <div style="display:flex;gap:8px;margin-bottom:8px;">
-    <input type="file" id="chat-file-input" accept=".txt,.md,.csv,.json,.xml,.yaml,.yml,.py,.js,.html,.css,.php,.java,.c,.cpp,.go,.rs,.rb,.sh,.bat,.log,.ini,.cfg,.sql,.srt,.vtt,.tex,.env,.gitignore" style="display:none;">
-    <button class="action-btn secondary" id="btn-attach" style="flex:0 0 auto;padding:14px 18px;">📎</button>
-    <input type="text" id="chat-input" placeholder="Задай вопрос..." style="flex:1;padding:14px 16px;background:var(--card);border:1px solid rgba(74,158,255,0.25);border-radius:14px;color:var(--text);font-size:15px;outline:none;font-family:inherit;">
-  </div>
-  <button class="action-btn" id="chat-btn">Отправить — 1💎</button>
+
+  <button class="action-btn" id="chat-btn">📤 Отправить — 1💎</button>
 </div>
 
-<!-- НАСТРОЙКИ ИИ -->
+<div id="screen-chats" class="screen">
+  <div class="screen-header">
+    <button class="back-btn" id="btn-back-chats">←</button>
+    <span class="screen-title">💬 Мои чаты</span>
+    <button class="back-btn" id="btn-new-chat2" title="Новый чат">➕</button>
+  </div>
+  <div id="chats-list"><div class="loading">Загрузка...</div></div>
+</div>
+
 <div id="screen-ai-settings" class="screen">
   <div class="screen-header">
     <button class="back-btn" id="btn-back-ai-set">←</button>
@@ -7157,7 +6971,6 @@ body::before{
   </div>
 </div>
 
-<!-- ИСТОРИЯ -->
 <div id="screen-history" class="screen">
   <div class="screen-header">
     <button class="back-btn" id="btn-back-hist">←</button>
@@ -7170,12 +6983,12 @@ body::before{
   <div id="history-content"><div class="loading">Загрузка...</div></div>
 </div>
 
-<!-- ПОКУПКА -->
 <div id="screen-buy" class="screen">
   <div class="screen-header">
     <button class="back-btn" id="btn-back-buy">←</button>
     <span class="screen-title">💳 Купить токены</span>
   </div>
+  <div class="section-title">Пакеты</div>
   <div class="buy-option" data-amount="100" data-tokens="20">
     <span style="opacity:0.7;">100 ₽</span> — <b>20 токенов</b>
   </div>
@@ -7188,14 +7001,22 @@ body::before{
   <div class="buy-option" data-amount="1000" data-tokens="200">
     <span style="opacity:0.7;">1000 ₽</span> — <b>200 токенов</b>
   </div>
+
+  <div class="section-title">Своя сумма</div>
+  <div class="input-wrap">
+    <input type="number" id="custom-tokens" placeholder="Кол-во токенов (20-3000)" min="20" max="3000">
+  </div>
+  <div style="font-size:12px;opacity:0.6;text-align:center;margin-bottom:10px;">💰 5 ₽ за 1 токен</div>
+  <button class="action-btn" id="buy-custom-btn">✏️ Купить свою сумму</button>
 </div>
 
-<!-- НАСТРОЙКИ -->
 <div id="screen-settings" class="screen">
   <div class="screen-header">
     <button class="back-btn" id="btn-back-set">←</button>
     <span class="screen-title">⚙️ Настройки</span>
   </div>
+  <div class="section-title">🎨 Тема оформления</div>
+  <div class="theme-grid" id="theme-grid"></div>
   <div class="section-title">🔧 Прочее</div>
   <div class="setting-row" id="set-sound-on">
     <div class="lbl">🔊 Звук уведомлений</div>
@@ -7203,12 +7024,12 @@ body::before{
   </div>
 </div>
 
-<!-- ПОДДЕРЖКА -->
 <div id="screen-support" class="screen">
   <div class="screen-header">
     <button class="back-btn" id="btn-back-sup">←</button>
     <span class="screen-title">🆘 Поддержка</span>
   </div>
+  <div class="section-title">Новый тикет</div>
   <div class="input-wrap">
     <textarea id="support-msg" placeholder="Опиши свою проблему или вопрос..."></textarea>
   </div>
@@ -7245,7 +7066,21 @@ body::before{
     currentScreen: 'main',
     isGenerating: false,
     isChatting: false,
-    pendingFile: null
+    pendingFile: null,
+    currentChatId: null,
+    currentChatTitle: '',
+    themes: [
+      {key:'ocean',  name:'🌊 Океан',   bg:'#0a1628', card:'#132a45', primary:'#4a9eff'},
+      {key:'night',  name:'🌙 Ночь',    bg:'#000000', card:'#1a1a1a', primary:'#888888'},
+      {key:'sakura', name:'🌸 Сакура',  bg:'#2a0f1e', card:'#4a1e33', primary:'#ff6fa5'},
+      {key:'forest', name:'🌲 Лес',     bg:'#0a1f12', card:'#13371f', primary:'#4ade80'},
+      {key:'fire',   name:'🔥 Огонь',   bg:'#2a0808', card:'#4a1515', primary:'#ff6b3d'},
+      {key:'ice',    name:'❄️ Лёд',     bg:'#0a1e2a', card:'#133a4a', primary:'#5ddcff'},
+      {key:'gold',   name:'👑 Золото',  bg:'#1a1400', card:'#3a2c00', primary:'#ffb800'},
+      {key:'neon',   name:'🌈 Неон',    bg:'#0d0022', card:'#200a44', primary:'#c04dff'},
+      {key:'coffee', name:'☕ Кофе',    bg:'#1a1008', card:'#3a2515', primary:'#c8945a'},
+      {key:'light',  name:'⚪ Светлая', bg:'#f0f4f8', card:'#ffffff', primary:'#2c7be5'}
+    ]
   };
 
   function $(id) { return document.getElementById(id); }
@@ -7285,6 +7120,7 @@ body::before{
     if (name === 'history') loadHistory('gen', $('tab-hist-gen'));
     if (name === 'settings') loadSettings();
     if (name === 'chat') { loadChatHistory(); updateChatBadges(); }
+    if (name === 'chats') loadChatsList();
     if (name === 'ai-settings') loadAISettings();
     if (name === 'support') loadTickets();
     if (name === 'generate') resetGenForm();
@@ -7305,6 +7141,8 @@ body::before{
   try {
     tg.BackButton.onClick(function() {
       if (state.currentScreen === 'main') openExitModal();
+      else if (state.currentScreen === 'ai-settings') showScreen('chat');
+      else if (state.currentScreen === 'chats') showScreen('chat');
       else showScreen('main');
     });
   } catch(e){}
@@ -7314,6 +7152,24 @@ body::before{
       state.me.tokens = b;
       $('balance-tokens').textContent = b;
     }
+  }
+
+  function applyTheme(themeKey) {
+    document.body.setAttribute('data-theme', themeKey);
+    var colors = {
+      'ocean':  ['#4a9eff', '#0a1628'],
+      'night':  ['#888888', '#000000'],
+      'sakura': ['#ff6fa5', '#2a0f1e'],
+      'forest': ['#4ade80', '#0a1f12'],
+      'fire':   ['#ff6b3d', '#2a0808'],
+      'ice':    ['#5ddcff', '#0a1e2a'],
+      'gold':   ['#ffb800', '#1a1400'],
+      'neon':   ['#c04dff', '#0d0022'],
+      'coffee': ['#c8945a', '#1a1008'],
+      'light':  ['#2c7be5', '#f0f4f8']
+    };
+    var c = colors[themeKey] || colors['ocean'];
+    try { tg.setHeaderColor(c[0]); tg.setBackgroundColor(c[1]); } catch(e){}
   }
 
   function loadMe() {
@@ -7328,10 +7184,10 @@ body::before{
       }
       state.me = d;
       $('balance-tokens').textContent = d.tokens;
+      if (d.theme) applyTheme(d.theme);
     });
   }
 
-  // === GENERATE ===
   function resetGenForm() {
     $('gen-form').style.display = 'block';
     $('gen-progress').style.display = 'none';
@@ -7404,18 +7260,47 @@ body::before{
     });
   }
 
-  // === CHAT ===
   function loadChatHistory() {
-    apiCall('history/chat').then(function(d) {
+    if (!state.currentChatId) {
+      apiCall('chats/list').then(function(d) {
+        if (d.error || !d.items || d.items.length === 0) {
+          apiCall('chats/create').then(function(d2) {
+            if (d2.error) return;
+            state.currentChatId = d2.chat_db_id;
+            state.currentChatTitle = d2.title;
+            $('chat-current-title').textContent = '💬 ' + d2.title;
+            $('chat-messages').innerHTML = '';
+            $('chat-hints').style.display = 'block';
+          });
+          return;
+        }
+        state.currentChatId = d.items[0].id;
+        state.currentChatTitle = d.items[0].title;
+        $('chat-current-title').textContent = '💬 ' + d.items[0].title;
+        loadChatMessages(state.currentChatId);
+      });
+      return;
+    }
+    loadChatMessages(state.currentChatId);
+  }
+
+  function loadChatMessages(chatId) {
+    apiCall('chats/messages', {chat_db_id: chatId}).then(function(d) {
       var container = $('chat-messages');
       container.innerHTML = '';
       if (d.error) {
         container.innerHTML = '<div class="err">Ошибка: ' + escapeHtml(d.error) + '</div>';
         return;
       }
+      if (d.title) {
+        state.currentChatTitle = d.title;
+        $('chat-current-title').textContent = '💬 ' + d.title;
+      }
       if (!d.items || d.items.length === 0) {
+        $('chat-hints').style.display = 'block';
         return;
       }
+      $('chat-hints').style.display = 'none';
       for (var i = 0; i < d.items.length; i++) {
         appendMessage(d.items[i].role, d.items[i].content, false);
       }
@@ -7479,18 +7364,78 @@ body::before{
     $('chat-file-input').value = '';
   }
 
-  function newChat() {
-    try {
-      tg.showConfirm('Начать новый чат? История будет очищена.', function(ok) {
-        if (!ok) return;
-        apiCall('new_chat').then(function(d) {
-          if (d.error) { try{tg.showAlert('❌ ' + d.error);}catch(e){} return; }
-          $('chat-messages').innerHTML = '';
-          $('chat-hints').style.display = 'block';
-          try{tg.showAlert('✅ История очищена');}catch(e){}
-        });
-      });
-    } catch(e){}
+  function createNewChat() {
+    apiCall('chats/create').then(function(d) {
+      if (d.error) { try{tg.showAlert('❌ ' + d.error);}catch(e){} return; }
+      state.currentChatId = d.chat_db_id;
+      state.currentChatTitle = d.title;
+      $('chat-messages').innerHTML = '';
+      $('chat-current-title').textContent = '💬 ' + d.title;
+      $('chat-hints').style.display = 'block';
+      showScreen('chat');
+      try{tg.showAlert('✅ Новый чат создан');}catch(e){}
+    });
+  }
+
+  function loadChatsList() {
+    var c = $('chats-list');
+    c.innerHTML = '<div class="loading">Загрузка...</div>';
+    apiCall('chats/list').then(function(d) {
+      if (d.error) {
+        c.innerHTML = '<div class="err">Ошибка: ' + escapeHtml(d.error) + '</div>';
+        return;
+      }
+      if (!d.items || d.items.length === 0) {
+        c.innerHTML = '<div style="text-align:center;padding:50px 20px;opacity:0.5;">Чатов нет. Создайте новый!</div>';
+        return;
+      }
+      c.innerHTML = '';
+      for (var i = 0; i < d.items.length; i++) {
+        (function(item) {
+          var div = document.createElement('div');
+          div.className = 'chat-item' + (item.id === state.currentChatId ? ' current' : '');
+          var when = item.last_message ? new Date(item.last_message * 1000) : null;
+          var whenStr = when ? (when.getDate() + '.' + (when.getMonth()+1) + ' ' + when.getHours() + ':' + (when.getMinutes()<10?'0':'') + when.getMinutes()) : '—';
+          div.innerHTML = '<div class="ico2">💬</div>' +
+            '<div class="info"><div class="name">' + escapeHtml(item.title || 'Чат') + '</div>' +
+            '<div class="meta">' + item.msg_count + ' сообщ. • ' + whenStr + '</div></div>' +
+            '<div class="actions">' +
+              '<button class="mini-btn" data-act="rename">✏️</button>' +
+              '<button class="mini-btn" data-act="delete">🗑</button>' +
+            '</div>';
+          div.querySelector('.info').addEventListener('click', function() {
+            state.currentChatId = item.id;
+            state.currentChatTitle = item.title;
+            showScreen('chat');
+          });
+          div.querySelector('[data-act="rename"]').addEventListener('click', function(ev) {
+            ev.stopPropagation();
+            var newName = prompt('Новое название:', item.title);
+            if (!newName) return;
+            apiCall('chats/rename', {chat_db_id: item.id, title: newName}).then(function(r) {
+              if (r.error) { try{tg.showAlert('❌ ' + r.error);}catch(e){} return; }
+              loadChatsList();
+            });
+          });
+          div.querySelector('[data-act="delete"]').addEventListener('click', function(ev) {
+            ev.stopPropagation();
+            try {
+              tg.showConfirm('Удалить чат "' + item.title + '"?', function(ok) {
+                if (!ok) return;
+                apiCall('chats/delete', {chat_db_id: item.id}).then(function(r) {
+                  if (r.error) { try{tg.showAlert('❌ ' + r.error);}catch(e){} return; }
+                  if (state.currentChatId === item.id) {
+                    state.currentChatId = null;
+                  }
+                  loadChatsList();
+                });
+              });
+            } catch(e){}
+          });
+          c.appendChild(div);
+        })(d.items[i]);
+      }
+    });
   }
 
   function doChat() {
@@ -7502,6 +7447,17 @@ body::before{
     if (!state.me || state.me.tokens < 1) { try{tg.showAlert('❌ Нужно 1 токен');}catch(e){} return; }
 
     $('chat-hints').style.display = 'none';
+
+    if (!state.currentChatId) {
+      apiCall('chats/create').then(function(d) {
+        if (d.error) { try{tg.showAlert('❌ ' + d.error);}catch(e){} return; }
+        state.currentChatId = d.chat_db_id;
+        state.currentChatTitle = d.title;
+        $('chat-current-title').textContent = '💬 ' + d.title;
+        doChat();
+      });
+      return;
+    }
 
     if (file) {
       state.isChatting = true;
@@ -7522,11 +7478,12 @@ body::before{
       fd.append('init_data', initData);
       fd.append('file', file);
       fd.append('caption', question);
+      fd.append('chat_db_id', String(state.currentChatId));
       fetch('/webapp/api/file', {method:'POST', body: fd}).then(function(r) { return r.json(); }).then(function(d) {
         var t = $('typing-msg');
         if (t) t.remove();
         btn.disabled = false;
-        btn.textContent = 'Отправить — 1💎';
+        btn.textContent = '📤 Отправить — 1💎';
         if (d.error) { appendMessage('bot', '❌ ' + d.error, false); }
         else {
           updateBalance(d.balance);
@@ -7538,7 +7495,7 @@ body::before{
         var t = $('typing-msg');
         if (t) t.remove();
         btn.disabled = false;
-        btn.textContent = 'Отправить — 1💎';
+        btn.textContent = '📤 Отправить — 1💎';
         appendMessage('bot', '❌ Ошибка сети', false);
         state.isChatting = false;
         scrollChatBottom();
@@ -7561,11 +7518,11 @@ body::before{
     $('chat-messages').appendChild(typing2);
     scrollChatBottom();
 
-    apiCall('chat', {question: question}).then(function(d) {
+    apiCall('chat', {question: question, chat_db_id: state.currentChatId}).then(function(d) {
       var t = $('typing-msg');
       if (t) t.remove();
       btn2.disabled = false;
-      btn2.textContent = 'Отправить — 1💎';
+      btn2.textContent = '📤 Отправить — 1💎';
       if (d.error) {
         appendMessage('bot', '❌ ' + d.error, false);
         state.isChatting = false;
@@ -7574,12 +7531,15 @@ body::before{
       }
       updateBalance(d.balance);
       appendMessage('bot', d.answer, false);
+      if (d.title) {
+        state.currentChatTitle = d.title;
+        $('chat-current-title').textContent = '💬 ' + d.title;
+      }
       scrollChatBottom();
       state.isChatting = false;
     });
   }
 
-  // === AI SETTINGS ===
   function loadAISettings() {
     if (!state.me) return;
     var modes = [
@@ -7640,7 +7600,6 @@ body::before{
     });
   }
 
-  // === HISTORY ===
   function loadHistory(kind, tabEl) {
     var tabs = document.querySelectorAll('#screen-history .tab');
     for (var i = 0; i < tabs.length; i++) tabs[i].classList.remove('active');
@@ -7673,7 +7632,6 @@ body::before{
     });
   }
 
-  // === BUY ===
   function buyTokens(amount, tokens) {
     try {
       tg.showConfirm('Купить ' + tokens + ' токенов за ' + amount + ' ₽?', function(ok) {
@@ -7686,11 +7644,33 @@ body::before{
     } catch(e){}
   }
 
-  // === SETTINGS ===
   function loadSettings() {
     if (!state.me) return;
+    // Рендер тем
+    var grid = $('theme-grid');
+    grid.innerHTML = '';
+    var currentTheme = state.me.theme || 'ocean';
+    for (var i = 0; i < state.themes.length; i++) {
+      (function(t) {
+        var card = document.createElement('div');
+        card.className = 'theme-card' + (t.key === currentTheme ? ' active' : '');
+        card.innerHTML = '<div class="preview" style="background:linear-gradient(180deg,' + t.primary + ' 0%,' + t.bg + ' 100%);"></div>' + t.name;
+        card.addEventListener('click', function() { setTheme(t.key); });
+        grid.appendChild(card);
+      })(state.themes[i]);
+    }
     var tso = $('toggle-sound_on');
     if (state.me.sound_on) tso.classList.add('on'); else tso.classList.remove('on');
+  }
+
+  function setTheme(key) {
+    state.me.theme = key;
+    applyTheme(key);
+    apiCall('settings', {field: 'theme', value: key}).then(function(d) {
+      if (d.error) { try{tg.showAlert('❌ ' + d.error);}catch(e){} return; }
+      try { tg.HapticFeedback.impactOccurred('light'); } catch(e){}
+      loadSettings();
+    });
   }
 
   function toggleSoundOn() {
@@ -7703,7 +7683,6 @@ body::before{
     });
   }
 
-  // === SUPPORT ===
   function loadTickets() {
     apiCall('tickets/list').then(function(d) {
       var c = $('support-tickets');
@@ -7748,7 +7727,7 @@ body::before{
     });
   }
 
-  // === BIND ===
+  // BIND
   $('btn-open-generate').addEventListener('click', function() { showScreen('generate'); });
   $('btn-open-chat').addEventListener('click', function() { showScreen('chat'); });
   $('btn-open-history').addEventListener('click', function() { showScreen('history'); });
@@ -7764,13 +7743,16 @@ body::before{
   });
   $('btn-back-gen').addEventListener('click', function() { showScreen('main'); });
   $('btn-back-chat').addEventListener('click', function() { showScreen('main'); });
+  $('btn-back-chats').addEventListener('click', function() { showScreen('chat'); });
   $('btn-back-hist').addEventListener('click', function() { showScreen('main'); });
   $('btn-back-buy').addEventListener('click', function() { showScreen('main'); });
   $('btn-back-set').addEventListener('click', function() { showScreen('main'); });
   $('btn-back-sup').addEventListener('click', function() { showScreen('main'); });
   $('btn-back-ai-set').addEventListener('click', function() { showScreen('chat'); });
   $('btn-chat-settings').addEventListener('click', function() { showScreen('ai-settings'); });
-  $('btn-new-chat').addEventListener('click', newChat);
+  $('btn-open-chats').addEventListener('click', function() { showScreen('chats'); });
+  $('btn-new-chat').addEventListener('click', createNewChat);
+  $('btn-new-chat2').addEventListener('click', function() { createNewChat(); });
   $('gen-btn').addEventListener('click', doGenerate);
   $('chat-btn').addEventListener('click', doChat);
   $('btn-attach').addEventListener('click', function() { $('chat-file-input').click(); });
@@ -7782,6 +7764,14 @@ body::before{
   $('set-chat-send-files').addEventListener('click', toggleChatSendFiles);
   $('set-sound-on').addEventListener('click', toggleSoundOn);
   $('support-send-btn').addEventListener('click', sendSupport);
+  $('buy-custom-btn').addEventListener('click', function() {
+    var n = parseInt($('custom-tokens').value || '0', 10);
+    if (isNaN(n) || n < 20 || n > 3000) {
+      try{tg.showAlert('❌ Введи от 20 до 3000');}catch(e){}
+      return;
+    }
+    buyTokens(n * 5, n);
+  });
 
   var buyOpts = document.querySelectorAll('.buy-option');
   for (var k = 0; k < buyOpts.length; k++) {
