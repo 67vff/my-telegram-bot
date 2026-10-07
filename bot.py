@@ -1,6 +1,6 @@
 # ============================================================
 # БОБ AI — Telegram Bot + WebApp
-# Часть 1: Импорты, конфиг, утилиты, база данных
+# Часть 1: Импорты, конфиг, БД, утилиты, меню, пользователи
 # ============================================================
 
 import os
@@ -210,6 +210,70 @@ def pagination_menu(prefix, page, total_pages, back_to="menu_main"):
     markup.row(*buttons)
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data=back_to))
     return markup
+
+
+# ============================================================
+# ЛОГИРОВАНИЕ ОШИБОК
+# ============================================================
+
+def log_error(error_msg, chat_id=None, username=None):
+    error_str = str(error_msg)[:500]
+    now = int(time.time())
+    path = "/app/data/errors.log"
+
+    ctx = ""
+    if chat_id:
+        ctx = f" 👤 chat_id={chat_id}"
+        if username:
+            ctx += f" ({username})"
+
+    try:
+        if os.path.exists(path):
+            size = os.path.getsize(path)
+            if size > 40 * 1024 * 1024:
+                try:
+                    os.remove(path)
+                    print(f"Rotated errors.log ({size / 1024 / 1024:.1f} МБ)")
+                except Exception as e:
+                    print(f"Rotation error: {e}")
+    except Exception:
+        pass
+
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]{ctx} {error_str}\n")
+    except Exception:
+        pass
+
+    if ERRORS_CHANNEL_ID == 0:
+        return
+
+    spam_key = f"{error_str}_{chat_id}"
+    last = _last_error_notify.get(spam_key, 0)
+    if now - last < 60:
+        return
+    _last_error_notify[spam_key] = now
+
+    if len(_last_error_notify) > 100:
+        cutoff = now - 3600
+        for k in list(_last_error_notify.keys()):
+            if _last_error_notify[k] < cutoff:
+                _last_error_notify.pop(k, None)
+
+    text = (
+        f"⚠️ <b>Ошибка в боте</b>\n\n"
+        f"📅 {time.strftime('%d.%m.%Y %H:%M:%S')}\n"
+    )
+    if chat_id:
+        text += f"👤 <code>{chat_id}</code>\n"
+        if username:
+            text += f"📛 {escape_html(username)}\n"
+    text += f"\n📝 <code>{escape_html(error_str)}</code>"
+
+    try:
+        bot.send_message(ERRORS_CHANNEL_ID, text, parse_mode='HTML')
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -593,8 +657,327 @@ def notify_subscribers(user_id, text):
         except Exception:
             pass
 
+
+def add_to_history(chat_id, role, content):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, role, content))
+    conn.commit()
+    conn.close()
+
+
+def get_history(chat_id, limit=20):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT role, content FROM history WHERE chat_id=? ORDER BY id DESC LIMIT ?", (chat_id, limit))
+    rows = c.fetchall()
+    conn.close()
+    return list(reversed(rows))
+
+
+def get_full_history(chat_id, limit=200):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT role, content FROM history WHERE chat_id=? ORDER BY id ASC LIMIT ?", (chat_id, limit))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def clear_history(chat_id):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("DELETE FROM history WHERE chat_id=?", (chat_id,))
+    conn.commit()
+    conn.close()
+
+
+def add_image_history(chat_id, prompt, image_url, kind="gen"):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("INSERT INTO image_history (chat_id, prompt, image_url, timestamp, kind) VALUES (?, ?, ?, ?, ?)",
+              (chat_id, prompt, image_url, int(time.time()), kind))
+    conn.commit()
+    conn.close()
+
+
+def get_image_history_by_kind(chat_id, kind, limit=50):
+    conn = get_conn()
+    c = conn.cursor()
+    if kind:
+        c.execute("SELECT prompt, image_url, timestamp FROM image_history WHERE chat_id=? AND kind=? ORDER BY id DESC LIMIT ?",
+                  (chat_id, kind, limit))
+    else:
+        c.execute("SELECT prompt, image_url, timestamp FROM image_history WHERE chat_id=? ORDER BY id DESC LIMIT ?",
+                  (chat_id, limit))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def get_full_image_history(chat_id, limit=100):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT prompt, image_url, timestamp, kind FROM image_history WHERE chat_id=? ORDER BY id ASC LIMIT ?",
+              (chat_id, limit))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def get_all_users():
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT chat_id, username, tokens FROM users ORDER BY tokens DESC")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def find_user_by_id(chat_id):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT chat_id, username, tokens FROM users WHERE chat_id=?", (chat_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+
+def get_maintenance():
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT active, message, enabled, notified FROM maintenance WHERE id=1")
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return (0, "Технические работы, пожалуйста подождите", 0, 1)
+    return row
+
+
+def set_maintenance(active, message=None, enabled=None, notified=None):
+    conn = get_conn()
+    c = conn.cursor()
+    if message is not None:
+        c.execute("UPDATE maintenance SET active=?, message=? WHERE id=1", (active, message))
+    else:
+        c.execute("UPDATE maintenance SET active=? WHERE id=1", (active,))
+    if enabled is not None:
+        c.execute("UPDATE maintenance SET enabled=? WHERE id=1", (enabled,))
+    if notified is not None:
+        c.execute("UPDATE maintenance SET notified=? WHERE id=1", (notified,))
+    conn.commit()
+    conn.close()
+
+
+def save_maintenance_notified(chat_id, message_id):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("INSERT INTO maintenance_notified (chat_id, message_id, timestamp) VALUES (?, ?, ?)",
+              (chat_id, message_id, int(time.time())))
+    conn.commit()
+    conn.close()
+
+
+def get_maintenance_notified():
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT chat_id, message_id FROM maintenance_notified")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def clear_maintenance_notified():
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("DELETE FROM maintenance_notified")
+    conn.commit()
+    conn.close()
+
+
+def has_ban_record(chat_id):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT reason, timestamp FROM bans WHERE chat_id=? ORDER BY id DESC LIMIT 1", (chat_id,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return True, row[0] if row[0] else "", row[1] if row[1] else 0
+    return False, "", 0
+
+
+def check_support_muted(chat_id):
+    user = get_user(chat_id)
+    muted_until = user[21]
+    now = int(time.time())
+    if muted_until > now:
+        left = muted_until - now
+        minutes = left // 60
+        seconds = left % 60
+        if minutes > 0:
+            return True, f"{minutes} мин {seconds} сек"
+        return True, f"{seconds} сек"
+    return False, ""
+
+
+def can_use_during_maintenance(chat_id):
+    if chat_id == ADMIN_ID:
+        return True
+    user = get_user(chat_id)
+    return bool(user[22])
+
+
+def check_banned(chat_id):
+    user = get_user(chat_id)
+    return bool(user[10]), user[11] if user[11] else ""
+
+
+def send_banned_message(chat_id):
+    banned, reason = check_banned(chat_id)
+    if not banned:
+        return False
+    clear_old_messages(chat_id)
+    text = (f"🚫 <b>Вы забанены.</b>\n\n"
+            f"Причина: {escape_html(reason) if reason else 'не указана'}")
+    sent = bot.send_message(chat_id, text, parse_mode='HTML')
+    remember(chat_id, sent.message_id)
+    return True
+
+
 # ============================================================
-# Часть 2: Меню, главное меню, /start, навигация
+# РАБОТА С СООБЩЕНИЯМИ
+# ============================================================
+
+def clear_old_messages(chat_id):
+    for msg_id in last_messages.get(chat_id, []):
+        try:
+            bot.delete_message(chat_id, msg_id)
+        except Exception:
+            pass
+    last_messages[chat_id] = []
+
+
+def remember(chat_id, msg_id):
+    last_messages.setdefault(chat_id, []).append(msg_id)
+    if len(last_messages[chat_id]) > 20:
+        last_messages[chat_id] = last_messages[chat_id][-20:]
+
+
+def send_long_text_as_file(chat_id, text, filename="otvet.txt"):
+    try:
+        data = text.encode('utf-8')
+        bot.send_document(chat_id, (filename, data))
+        return True
+    except Exception as e:
+        log_error(f"Send file error: {e}")
+        return False
+
+
+def send_photo_safe(chat_id, image_url, caption):
+    try:
+        r = requests.get(image_url, timeout=15)
+        if r.status_code != 200:
+            return None
+        img = r.content
+        msg = bot.send_photo(chat_id, img, caption=caption, parse_mode='HTML')
+        return msg.message_id
+    except Exception as e:
+        log_error(f"Send photo error: {e}")
+        return None
+
+
+def send_with_sound(chat_id, text, reply_markup=None, parse_mode='HTML'):
+    user = get_user(chat_id)
+    sound_on = user[23]
+    try:
+        return bot.send_message(chat_id, text, parse_mode=parse_mode,
+                                reply_markup=reply_markup,
+                                disable_notification=(not sound_on))
+    except Exception:
+        return bot.send_message(chat_id, text, reply_markup=reply_markup)
+
+
+def check_spam(chat_id, cooldown=2):
+    if chat_id == ADMIN_ID:
+        return True
+    now = int(time.time())
+    last = _last_action.get(chat_id, 0)
+    if now - last < cooldown:
+        return False
+    _last_action[chat_id] = now
+    return True
+
+
+def check_duplicate(chat_id, text, cooldown=5):
+    if not text:
+        return False
+    now = int(time.time())
+    last = _last_message_text.get(chat_id)
+    if last:
+        last_text, last_time = last
+        if last_text.lower() == text.lower() and now - last_time < cooldown:
+            return True
+    _last_message_text[chat_id] = (text, now)
+    return False
+
+
+def deny_if_banned_or_maintenance(chat_id, call=None, message=None):
+    if call and not check_spam(chat_id, cooldown=2):
+        try:
+            bot.answer_callback_query(call.id, "⏳ Не спамь")
+        except Exception:
+            pass
+        return True
+
+    state = get_user(chat_id)[1]
+    if state in ('gen_processing', 'edit_processing'):
+        if call:
+            try:
+                bot.answer_callback_query(call.id, "⏳ Генерация идёт, подожди")
+            except Exception:
+                pass
+        return True
+
+    banned, reason = check_banned(chat_id)
+    if banned:
+        if call:
+            try:
+                bot.answer_callback_query(call.id, "🚫 Вы забанены.")
+            except Exception:
+                pass
+            try:
+                bot.delete_message(chat_id, call.message.message_id)
+            except Exception:
+                pass
+        send_banned_message(chat_id)
+        return True
+    if not can_use_during_maintenance(chat_id):
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("SELECT enabled, message FROM maintenance WHERE id=1")
+        row = c.fetchone()
+        conn.close()
+        if row and row[0]:
+            msg = row[1] if row[1] else "Технические работы"
+            try:
+                if call:
+                    bot.answer_callback_query(call.id, "🛠 Тех.работы")
+                    try:
+                        bot.delete_message(chat_id, call.message.message_id)
+                    except Exception:
+                        pass
+                clear_old_messages(chat_id)
+                sent = bot.send_message(chat_id, f"🛠 <b>{escape_html(msg)}</b>",
+                                        parse_mode='HTML', reply_markup=maintenance_menu())
+                remember(chat_id, sent.message_id)
+            except Exception:
+                pass
+            return True
+    return False
+
+
+# ============================================================
+# МЕНЮ (КЛАВИАТУРЫ)
 # ============================================================
 
 def main_menu(chat_id=None):
@@ -704,10 +1087,6 @@ def support_menu():
     return markup
 
 
-# ============================================================
-# НОВОЕ: chat_menu с «➕ Новый чат» и «🤖 ИИ Боб»
-# ============================================================
-
 def chat_menu():
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("➕ Новый чат", callback_data="new_chat"))
@@ -725,8 +1104,6 @@ def ai_bob_menu(chat_id):
     send_files = user[18]
 
     markup = telebot.types.InlineKeyboardMarkup()
-
-    # === РЕЖИМ ===
     markup.add(telebot.types.InlineKeyboardButton("── 🎯 РЕЖИМ ──", callback_data="noop"))
     modes = [
         ("regular", "🤖 Обычный ИИ"),
@@ -743,7 +1120,6 @@ def ai_bob_menu(chat_id):
         prefix = "✅ " if active else "◻️ "
         markup.add(telebot.types.InlineKeyboardButton(f"{prefix}{name}", callback_data=f"mode_{key}"))
 
-    # === ПОВЕДЕНИЕ ===
     markup.add(telebot.types.InlineKeyboardButton("── 🧠 ПОВЕДЕНИЕ ──", callback_data="noop"))
     ai_modes = [
         ("regular", "🤖 Обычный"),
@@ -755,7 +1131,6 @@ def ai_bob_menu(chat_id):
         prefix = "✅ " if ai_mode == key else "◻️ "
         markup.add(telebot.types.InlineKeyboardButton(f"{prefix}{name}", callback_data=f"ai_{key}"))
 
-    # === ОТВЕТЫ ФАЙЛАМИ ===
     markup.add(telebot.types.InlineKeyboardButton("── 📎 ОТВЕТЫ ──", callback_data="noop"))
     files_label = "📎 Ответы файлами: ВКЛ" if send_files else "📎 Ответы файлами: ВЫКЛ"
     markup.add(telebot.types.InlineKeyboardButton(files_label, callback_data="toggle_send_files"))
@@ -779,12 +1154,6 @@ def back_to_main_menu():
 def back_to_admin_menu():
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
-    return markup
-
-
-def back_to_history_menu():
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_history"))
     return markup
 
 
@@ -906,277 +1275,6 @@ def errors_menu():
 
 
 # ============================================================
-# ЛОГИРОВАНИЕ ОШИБОК
-# ============================================================
-
-def log_error(error_msg, chat_id=None, username=None):
-    error_str = str(error_msg)[:500]
-    now = int(time.time())
-    path = "/app/data/errors.log"
-
-    ctx = ""
-    if chat_id:
-        ctx = f" 👤 chat_id={chat_id}"
-        if username:
-            ctx += f" ({username})"
-
-    try:
-        if os.path.exists(path):
-            size = os.path.getsize(path)
-            if size > 40 * 1024 * 1024:
-                if size < 50 * 1024 * 1024 and ERRORS_CHANNEL_ID != 0:
-                    try:
-                        with open(path, "rb") as f:
-                            data = f.read()
-                        filename = f"errors_rotated_{time.strftime('%Y-%m-%d_%H-%M')}.log"
-                        days_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
-                        day_name = days_ru[time.localtime().tm_wday]
-                        caption = (
-                            f"🔄 <b>Ротация errors.log</b>\n\n"
-                            f"📅 <b>Дата:</b> {time.strftime('%d.%m.%Y')}\n"
-                            f"📆 <b>День:</b> {day_name}\n"
-                            f"⏱ <b>Время:</b> {time.strftime('%H:%M:%S')}\n"
-                            f"🗓 <b>Год:</b> {time.strftime('%Y')}\n\n"
-                            f"📦 Размер: <b>{size / 1024 / 1024:.1f} МБ</b>"
-                        )
-                        bot.send_document(ERRORS_CHANNEL_ID, (filename, data),
-                                          caption=caption, parse_mode='HTML')
-                    except Exception as e:
-                        print(f"Send rotated log error: {e}")
-                try:
-                    os.remove(path)
-                    print(f"Rotated errors.log ({size / 1024 / 1024:.1f} МБ)")
-                except Exception as e:
-                    print(f"Rotation error: {e}")
-    except Exception:
-        pass
-
-    try:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]{ctx} {error_str}\n")
-    except Exception:
-        pass
-
-    if ERRORS_CHANNEL_ID == 0:
-        return
-
-    spam_key = f"{error_str}_{chat_id}"
-    last = _last_error_notify.get(spam_key, 0)
-    if now - last < 60:
-        return
-    _last_error_notify[spam_key] = now
-
-    if len(_last_error_notify) > 100:
-        cutoff = now - 3600
-        for k in list(_last_error_notify.keys()):
-            if _last_error_notify[k] < cutoff:
-                _last_error_notify.pop(k, None)
-
-    days_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
-    day_name = days_ru[time.localtime().tm_wday]
-
-    text = (
-        f"⚠️ <b>Ошибка в боте</b>\n\n"
-        f"📅 <b>Дата:</b> {time.strftime('%d.%m.%Y')}\n"
-        f"📆 <b>День:</b> {day_name}\n"
-        f"⏱ <b>Время:</b> {time.strftime('%H:%M:%S')}\n"
-        f"🗓 <b>Год:</b> {time.strftime('%Y')}\n"
-    )
-    if chat_id:
-        text += f"\n👤 <b>Юзер:</b> <code>{chat_id}</code>\n"
-        if username:
-            text += f"📛 <b>Username:</b> {escape_html(username)}\n"
-    text += f"\n📝 <b>Ошибка:</b>\n<code>{escape_html(error_str)}</code>"
-
-    try:
-        bot.send_message(ERRORS_CHANNEL_ID, text, parse_mode='HTML')
-    except Exception as e:
-        print(f"Send error to channel failed: {e}")
-
-
-# ============================================================
-# АНТИСПАМ И РАБОТА С СООБЩЕНИЯМИ
-# ============================================================
-
-def check_spam(chat_id, cooldown=2):
-    if chat_id == ADMIN_ID:
-        return True
-    now = int(time.time())
-    last = _last_action.get(chat_id, 0)
-    if now - last < cooldown:
-        return False
-    _last_action[chat_id] = now
-    return True
-
-
-def check_duplicate(chat_id, text, cooldown=5):
-    if not text:
-        return False
-    now = int(time.time())
-    last = _last_message_text.get(chat_id)
-    if last:
-        last_text, last_time = last
-        if last_text.lower() == text.lower() and now - last_time < cooldown:
-            return True
-    _last_message_text[chat_id] = (text, now)
-    return False
-
-
-def clear_old_messages(chat_id):
-    for msg_id in last_messages.get(chat_id, []):
-        try:
-            bot.delete_message(chat_id, msg_id)
-        except Exception:
-            pass
-    last_messages[chat_id] = []
-
-
-def remember(chat_id, msg_id):
-    last_messages.setdefault(chat_id, []).append(msg_id)
-    if len(last_messages[chat_id]) > 20:
-        last_messages[chat_id] = last_messages[chat_id][-20:]
-
-
-def send_long_text_as_file(chat_id, text, filename="otvet.txt"):
-    try:
-        data = text.encode('utf-8')
-        bot.send_document(chat_id, (filename, data))
-        return True
-    except Exception as e:
-        log_error(f"Send file error: {e}")
-        return False
-
-
-def send_photo_safe(chat_id, image_url, caption):
-    try:
-        r = requests.get(image_url, timeout=15)
-        if r.status_code != 200:
-            return None
-        img = r.content
-        msg = bot.send_photo(chat_id, img, caption=caption, parse_mode='HTML')
-        return msg.message_id
-    except Exception as e:
-        log_error(f"Send photo error: {e}")
-        return None
-
-
-def send_with_sound(chat_id, text, reply_markup=None, parse_mode='HTML'):
-    user = get_user(chat_id)
-    sound_on = user[23]
-    try:
-        return bot.send_message(chat_id, text, parse_mode=parse_mode,
-                                reply_markup=reply_markup,
-                                disable_notification=(not sound_on))
-    except Exception:
-        return bot.send_message(chat_id, text, reply_markup=reply_markup)
-
-
-def check_banned(chat_id):
-    user = get_user(chat_id)
-    return bool(user[10]), user[11] if user[11] else ""
-
-
-def send_banned_message(chat_id):
-    banned, reason = check_banned(chat_id)
-    if not banned:
-        return False
-    clear_old_messages(chat_id)
-    text = (f"🚫 <b>Вы забанены.</b>\n\n"
-            f"Причина: {escape_html(reason) if reason else 'не указана'}")
-    sent = bot.send_message(chat_id, text, parse_mode='HTML')
-    remember(chat_id, sent.message_id)
-    return True
-
-
-def deny_if_banned_or_maintenance(chat_id, call=None, message=None):
-    if call and not check_spam(chat_id, cooldown=2):
-        try:
-            bot.answer_callback_query(call.id, "⏳ Не спамь")
-        except Exception:
-            pass
-        return True
-
-    state = get_user(chat_id)[1]
-    if state in ('gen_processing', 'edit_processing'):
-        if call:
-            try:
-                bot.answer_callback_query(call.id, "⏳ Генерация идёт, подожди")
-            except Exception:
-                pass
-        return True
-
-    banned, reason = check_banned(chat_id)
-    if banned:
-        if call:
-            try:
-                bot.answer_callback_query(call.id, "🚫 Вы забанены.")
-            except Exception:
-                pass
-            try:
-                bot.delete_message(chat_id, call.message.message_id)
-            except Exception:
-                pass
-        send_banned_message(chat_id)
-        return True
-    if not can_use_during_maintenance(chat_id):
-        conn = get_conn()
-        c = conn.cursor()
-        c.execute("SELECT enabled, message FROM maintenance WHERE id=1")
-        row = c.fetchone()
-        conn.close()
-        if row and row[0]:
-            msg = row[1] if row[1] else "Технические работы"
-            try:
-                if call:
-                    bot.answer_callback_query(call.id, "🛠 Тех.работы")
-                    try:
-                        bot.delete_message(chat_id, call.message.message_id)
-                    except Exception:
-                        pass
-                clear_old_messages(chat_id)
-                sent = bot.send_message(chat_id, f"🛠 <b>{escape_html(msg)}</b>",
-                                        parse_mode='HTML', reply_markup=maintenance_menu())
-                remember(chat_id, sent.message_id)
-            except Exception:
-                pass
-            return True
-    return False
-
-
-# ============================================================
-# БОЛЕЕ ПОЗДНИЕ ФУНКЦИИ (объявляем здесь, чтобы не падало)
-# ============================================================
-
-def can_use_during_maintenance(chat_id):
-    if chat_id == ADMIN_ID:
-        return True
-    user = get_user(chat_id)
-    return bool(user[22])
-
-
-def check_support_muted(chat_id):
-    user = get_user(chat_id)
-    muted_until = user[21]
-    now = int(time.time())
-    if muted_until > now:
-        left = muted_until - now
-        minutes = left // 60
-        seconds = left % 60
-        if minutes > 0:
-            return True, f"{minutes} мин {seconds} сек"
-        return True, f"{seconds} сек"
-    return False, ""
-
-
-def clear_history(chat_id):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("DELETE FROM history WHERE chat_id=?", (chat_id,))
-    conn.commit()
-    conn.close()
-
-
-# ============================================================
 # ГЛАВНОЕ МЕНЮ + /start + НАВИГАЦИЯ
 # ============================================================
 
@@ -1240,18 +1338,7 @@ def start(message):
     _last_ai_message.pop(message.chat.id, None)
     if send_banned_message(message.chat.id):
         return
-    has_ban, ban_reason, ban_time = has_ban_record(message.chat.id)
     user = get_user(message.chat.id)
-    banned = user[10]
-    if has_ban and banned:
-        try:
-            bot.send_message(
-                message.chat.id,
-                f"🚫 <b>Вы были забанены.</b>\n\nПричина: {escape_html(ban_reason) if ban_reason else 'не указана'}\n\nДля разбана обратитесь в поддержку.",
-                parse_mode='HTML')
-        except Exception:
-            pass
-        return
     trial_started = user[4]
     trial_used = user[5]
     if trial_started == 0 and not trial_used:
@@ -1271,19 +1358,6 @@ def start(message):
             return
     send_main_menu(message.chat.id)
 
-
-def has_ban_record(chat_id):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT reason, timestamp FROM bans WHERE chat_id=? ORDER BY id DESC LIMIT 1", (chat_id,))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        return True, row[0] if row[0] else "", row[1] if row[1] else 0
-    return False, "", 0
-
-
-# === НАВИГАЦИЯ ===
 
 @bot.callback_query_handler(func=lambda call: call.data == "back_to_main")
 def back_to_main(call):
@@ -1459,8 +1533,6 @@ def noop_handler(call):
     bot.answer_callback_query(call.id, "")
 
 
-# === МЕНЮ НАСТРОЕК ===
-
 @bot.callback_query_handler(func=lambda call: call.data == "menu_settings")
 def settings_menu_handler(call):
     if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
@@ -1560,8 +1632,6 @@ def support(call):
         pass
     bot.answer_callback_query(call.id)
 
-
-# === ХЕНДЛЕРЫ ИНСТРУКЦИЙ ===
 
 @bot.callback_query_handler(func=lambda call: call.data == "help_bot")
 def help_bot(call):
@@ -1678,8 +1748,6 @@ def help_edit(call):
     bot.answer_callback_query(call.id)
 
 
-# === НОВЫЙ ХЕНДЛЕР: «➕ Новый чат» ===
-
 @bot.callback_query_handler(func=lambda call: call.data == "new_chat")
 def new_chat_cmd(call):
     if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
@@ -1719,8 +1787,6 @@ def new_chat_cmd(call):
     except Exception:
         pass
 
-
-# === НОВЫЙ ХЕНДЛЕР: «🤖 ИИ Боб» (настройки ИИ) ===
 
 @bot.callback_query_handler(func=lambda call: call.data == "ai_bob_menu")
 def ai_bob_menu_handler(call):
@@ -1772,8 +1838,9 @@ def toggle_send_files(call):
         pass
 
 # ============================================================
-# Часть 3: Обработчики — генерация, редактирование, чат, файлы, история, покупки, тикеты
+# Часть 2: Генерация, GigaChat, чат, редактирование, файлы, история, покупки, тикеты
 # ============================================================
+
 
 # =============================
 # ГЕНЕРАЦИЯ КАРТИНОК
@@ -1804,7 +1871,7 @@ def image_menu(call):
         bot.answer_callback_query(call.id, "🚫 Лимит картинок исчерпан.")
         try:
             bot.edit_message_text(
-                f"🚫 <b>Лимит картинок исчерпан.</b>\n\nИспользовано: {used_images} / {limit_images}\n\nОбратитесь в поддержку.",
+                f"🚫 <b>Лимит картинок исчерпан.</b>\n\nИспользовано: {used_images} / {limit_images}",
                 chat_id=call.message.chat.id, message_id=call.message.message_id,
                 parse_mode='HTML', reply_markup=back_to_generate_menu())
         except Exception:
@@ -2294,34 +2361,8 @@ def ask_gigachat_with_progress(chat_id, question, mode, ai_mode):
     return answer
 
 
-def add_to_history(chat_id, role, content):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, role, content))
-    conn.commit()
-    conn.close()
-
-
-def get_history(chat_id, limit=20):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT role, content FROM history WHERE chat_id=? ORDER BY id DESC LIMIT ?", (chat_id, limit))
-    rows = c.fetchall()
-    conn.close()
-    return list(reversed(rows))
-
-
-def get_full_history(chat_id, limit=200):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT role, content FROM history WHERE chat_id=? ORDER BY id ASC LIMIT ?", (chat_id, limit))
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-
 # =============================
-# ЧАТ С ИИ (главный обработчик текста)
+# ЧАТ С ИИ
 # =============================
 
 @bot.callback_query_handler(func=lambda call: call.data == "menu_chat")
@@ -2727,8 +2768,7 @@ def edit_help(call):
         "1️⃣ Пришли фото (можно несколько)\n"
         "2️⃣ Напиши задание\n"
         "3️⃣ Нажми «✅ Готово»\n\n"
-        "💰 <b>Стоимость:</b> 4 токена\n"
-        "⏳ <b>Время:</b> 20-60 секунд"
+        "💰 <b>Стоимость:</b> 4 токена"
     )
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="edit_help_back"))
@@ -2795,14 +2835,6 @@ def edit_process_photo(message):
     tokens = user[0]
     if not state.startswith('edit_wait_photo'):
         return
-    if not can_use_during_maintenance(message.chat.id):
-        conn = get_conn()
-        c = conn.cursor()
-        c.execute("SELECT enabled FROM maintenance WHERE id=1")
-        row = c.fetchone()
-        conn.close()
-        if row and row[0]:
-            return
 
     if tokens < EDIT_COST:
         sent = bot.send_message(message.chat.id, f"❌ Недостаточно токенов. Нужно: {EDIT_COST}.",
@@ -3098,14 +3130,6 @@ def handle_photo(message):
         sent = bot.send_message(message.chat.id, "⏳ Дождись окончания генерации.")
         remember(message.chat.id, sent.message_id)
         return
-    if not can_use_during_maintenance(message.chat.id):
-        conn = get_conn()
-        c = conn.cursor()
-        c.execute("SELECT enabled FROM maintenance WHERE id=1")
-        row = c.fetchone()
-        conn.close()
-        if row and row[0]:
-            return
     if state.startswith('edit_wait_photo') or state.startswith('edit_collecting'):
         edit_process_photo(message)
         return
@@ -3120,14 +3144,6 @@ def handle_document(message):
     doc_id = message.document.file_id
     if check_duplicate(message.chat.id, f"doc_{doc_id}", cooldown=5):
         return
-    if not can_use_during_maintenance(message.chat.id):
-        conn = get_conn()
-        c = conn.cursor()
-        c.execute("SELECT enabled FROM maintenance WHERE id=1")
-        row = c.fetchone()
-        conn.close()
-        if row and row[0]:
-            return
     state = get_user(message.chat.id)[1]
     if state in ('gen_processing', 'edit_processing'):
         sent = bot.send_message(message.chat.id, "⏳ Дождись окончания генерации.")
@@ -3247,39 +3263,6 @@ def handle_document(message):
 # ИСТОРИЯ
 # =============================
 
-def get_image_history_by_kind(chat_id, kind, limit=50):
-    conn = get_conn()
-    c = conn.cursor()
-    if kind:
-        c.execute("SELECT prompt, image_url, timestamp FROM image_history WHERE chat_id=? AND kind=? ORDER BY id DESC LIMIT ?",
-                  (chat_id, kind, limit))
-    else:
-        c.execute("SELECT prompt, image_url, timestamp FROM image_history WHERE chat_id=? ORDER BY id DESC LIMIT ?",
-                  (chat_id, limit))
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-
-def get_full_image_history(chat_id, limit=100):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT prompt, image_url, timestamp, kind FROM image_history WHERE chat_id=? ORDER BY id ASC LIMIT ?",
-              (chat_id, limit))
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-
-def add_image_history(chat_id, prompt, image_url, kind="gen"):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("INSERT INTO image_history (chat_id, prompt, image_url, timestamp, kind) VALUES (?, ?, ?, ?, ?)",
-              (chat_id, prompt, image_url, int(time.time()), kind))
-    conn.commit()
-    conn.close()
-
-
 @bot.callback_query_handler(func=lambda call: call.data == "hist_image" or call.data.startswith("hist_image_page_"))
 def hist_image(call):
     if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
@@ -3315,8 +3298,7 @@ def hist_image(call):
     sent = bot.send_message(
         call.message.chat.id,
         f"🎨 <b>История генераций</b> (стр. {page}/{total_pages})\n"
-        f"Всего: <b>{total}</b>\n\n"
-        f"Фото: <b>{start + 1}—{min(end, total)}</b>",
+        f"Всего: <b>{total}</b>",
         parse_mode='HTML')
     remember(call.message.chat.id, sent.message_id)
     for prompt, image_url, ts in page_items:
@@ -3376,8 +3358,7 @@ def hist_edit(call):
     sent = bot.send_message(
         call.message.chat.id,
         f"🖼 <b>История редактирований</b> (стр. {page}/{total_pages})\n"
-        f"Всего: <b>{total}</b>\n\n"
-        f"Фото: <b>{start + 1}—{min(end, total)}</b>",
+        f"Всего: <b>{total}</b>",
         parse_mode='HTML')
     remember(call.message.chat.id, sent.message_id)
     for prompt, image_url, ts in page_items:
@@ -3458,6 +3439,69 @@ def hist_chat(call):
 # =============================
 # ПОКУПКИ + ТИКЕТЫ
 # =============================
+
+def save_order(order_id, chat_id, tokens, amount):
+    expires = int(time.time()) + ORDER_TTL
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR REPLACE INTO orders "
+        "(order_id, chat_id, tokens, amount, created, paid, yoomoney_tx_id, expires) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (order_id, chat_id, tokens, amount, int(time.time()), 0, "", expires)
+    )
+    conn.commit()
+    conn.close()
+
+
+def mark_order_paid(order_id, tx_id=""):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("UPDATE orders SET paid=1, yoomoney_tx_id=? WHERE order_id=?", (tx_id, order_id))
+    conn.commit()
+    conn.close()
+
+
+def get_order(order_id):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT chat_id, tokens FROM orders WHERE order_id=?", (order_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+
+def get_all_orders():
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT order_id, chat_id, tokens, amount, created, paid, yoomoney_tx_id, expires FROM orders ORDER BY created DESC LIMIT 100")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def get_user_orders_paid(chat_id):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT order_id, tokens, amount, created, yoomoney_tx_id FROM orders WHERE chat_id=? AND paid=1 ORDER BY created DESC LIMIT 50",
+              (chat_id,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def get_user_orders_pending(chat_id):
+    cutoff = int(time.time())
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("DELETE FROM orders WHERE chat_id=? AND paid=0 AND expires > 0 AND expires < ?", (chat_id, cutoff))
+    conn.commit()
+    c.execute("SELECT order_id, tokens, amount, created, expires FROM orders WHERE chat_id=? AND paid=0 ORDER BY created DESC LIMIT 50",
+              (chat_id,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
 
 @bot.callback_query_handler(func=lambda call: call.data == "menu_buy")
 def buy_tokens(call):
@@ -3645,69 +3689,6 @@ def create_invoice(chat_id, amount, tokens):
     remember(chat_id, sent.message_id)
 
 
-def save_order(order_id, chat_id, tokens, amount):
-    expires = int(time.time()) + ORDER_TTL
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        "INSERT OR REPLACE INTO orders "
-        "(order_id, chat_id, tokens, amount, created, paid, yoomoney_tx_id, expires) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (order_id, chat_id, tokens, amount, int(time.time()), 0, "", expires)
-    )
-    conn.commit()
-    conn.close()
-
-
-def mark_order_paid(order_id, tx_id=""):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("UPDATE orders SET paid=1, yoomoney_tx_id=? WHERE order_id=?", (tx_id, order_id))
-    conn.commit()
-    conn.close()
-
-
-def get_order(order_id):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT chat_id, tokens FROM orders WHERE order_id=?", (order_id,))
-    row = c.fetchone()
-    conn.close()
-    return row
-
-
-def get_all_orders():
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT order_id, chat_id, tokens, amount, created, paid, yoomoney_tx_id, expires FROM orders ORDER BY created DESC LIMIT 100")
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-
-def get_user_orders_paid(chat_id):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT order_id, tokens, amount, created, yoomoney_tx_id FROM orders WHERE chat_id=? AND paid=1 ORDER BY created DESC LIMIT 50",
-              (chat_id,))
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-
-def get_user_orders_pending(chat_id):
-    cutoff = int(time.time())
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("DELETE FROM orders WHERE chat_id=? AND paid=0 AND expires > 0 AND expires < ?", (chat_id, cutoff))
-    conn.commit()
-    c.execute("SELECT order_id, tokens, amount, created, expires FROM orders WHERE chat_id=? AND paid=0 ORDER BY created DESC LIMIT 50",
-              (chat_id,))
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-
 @bot.callback_query_handler(func=lambda call: call.data == "menu_my_orders")
 def my_orders(call):
     if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
@@ -3850,7 +3831,7 @@ def cancel_order(call):
 
 
 # =============================
-# ТИКЕТЫ (поддержка)
+# ТИКЕТЫ
 # =============================
 
 def create_ticket(chat_id, username, message, photo_id=None):
@@ -3947,10 +3928,6 @@ def ticket_my(call):
         pass
     bot.answer_callback_query(call.id)
 
-
-# =============================
-# МЕНЮ ПОДДЕРЖКИ ВО ВРЕМЯ ТЕХ.РАБОТ
-# =============================
 
 @bot.callback_query_handler(func=lambda call: call.data == "maint_support")
 def maint_support(call):
@@ -4069,8 +4046,9 @@ def maint_ticket_my(call):
     bot.answer_callback_query(call.id)
 
 # ============================================================
-# Часть 4: Админка, оплата (ЮMoney), воркеры
+# Часть 3: Админка, оплата, воркеры, Flask API
 # ============================================================
+
 
 # =============================
 # АДМИН-ПАНЕЛЬ
@@ -4099,58 +4077,6 @@ def admin_panel(call):
 # ТЕХ.РАБОТЫ
 # =============================
 
-def get_maintenance():
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT active, message, enabled, notified FROM maintenance WHERE id=1")
-    row = c.fetchone()
-    conn.close()
-    if not row:
-        return (0, "Технические работы, пожалуйста подождите", 0, 1)
-    return row
-
-
-def set_maintenance(active, message=None, enabled=None, notified=None):
-    conn = get_conn()
-    c = conn.cursor()
-    if message is not None:
-        c.execute("UPDATE maintenance SET active=?, message=? WHERE id=1", (active, message))
-    else:
-        c.execute("UPDATE maintenance SET active=? WHERE id=1", (active,))
-    if enabled is not None:
-        c.execute("UPDATE maintenance SET enabled=? WHERE id=1", (enabled,))
-    if notified is not None:
-        c.execute("UPDATE maintenance SET notified=? WHERE id=1", (notified,))
-    conn.commit()
-    conn.close()
-
-
-def save_maintenance_notified(chat_id, message_id):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("INSERT INTO maintenance_notified (chat_id, message_id, timestamp) VALUES (?, ?, ?)",
-              (chat_id, message_id, int(time.time())))
-    conn.commit()
-    conn.close()
-
-
-def get_maintenance_notified():
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT chat_id, message_id FROM maintenance_notified")
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-
-def clear_maintenance_notified():
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("DELETE FROM maintenance_notified")
-    conn.commit()
-    conn.close()
-
-
 @bot.callback_query_handler(func=lambda call: call.data == "admin_maintenance")
 def admin_maintenance(call):
     if call.message.chat.id != ADMIN_ID:
@@ -4167,16 +4093,8 @@ def admin_maintenance(call):
         "   🛠 ТЕХНИЧЕСКИЕ РАБОТЫ\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Статус: <b>{status}</b>\n"
-        f"Текст: <i>{escape_html(msg)}</i>\n\n"
-        f"📱 Приложение тоже будет недоступно"
+        f"Текст: <i>{escape_html(msg)}</i>"
     )
-    if has_active_operations():
-        conn = get_conn()
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM active_operations WHERE started > ?", (int(time.time()) - 300,))
-        cnt = c.fetchone()[0]
-        conn.close()
-        text += f"\n\n⚠️ Активных операций: <b>{cnt}</b>"
     markup = telebot.types.InlineKeyboardMarkup()
     if enabled:
         markup.add(telebot.types.InlineKeyboardButton("🔴 Выключить", callback_data="maint_off"))
@@ -4305,9 +4223,6 @@ def admin_errors(call):
         return
     path = "/app/data/errors.log"
     now = int(time.time())
-    cut_30m = now - 1800
-    cut_1h = now - 3600
-    cut_24h = now - 86400
     cnt_30m = cnt_1h = cnt_24h = total = 0
     if os.path.exists(path):
         try:
@@ -4318,48 +4233,25 @@ def admin_errors(call):
                         date_str = line[1:20]
                         try:
                             ts = int(time.mktime(time.strptime(date_str, "%Y-%m-%d %H:%M:%S")))
-                            if ts >= cut_30m:
+                            if ts >= now - 1800:
                                 cnt_30m += 1
-                            if ts >= cut_1h:
+                            if ts >= now - 3600:
                                 cnt_1h += 1
-                            if ts >= cut_24h:
+                            if ts >= now - 86400:
                                 cnt_24h += 1
                         except Exception:
                             pass
         except Exception:
             pass
-    active_count = 0
-    active_list = []
-    try:
-        conn = get_conn()
-        c = conn.cursor()
-        c.execute("SELECT chat_id, operation, started FROM active_operations ORDER BY started ASC")
-        active_rows = c.fetchall()
-        active_count = len(active_rows)
-        stuck_cutoff = now - 300
-        for chat_id, op_type, started in active_rows:
-            if started < stuck_cutoff:
-                duration = now - started
-                active_list.append(f"chat_id {chat_id} ({op_type}, {duration}s)")
-        conn.close()
-    except Exception:
-        pass
     text = (
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         "       ⚠️ Ошибки\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📊 Всего ошибок: <b>{total}</b>\n\n"
+        f"📊 Всего: <b>{total}</b>\n"
         f"📅 30 минут: <b>{cnt_30m}</b>\n"
         f"📅 Час: <b>{cnt_1h}</b>\n"
-        f"📅 Сутки: <b>{cnt_24h}</b>\n\n"
-        f"🔄 Активных операций: <b>{active_count}</b>\n"
+        f"📅 Сутки: <b>{cnt_24h}</b>\n"
     )
-    if active_list:
-        text += f"⚠️ Застрявших: <b>{len(active_list)}</b>\n"
-        for item in active_list[:5]:
-            text += f"   → <code>{item}</code>\n"
-        if len(active_list) > 5:
-            text += f"   ...и ещё {len(active_list) - 5}\n"
     try:
         bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id,
                               parse_mode='HTML', reply_markup=errors_menu())
@@ -4391,35 +4283,16 @@ def admin_errors_send(call):
         return
     path = "/app/data/errors.log"
     if not os.path.exists(path):
-        bot.answer_callback_query(call.id, "❌ Ошибок не было — файла нет")
+        bot.answer_callback_query(call.id, "❌ Файла нет")
         return
     size = os.path.getsize(path)
     if size == 0:
-        bot.answer_callback_query(call.id, "❌ Файл пустой — ошибок нет")
+        bot.answer_callback_query(call.id, "❌ Пусто")
         return
-    errors_count = 0
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            errors_count = sum(1 for _ in f)
-    except Exception:
-        pass
-    days_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
-    day_name = days_ru[time.localtime().tm_wday]
-    filename = f"errors_{time.strftime('%Y-%m-%d_%H-%M')}.log"
-    caption = (
-        f"📤 <b>Отправлено вручную</b>\n\n"
-        f"📅 <b>Дата:</b> {time.strftime('%d.%m.%Y')}\n"
-        f"📆 <b>День:</b> {day_name}\n"
-        f"⏱ <b>Время:</b> {time.strftime('%H:%M:%S')}\n"
-        f"🗓 <b>Год:</b> {time.strftime('%Y')}\n\n"
-        f"📊 Ошибок: <b>{errors_count}</b>\n"
-        f"📦 Размер: <b>{size / 1024:.1f} КБ</b>"
-    )
     try:
         with open(path, "rb") as f:
             data = f.read()
-        bot.send_document(ERRORS_CHANNEL_ID, (filename, data),
-                          caption=caption, parse_mode='HTML')
+        bot.send_document(ERRORS_CHANNEL_ID, ("errors.log", data), caption="📤 errors.log")
         bot.answer_callback_query(call.id, "✅ Отправлено")
     except Exception as e:
         bot.answer_callback_query(call.id, f"❌ {e}")
@@ -4472,7 +4345,7 @@ def show_logs(call):
     for chat_id, username, atype, adata, ts in rows:
         when = time.strftime('%d.%m %H:%M', time.localtime(ts)) if ts else "—"
         emoji = {"gen": "🎨", "edit": "🖼", "ai": "🤖", "buy": "💳",
-                 "ban": "🚫", "delete": "🗑", "file": "📄", "ticket": "🎫"}.get(atype, "•")
+                 "ban": "🚫", "ticket": "🎫"}.get(atype, "•")
         name = username if username else f"ID:{chat_id}"
         short = adata[:60] + "..." if len(adata) > 60 else adata
         text += f"[{when}] {emoji} {name}\n{escape_html(short)}\n\n"
@@ -4519,18 +4392,15 @@ def logs_file(call):
     if not rows:
         bot.answer_callback_query(call.id, "Логов нет.")
         return
-    txt = f"ЛОГИ ДЕЙСТВИЙ — {time.strftime('%d.%m.%Y %H:%M')}\n"
-    txt += "=" * 60 + "\n\n"
+    txt = f"ЛОГИ — {time.strftime('%d.%m.%Y %H:%M')}\n" + "=" * 60 + "\n\n"
     for chat_id, username, atype, adata, ts in rows:
         when = time.strftime('%d.%m.%Y %H:%M:%S', time.localtime(ts)) if ts else "—"
         name = username if username else f"ID:{chat_id}"
         txt += f"[{when}] {atype} | {name}\n{adata}\n\n"
     try:
-        data = txt.encode('utf-8')
-        bot.send_document(call.message.chat.id, ("logs.txt", data),
-                          caption=f"📊 Логи: {len(rows)}")
+        bot.send_document(call.message.chat.id, ("logs.txt", txt.encode('utf-8')))
     except Exception as e:
-        bot.send_message(call.message.chat.id, f"❌ Ошибка файла: {e}")
+        bot.send_message(call.message.chat.id, f"❌ {e}")
     bot.answer_callback_query(call.id)
 
 
@@ -4542,7 +4412,7 @@ def logs_clear_confirm(call):
     markup.add(telebot.types.InlineKeyboardButton("✅ Да, очистить", callback_data="logs_clear_yes"))
     markup.add(telebot.types.InlineKeyboardButton("❌ Отмена", callback_data="admin_logs"))
     try:
-        bot.edit_message_text("⚠️ <b>ОЧИСТИТЬ ВСЕ ЛОГИ?</b>\n\nНельзя отменить.",
+        bot.edit_message_text("⚠️ <b>ОЧИСТИТЬ ВСЕ ЛОГИ?</b>",
                               chat_id=call.message.chat.id, message_id=call.message.message_id,
                               parse_mode='HTML', reply_markup=markup)
     except Exception:
@@ -4559,7 +4429,7 @@ def logs_clear_execute(call):
     c.execute("DELETE FROM action_logs")
     conn.commit()
     conn.close()
-    bot.answer_callback_query(call.id, "🗑 Логи очищены")
+    bot.answer_callback_query(call.id, "🗑 Очищено")
     admin_logs(call)
 
 
@@ -4611,34 +4481,11 @@ def wipe_all_data(what="all"):
         c.execute("DELETE FROM active_operations")
         c.execute("DELETE FROM maintenance_notified")
         c.execute("""UPDATE users SET 
-            tokens = 0,
-            state = 'idle',
-            trial_started = 0,
-            trial_used = 0,
-            used_images = 0,
-            used_chats = 0,
-            used_edits = 0
+            tokens = 0, state = 'idle', trial_started = 0, trial_used = 0,
+            used_images = 0, used_chats = 0, used_edits = 0
             """)
     conn.commit()
     conn.close()
-
-
-def get_all_users():
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT chat_id, username, tokens FROM users ORDER BY tokens DESC")
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-
-def find_user_by_id(chat_id):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT chat_id, username, tokens FROM users WHERE chat_id=?", (chat_id,))
-    row = c.fetchone()
-    conn.close()
-    return row
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "admin_wipe")
@@ -4673,7 +4520,7 @@ def wipe_user_select(call):
                                                        callback_data=f"wipe_user_{uid}"))
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_wipe"))
     try:
-        bot.edit_message_text("👤 <b>Кого очистить?</b>\n\nВыбери юзера:",
+        bot.edit_message_text("👤 <b>Кого очистить?</b>",
                               chat_id=call.message.chat.id, message_id=call.message.message_id,
                               parse_mode='HTML', reply_markup=markup)
     except Exception:
@@ -4691,13 +4538,7 @@ def wipe_user_menu_handler(call):
     uid = int(uid_str)
     user = get_user(uid)
     uname = user[6] if user[6] else "—"
-    text = (
-        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"   🧹 ОЧИСТКА USER {uid}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"👤 {uname}\n\n"
-        f"Что удалить?"
-    )
+    text = f"🧹 ОЧИСТКА USER {uid}\n👤 {uname}\n\nЧто удалить?"
     try:
         bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id,
                               parse_mode='HTML', reply_markup=wipe_user_menu(uid))
@@ -4713,38 +4554,21 @@ def wipe_user_do_confirm(call):
     rest = call.data.replace("wipe_user_do_", "")
     parts = rest.split("_", 1)
     if len(parts) < 2:
-        bot.answer_callback_query(call.id, "❌ Ошибка.")
         return
     what, uid_str = parts
     if not uid_str.isdigit():
-        bot.answer_callback_query(call.id, "❌ Ошибка ID.")
         return
     uid = int(uid_str)
-    names = {
-        "chat": "💬 Переписку",
-        "image": "🎨 Генерации",
-        "edit": "🖼 Редактирования",
-        "orders": "🛒 Заказы",
-        "tickets": "📋 Тикеты",
-        "stats": "📊 Статистику",
-        "all": "💥 ВСЁ",
-    }
+    names = {"chat": "💬 Переписку", "image": "🎨 Генерации", "edit": "🖼 Редактирования",
+             "orders": "🛒 Заказы", "tickets": "📋 Тикеты", "stats": "📊 Статистику", "all": "💥 ВСЁ"}
     label = names.get(what, what)
-    user = get_user(uid)
-    uname = user[6] if user[6] else "—"
-    text = (
-        f"⚠️ <b>ПОДТВЕРЖДЕНИЕ</b>\n\n"
-        f"Удалить: <b>{label}</b>\n\n"
-        f"🆔 <code>{uid}</code>\n"
-        f"👤 {uname}\n\n"
-        f"<b>Нельзя отменить!</b>"
-    )
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("✅ Да, удалить",
                                                    callback_data=f"wipe_user_yes_{what}_{uid}"))
     markup.add(telebot.types.InlineKeyboardButton("❌ Отмена", callback_data=f"wipe_user_{uid}"))
     try:
-        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id,
+        bot.edit_message_text(f"⚠️ Удалить: <b>{label}</b> у <code>{uid}</code>?",
+                              chat_id=call.message.chat.id, message_id=call.message.message_id,
                               parse_mode='HTML', reply_markup=markup)
     except Exception:
         pass
@@ -4758,27 +4582,16 @@ def wipe_user_do_execute(call):
     rest = call.data.replace("wipe_user_yes_", "")
     parts = rest.split("_", 1)
     if len(parts) < 2:
-        bot.answer_callback_query(call.id, "❌ Ошибка.")
         return
     what, uid_str = parts
     if not uid_str.isdigit():
-        bot.answer_callback_query(call.id, "❌ Ошибка ID.")
         return
     uid = int(uid_str)
     wipe_user_data(uid, what)
     bot.answer_callback_query(call.id, "✅ Очищено")
-    user = get_user(uid)
-    uname = user[6] if user[6] else "—"
-    text = (
-        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"   🧹 Очистка юзера {uid}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"👤 {uname}\n\n"
-        f"✅ Готово!\n\n"
-        f"Что ещё удалить?"
-    )
     try:
-        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id,
+        bot.edit_message_text(f"🧹 Очистка юзера {uid}\n✅ Готово!",
+                              chat_id=call.message.chat.id, message_id=call.message.message_id,
                               parse_mode='HTML', reply_markup=wipe_user_menu(uid))
     except Exception:
         pass
@@ -4789,24 +4602,13 @@ def wipe_confirm(call):
     if call.message.chat.id != ADMIN_ID:
         return
     what = call.data.replace("wipe_confirm_", "")
-    names = {
-        "chat_all": "💬 ВСЕ ПЕРЕПИСКИ",
-        "image_all": "🎨 ВСЕ ГЕНЕРАЦИИ",
-        "edit_all": "🖼 ВСЕ РЕДАКТИРОВАНИЯ",
-        "stats_all": "📊 ВСЮ СТАТИСТИКУ",
-        "all_all": "💥 ВСЁ (кроме юзеров)",
-    }
+    names = {"chat_all": "💬 ВСЕ ПЕРЕПИСКИ", "image_all": "🎨 ВСЕ ГЕНЕРАЦИИ",
+             "edit_all": "🖼 ВСЕ РЕДАКТИРОВАНИЯ", "stats_all": "📊 ВСЮ СТАТИСТИКУ",
+             "all_all": "💥 ВСЁ"}
     label = names.get(what, what)
-    text = (
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "   ⚠️ ПОДТВЕРЖДЕНИЕ\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Удалить: <b>{label}</b>\n\n"
-        f"У ВСЕХ пользователей.\n\n"
-        f"Нельзя отменить."
-    )
     try:
-        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id,
+        bot.edit_message_text(f"⚠️ Удалить: <b>{label}</b> у ВСЕХ?",
+                              chat_id=call.message.chat.id, message_id=call.message.message_id,
                               parse_mode='HTML', reply_markup=wipe_confirm_menu(what))
     except Exception:
         pass
@@ -4818,25 +4620,15 @@ def wipe_do(call):
     if call.message.chat.id != ADMIN_ID:
         return
     what = call.data.replace("wipe_do_", "")
-    mapping = {
-        "chat_all": "chat",
-        "image_all": "image",
-        "edit_all": "edit",
-        "stats_all": "stats",
-        "all_all": "all",
-    }
+    mapping = {"chat_all": "chat", "image_all": "image", "edit_all": "edit",
+               "stats_all": "stats", "all_all": "all"}
     real_what = mapping.get(what, what)
     wipe_all_data(real_what)
     bot.answer_callback_query(call.id, "✅ Очищено")
     try:
-        bot.edit_message_text(
-            "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "      🧹 ОЧИСТКА\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "✅ Готово!\n\n"
-            "Что ещё очистить?",
-            chat_id=call.message.chat.id, message_id=call.message.message_id,
-            parse_mode='HTML', reply_markup=wipe_menu())
+        bot.edit_message_text("🧹 ОЧИСТКА\n✅ Готово!",
+                              chat_id=call.message.chat.id, message_id=call.message.message_id,
+                              parse_mode='HTML', reply_markup=wipe_menu())
     except Exception:
         pass
 
@@ -4906,7 +4698,7 @@ def subs_add(call):
                                                        callback_data=f"subs_toggle_{uid}"))
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="admin_subs"))
     try:
-        bot.edit_message_text("✍️ <b>Выбери юзера для подписки:</b>\n\n✅ — уже подписан",
+        bot.edit_message_text("✍️ Выбери юзера для подписки:",
                               chat_id=call.message.chat.id, message_id=call.message.message_id,
                               parse_mode='HTML', reply_markup=markup)
     except Exception:
@@ -4947,7 +4739,7 @@ def subs_remove(call):
                                                        callback_data=f"subs_rm_{uid}"))
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="admin_subs"))
     try:
-        bot.edit_message_text("✍️ <b>Выбери кого убрать:</b>",
+        bot.edit_message_text("✍️ Выбери кого убрать:",
                               chat_id=call.message.chat.id, message_id=call.message.message_id,
                               parse_mode='HTML', reply_markup=markup)
     except Exception:
@@ -4975,8 +4767,7 @@ def subs_rm(call):
 def get_tickets_by_status(status):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT id, chat_id, username, message, photo_id, created FROM tickets WHERE status=? ORDER BY id ASC",
-              (status,))
+    c.execute("SELECT id, chat_id, username, message, photo_id, created FROM tickets WHERE status=? ORDER BY id ASC", (status,))
     rows = c.fetchall()
     conn.close()
     return rows
@@ -5052,7 +4843,7 @@ def admin_tickets_open(call):
         markup.add(telebot.types.InlineKeyboardButton(f"#{tid} — {uname[:20]}", callback_data=f"admin_view_{tid}"))
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="admin_tickets"))
     try:
-        bot.edit_message_text("📬 <b>Открытые тикеты:</b>",
+        bot.edit_message_text("📬 Открытые тикеты:",
                               chat_id=call.message.chat.id, message_id=call.message.message_id,
                               parse_mode='HTML', reply_markup=markup)
     except Exception:
@@ -5079,7 +4870,7 @@ def admin_tickets_done(call):
         markup.add(telebot.types.InlineKeyboardButton(f"✅ #{tid} — {uname[:20]}", callback_data=f"admin_view_{tid}"))
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="admin_tickets"))
     try:
-        bot.edit_message_text("✅ <b>Выполненные тикеты:</b>",
+        bot.edit_message_text("✅ Выполненные тикеты:",
                               chat_id=call.message.chat.id, message_id=call.message.message_id,
                               parse_mode='HTML', reply_markup=markup)
     except Exception:
@@ -5124,10 +4915,9 @@ def admin_reject_ticket(call):
     delete_ticket(ticket_id)
     bot.answer_callback_query(call.id, "❌ Удалён")
     try:
-        bot.edit_message_text(
-            f"❌ Тикет #{ticket_id} удалён.\n\n📋 <b>Тикеты</b>\nВыбери раздел:",
-            chat_id=call.message.chat.id, message_id=call.message.message_id,
-            parse_mode='HTML', reply_markup=tickets_menu())
+        bot.edit_message_text(f"❌ Тикет #{ticket_id} удалён.",
+                              chat_id=call.message.chat.id, message_id=call.message.message_id,
+                              parse_mode='HTML', reply_markup=tickets_menu())
     except Exception:
         pass
 
@@ -5163,13 +4953,12 @@ def admin_send_reply(message, ticket_id):
                          parse_mode='HTML')
     except Exception:
         pass
-    sent = bot.send_message(message.chat.id, f"✅ Ответ отправлен.",
-                            reply_markup=tickets_menu())
+    sent = bot.send_message(message.chat.id, f"✅ Ответ отправлен.", reply_markup=tickets_menu())
     remember(message.chat.id, sent.message_id)
 
 
 # =============================
-# НАЧИСЛЕНИЕ/СПИСАНИЕ ТОКЕНОВ
+# ТОКЕНЫ
 # =============================
 
 @bot.callback_query_handler(func=lambda call: call.data == "admin_give")
@@ -5187,7 +4976,7 @@ def admin_give(call):
                                                        callback_data=f"admin_give_to_{uid}"))
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
     try:
-        bot.edit_message_text("💰 <b>Начислить токены</b>\n\nВыбери пользователя:",
+        bot.edit_message_text("💰 Начислить токены:",
                               chat_id=call.message.chat.id, message_id=call.message.message_id,
                               parse_mode='HTML', reply_markup=markup)
     except Exception:
@@ -5227,7 +5016,7 @@ def admin_give_amount(message, uid):
                          parse_mode='HTML')
     except Exception:
         pass
-    sent = bot.send_message(message.chat.id, f"✅ Начислено {cnt} токенов для {uid}.",
+    sent = bot.send_message(message.chat.id, f"✅ Начислено {cnt} для {uid}.",
                             reply_markup=admin_menu())
     remember(message.chat.id, sent.message_id)
 
@@ -5246,7 +5035,7 @@ def admin_take(call):
                                                        callback_data=f"admin_take_from_{uid}"))
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
     try:
-        bot.edit_message_text("💸 <b>Забрать токены</b>\n\nВыбери пользователя:",
+        bot.edit_message_text("💸 Забрать токены:",
                               chat_id=call.message.chat.id, message_id=call.message.message_id,
                               parse_mode='HTML', reply_markup=markup)
     except Exception:
@@ -5265,13 +5054,7 @@ def admin_take_from(call):
     user = get_user(uid)
     uname = user[6] if user[6] else "—"
     tokens = user[0]
-    text = (
-        f"⚠️ <b>СПИСАНИЕ ТОКЕНОВ</b>\n\n"
-        f"🆔 <code>{uid}</code>\n"
-        f"👤 {uname}\n"
-        f"💰 Текущий баланс: <b>{tokens}</b>\n\n"
-        f"Сколько забрать?"
-    )
+    text = f"⚠️ <b>СПИСАНИЕ</b>\n🆔 {uid} — {uname}\n💰 Баланс: {tokens}\n\nСколько забрать?"
     sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML',
                             reply_markup=back_to_admin_menu())
     bot.register_next_step_handler(sent, admin_take_amount, uid)
@@ -5296,13 +5079,13 @@ def admin_take_amount(message, uid):
                          parse_mode='HTML')
     except Exception:
         pass
-    sent = bot.send_message(message.chat.id, f"✅ Забрано {cnt} токенов у {uid}.",
+    sent = bot.send_message(message.chat.id, f"✅ Забрано {cnt} у {uid}.",
                             reply_markup=admin_menu())
     remember(message.chat.id, sent.message_id)
 
 
 # =============================
-# СПИСОК ЮЗЕРОВ / УПРАВЛЕНИЕ
+# СПИСОК ЮЗЕРОВ
 # =============================
 
 @bot.callback_query_handler(func=lambda call: call.data == "admin_users" or call.data.startswith("admin_users_page_"))
@@ -5325,8 +5108,7 @@ def admin_users(call):
         bot.answer_callback_query(call.id)
         return
     page_users, page, total_pages, total = paginate(users, page, per_page=10)
-    text = f"👥 <b>Список пользователей</b> (стр. {page}/{total_pages})\n"
-    text += f"Всего: <b>{total}</b>\n\n"
+    text = f"👥 <b>Список</b> (стр. {page}/{total_pages})\nВсего: <b>{total}</b>\n\n"
     for uid, uname, tokens in page_users:
         name = uname if uname else "—"
         text += f"🆔 <code>{uid}</code> — {name} — <b>{tokens}</b> ток.\n"
@@ -5365,7 +5147,7 @@ def admin_manage(call):
     markup.row(*nav)
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
     try:
-        bot.edit_message_text(f"🚫 <b>Управление юзером</b> (стр. {page}/{total_pages})\n\nВыбери:",
+        bot.edit_message_text(f"🚫 Управление (стр. {page}/{total_pages}):",
                               chat_id=call.message.chat.id, message_id=call.message.message_id,
                               parse_mode='HTML', reply_markup=markup)
     except Exception:
@@ -5416,12 +5198,11 @@ def admin_mng_user(call):
     markup.add(telebot.types.InlineKeyboardButton("🎨 Картинки ВКЛ/ВЫКЛ", callback_data=f"admin_mng_img_{uid}"))
     markup.add(telebot.types.InlineKeyboardButton("🤖 Чат ВКЛ/ВЫКЛ", callback_data=f"admin_mng_chat_{uid}"))
     markup.add(telebot.types.InlineKeyboardButton("🎯 Лимиты", callback_data=f"admin_mng_limits_{uid}"))
-    markup.add(telebot.types.InlineKeyboardButton("🚫 Мьют поддержки", callback_data=f"admin_mng_mute_{uid}"))
+    markup.add(telebot.types.InlineKeyboardButton("🚫 Мьют", callback_data=f"admin_mng_mute_{uid}"))
     if ignore_maint:
-        markup.add(telebot.types.InlineKeyboardButton("🔒 Убрать игнор тех.работ", callback_data=f"admin_mng_ignore_off_{uid}"))
+        markup.add(telebot.types.InlineKeyboardButton("🔒 Убрать игнор", callback_data=f"admin_mng_ignore_off_{uid}"))
     else:
         markup.add(telebot.types.InlineKeyboardButton("🔓 Игнор тех.работ", callback_data=f"admin_mng_ignore_{uid}"))
-    markup.add(telebot.types.InlineKeyboardButton("📜 История", callback_data=f"admin_mng_hist_{uid}"))
     markup.add(telebot.types.InlineKeyboardButton("✍️ Написать", callback_data=f"admin_mng_write_{uid}"))
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="admin_manage"))
     try:
@@ -5453,10 +5234,6 @@ def admin_mng_ban_save(message, uid):
     if message.chat.id != ADMIN_ID:
         return
     reason = message.text or "не указана"
-    try:
-        bot.delete_message(message.chat.id, message.message_id)
-    except Exception:
-        pass
     update_user(uid, 'banned', 1)
     update_user(uid, 'ban_reason', reason)
     conn = get_conn()
@@ -5486,10 +5263,6 @@ def admin_mng_unban(call):
     update_user(uid, 'banned', 0)
     update_user(uid, 'ban_reason', '')
     bot.answer_callback_query(call.id, "✅ Разбанен")
-    try:
-        bot.send_message(uid, "✅ <b>Вы разбанены.</b>", parse_mode='HTML')
-    except Exception:
-        pass
     admin_mng_user(call)
 
 
@@ -5556,8 +5329,7 @@ def admin_mng_mute(call):
         return
     uid = int(uid_str)
     sent = bot.send_message(call.message.chat.id,
-                            f"🚫 На сколько минут замутить поддержку <code>{uid}</code>?\n\n"
-                            f"<i>Введи число (1-10080)</i>",
+                            f"🚫 На сколько минут? <code>{uid}</code> (1-10080):",
                             parse_mode='HTML', reply_markup=back_to_admin_menu())
     bot.register_next_step_handler(sent, admin_mng_mute_save, uid)
     bot.answer_callback_query(call.id)
@@ -5575,15 +5347,11 @@ def admin_mng_mute_save(message, uid):
         bot.send_message(message.chat.id, "❌ Введи число.", reply_markup=admin_menu())
         return
     if minutes < 1 or minutes > 10080:
-        bot.send_message(message.chat.id, "❌ 1-10080 минут (7 дней макс).", reply_markup=admin_menu())
+        bot.send_message(message.chat.id, "❌ 1-10080.", reply_markup=admin_menu())
         return
     until = int(time.time()) + minutes * 60
     update_user(uid, 'support_muted_until', until)
-    try:
-        bot.delete_message(message.chat.id, message.message_id)
-    except Exception:
-        pass
-    sent = bot.send_message(message.chat.id, f"✅ Мьют поддержки для {uid}: {minutes} мин.",
+    sent = bot.send_message(message.chat.id, f"✅ Мьют {uid}: {minutes} мин.",
                             reply_markup=admin_menu())
     remember(message.chat.id, sent.message_id)
 
@@ -5600,7 +5368,7 @@ def admin_mng_limits(call):
     li, lc, le = user[14], user[15], user[20]
     ui, uc, ue = user[16], user[17], user[19]
     text = (
-        f"🎯 <b>Лимиты для</b> <code>{uid}</code>\n\n"
+        f"🎯 <b>Лимиты</b> <code>{uid}</code>\n\n"
         f"🎨 Картинок: {ui}/{li if li >= 0 else '∞'}\n"
         f"🖼 Правок: {ue}/{le if le >= 0 else '∞'}\n"
         f"🤖 Чата: {uc}/{lc if lc >= 0 else '∞'}"
@@ -5609,7 +5377,7 @@ def admin_mng_limits(call):
     markup.add(telebot.types.InlineKeyboardButton("🎨 Лимит картинок", callback_data=f"admin_lim_img_{uid}"))
     markup.add(telebot.types.InlineKeyboardButton("🖼 Лимит правок", callback_data=f"admin_lim_edit_{uid}"))
     markup.add(telebot.types.InlineKeyboardButton("🤖 Лимит чата", callback_data=f"admin_lim_chat_{uid}"))
-    markup.add(telebot.types.InlineKeyboardButton("🔄 Сбросить счётчики", callback_data=f"admin_lim_reset_{uid}"))
+    markup.add(telebot.types.InlineKeyboardButton("🔄 Сбросить", callback_data=f"admin_lim_reset_{uid}"))
     markup.add(telebot.types.InlineKeyboardButton("♾ Снять всё", callback_data=f"admin_lim_clear_{uid}"))
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data=f"admin_mng_{uid}"))
     try:
@@ -5628,7 +5396,7 @@ def admin_lim_img(call):
     if not uid_str.isdigit():
         return
     uid = int(uid_str)
-    sent = bot.send_message(call.message.chat.id, f"🎨 Лимит картинок для <code>{uid}</code> (-1=∞):",
+    sent = bot.send_message(call.message.chat.id, f"🎨 Лимит картинок <code>{uid}</code> (-1=∞):",
                             parse_mode='HTML', reply_markup=back_to_admin_menu())
     bot.register_next_step_handler(sent, admin_lim_img_save, uid)
     bot.answer_callback_query(call.id)
@@ -5647,10 +5415,6 @@ def admin_lim_img_save(message, uid):
         return
     update_user(uid, 'limit_images', val)
     reset_used(uid, 'used_images')
-    try:
-        bot.delete_message(message.chat.id, message.message_id)
-    except Exception:
-        pass
     sent = bot.send_message(message.chat.id, f"✅ {val if val >= 0 else '∞'}", reply_markup=admin_menu())
     remember(message.chat.id, sent.message_id)
 
@@ -5663,7 +5427,7 @@ def admin_lim_edit(call):
     if not uid_str.isdigit():
         return
     uid = int(uid_str)
-    sent = bot.send_message(call.message.chat.id, f"🖼 Лимит правок для <code>{uid}</code> (-1=∞):",
+    sent = bot.send_message(call.message.chat.id, f"🖼 Лимит правок <code>{uid}</code> (-1=∞):",
                             parse_mode='HTML', reply_markup=back_to_admin_menu())
     bot.register_next_step_handler(sent, admin_lim_edit_save, uid)
     bot.answer_callback_query(call.id)
@@ -5682,10 +5446,6 @@ def admin_lim_edit_save(message, uid):
         return
     update_user(uid, 'limit_edits', val)
     reset_used(uid, 'used_edits')
-    try:
-        bot.delete_message(message.chat.id, message.message_id)
-    except Exception:
-        pass
     sent = bot.send_message(message.chat.id, f"✅ {val if val >= 0 else '∞'}", reply_markup=admin_menu())
     remember(message.chat.id, sent.message_id)
 
@@ -5698,7 +5458,7 @@ def admin_lim_chat(call):
     if not uid_str.isdigit():
         return
     uid = int(uid_str)
-    sent = bot.send_message(call.message.chat.id, f"🤖 Лимит чата для <code>{uid}</code> (-1=∞):",
+    sent = bot.send_message(call.message.chat.id, f"🤖 Лимит чата <code>{uid}</code> (-1=∞):",
                             parse_mode='HTML', reply_markup=back_to_admin_menu())
     bot.register_next_step_handler(sent, admin_lim_chat_save, uid)
     bot.answer_callback_query(call.id)
@@ -5717,10 +5477,6 @@ def admin_lim_chat_save(message, uid):
         return
     update_user(uid, 'limit_chats', val)
     reset_used(uid, 'used_chats')
-    try:
-        bot.delete_message(message.chat.id, message.message_id)
-    except Exception:
-        pass
     sent = bot.send_message(message.chat.id, f"✅ {val if val >= 0 else '∞'}", reply_markup=admin_menu())
     remember(message.chat.id, sent.message_id)
 
@@ -5754,66 +5510,6 @@ def admin_lim_clear(call):
     admin_mng_limits(call)
 
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_mng_hist_"))
-def admin_mng_hist(call):
-    if call.message.chat.id != ADMIN_ID:
-        return
-    uid_str = call.data.replace("admin_mng_hist_", "")
-    if not uid_str.isdigit():
-        return
-    uid = int(uid_str)
-    history = get_full_history(uid, limit=500)
-    img_hist = get_full_image_history(uid, limit=100)
-    txt = f"📜 ИСТОРИЯ ЗАПРОСОВ\nПользователь: {uid}\n"
-    txt += f"Дата: {time.strftime('%d.%m.%Y %H:%M')}\n"
-    txt += "=" * 60 + "\n\n"
-    txt += f"🤖 ЧАТ С ИИ ({len(history)} сообщений):\n"
-    txt += "-" * 40 + "\n"
-    if not history:
-        txt += "(пусто)\n"
-    for role, content in history:
-        prefix = "👤 ПОЛЬЗОВАТЕЛЬ:" if role == "user" else "🤖 БОБ:"
-        txt += f"\n{prefix}\n{content}\n"
-    txt += "\n\n"
-    txt += f"🎨 ФОТО ({len(img_hist)} записей):\n"
-    txt += "-" * 40 + "\n"
-    if not img_hist:
-        txt += "(пусто)\n"
-    for item in img_hist:
-        if len(item) == 4:
-            prompt, url, ts, kind = item
-        else:
-            prompt, url, ts = item
-            kind = "gen"
-        when = time.strftime('%d.%m.%Y %H:%M', time.localtime(ts)) if ts else "—"
-        tag = "🖼 EDIT" if kind == "edit" else "🎨 GEN"
-        txt += f"\n[{when}] {tag}\nПромт: {prompt}\nURL: {url}\n"
-    try:
-        data = txt.encode('utf-8')
-        size_kb = len(data) / 1024
-        user = get_user(uid)
-        username = user[6] if user[6] else "—"
-        caption = (
-            f"📜 <b>История запроса</b>\n\n"
-            f"🆔 <code>{uid}</code>\n"
-            f"👤 {username}\n\n"
-            f"🤖 Чат: <b>{len(history)}</b> сообщений\n"
-            f"🎨 Фото: <b>{len(img_hist)}</b>\n"
-            f"📦 Размер: <b>{size_kb:.1f} КБ</b>\n"
-            f"📅 {time.strftime('%d.%m.%Y %H:%M')}"
-        )
-        bot.send_document(call.message.chat.id,
-                          (f"history_{uid}_{time.strftime('%Y-%m-%d')}.txt", data),
-                          caption=caption, parse_mode='HTML')
-    except Exception as e:
-        bot.send_message(call.message.chat.id, f"❌ Ошибка файла: {e}")
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data=f"admin_mng_{uid}"))
-    s = bot.send_message(call.message.chat.id, "✅ Готово.", reply_markup=markup)
-    remember(call.message.chat.id, s.message_id)
-    bot.answer_callback_query(call.id)
-
-
 @bot.callback_query_handler(func=lambda call: call.data.startswith("admin_mng_write_"))
 def admin_mng_write(call):
     if call.message.chat.id != ADMIN_ID:
@@ -5834,45 +5530,15 @@ def admin_mng_write_save(message, uid):
         return
     if message.chat.id != ADMIN_ID:
         return
-    try:
-        bot.delete_message(message.chat.id, message.message_id)
-    except Exception:
-        pass
     text = message.text or ""
     try:
         bot.send_message(uid, f"📩 <b>Сообщение от администрации:</b>\n\n{escape_html(text)}",
                          parse_mode='HTML')
         sent = bot.send_message(message.chat.id, "✅ Отправлено.", reply_markup=admin_menu())
     except Exception as e:
-        sent = bot.send_message(message.chat.id, f"❌ {e}\n\nСсылка: tg://user?id={uid}",
+        sent = bot.send_message(message.chat.id, f"❌ {e}\n\ntg://user?id={uid}",
                                 reply_markup=admin_menu())
     remember(message.chat.id, sent.message_id)
-
-
-# =============================
-# ЛИМИТЫ (корень)
-# =============================
-
-@bot.callback_query_handler(func=lambda call: call.data == "admin_limits")
-def admin_limits_root(call):
-    if call.message.chat.id != ADMIN_ID:
-        return
-    users = get_all_users()
-    if not users:
-        return
-    markup = telebot.types.InlineKeyboardMarkup()
-    for uid, uname, tokens in users[:30]:
-        name = uname if uname else "—"
-        markup.add(telebot.types.InlineKeyboardButton(f"🎯 {uid} — {name}",
-                                                       callback_data=f"admin_mng_limits_{uid}"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
-    try:
-        bot.edit_message_text("🎯 <b>Лимиты</b>\n\nВыбери юзера:",
-                              chat_id=call.message.chat.id, message_id=call.message.message_id,
-                              parse_mode='HTML', reply_markup=markup)
-    except Exception:
-        pass
-    bot.answer_callback_query(call.id)
 
 
 # =============================
@@ -5897,10 +5563,7 @@ def admin_orders(call):
     for oid, uid, tokens, amount, created, paid, tx_id, expires in orders:
         when = time.strftime('%d.%m %H:%M', time.localtime(created)) if created else "—"
         status = "✅" if paid else "⏳"
-        text += f"🧾 <code>{oid}</code>\n👤 {uid}\n💰 {amount} ₽ → {tokens} ток.\n📅 {when} {status}\n"
-        if tx_id:
-            text += f"🆔 <code>{tx_id}</code>\n"
-        text += "\n"
+        text += f"🧾 <code>{oid}</code>\n👤 {uid}\n💰 {amount} ₽ → {tokens} ток.\n📅 {when} {status}\n\n"
     if len(text) > 4000:
         text = text[:4000] + "..."
     try:
@@ -5990,7 +5653,7 @@ def admin_broadcast_confirm(message, signed):
     markup.add(telebot.types.InlineKeyboardButton("✅ Отправить", callback_data="admin_bc_yes"))
     markup.add(telebot.types.InlineKeyboardButton("❌ Отмена", callback_data="admin_bc_no"))
     sent = bot.send_message(message.chat.id,
-                            f"📢 <b>Подтверждение</b>\n\n<i>{escape_html(message.text[:1000])}</i>\n\nОтправить?",
+                            f"📢 Подтверждение:\n\n<i>{escape_html(message.text[:1000])}</i>\n\nОтправить?",
                             parse_mode='HTML', reply_markup=markup)
     remember(message.chat.id, sent.message_id)
 
@@ -6027,43 +5690,8 @@ def admin_bc_yes(call):
     except Exception:
         pass
     bot.answer_callback_query(call.id)
-    if has_active_operations():
-        global pending_broadcast
-        pending_broadcast = {
-            "active": True,
-            "text": text,
-            "signed": signed,
-            "waiting_since": int(time.time())
-        }
-        markup = telebot.types.InlineKeyboardMarkup()
-        markup.add(telebot.types.InlineKeyboardButton("❌ Отменить", callback_data="broadcast_cancel"))
-        bot.send_message(
-            call.message.chat.id,
-            "⏳ <b>Есть активные операции</b>\n\n"
-            "Рассылка запустится, когда все закончат.\n"
-            "Если ждать больше 10 минут — запустится автоматически.",
-            parse_mode='HTML',
-            reply_markup=markup
-        )
-    else:
-        threading.Thread(target=send_broadcast, args=(text, signed), daemon=True).start()
-        bot.send_message(call.message.chat.id, "📢 Рассылка запущена в фоне")
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "broadcast_cancel")
-def broadcast_cancel(call):
-    if call.message.chat.id != ADMIN_ID:
-        return
-    global pending_broadcast
-    pending_broadcast = {"active": False, "text": "", "signed": False, "waiting_since": 0}
-    bot.answer_callback_query(call.id, "❌ Отменено")
-    try:
-        bot.edit_message_text("❌ Рассылка отменена.",
-                              chat_id=call.message.chat.id,
-                              message_id=call.message.message_id,
-                              reply_markup=admin_menu())
-    except Exception:
-        pass
+    threading.Thread(target=send_broadcast, args=(text, signed), daemon=True).start()
+    bot.send_message(call.message.chat.id, "📢 Рассылка запущена в фоне")
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "admin_bc_delete")
@@ -6083,11 +5711,6 @@ def admin_bc_delete(call):
             pass
     last_broadcast = {"messages": [], "active": False}
     bot.answer_callback_query(call.id, f"🗑 {deleted}")
-    try:
-        bot.edit_message_text(f"🗑 Удалено: {deleted}", chat_id=call.message.chat.id,
-                              message_id=call.message.message_id, reply_markup=admin_menu())
-    except Exception:
-        pass
 
 
 @bot.message_handler(commands=['find_user'])
@@ -6112,7 +5735,7 @@ def find_user_cmd(message):
 
 
 # =============================
-# ОПЛАТА (FLASK — pay + webhook)
+# ОПЛАТА (FLASK)
 # =============================
 
 @app.route('/pay/<amount>/<label>')
@@ -6162,19 +5785,19 @@ def yoomoney_webhook():
             f"━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"   ✅ ОПЛАТА ПРОШЛА!\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🧾 Счёт: <code>{label}</code>\n"
-            f"💰 Сумма: {real_amount} ₽\n"
+            f"🧾 {label}\n"
+            f"💰 {real_amount} ₽\n"
             f"🎫 Токенов: <b>{tokens}</b>\n"
             f"💎 Баланс: <b>{new_balance}</b>",
             parse_mode='HTML', reply_markup=main_menu(chat_id))
         remember(chat_id, sent.message_id)
-        log_action(chat_id, "buy", f"{real_amount} ₽ → {tokens} токенов")
-        notify_subscribers(chat_id, f"💳 Оплата: {real_amount} ₽ → {tokens} токенов")
+        log_action(chat_id, "buy", f"{real_amount} ₽ → {tokens}")
+        notify_subscribers(chat_id, f"💳 Оплата: {real_amount} ₽ → {tokens}")
     return jsonify({"status": "ok"}), 200
 
 
 # =============================
-# ВОРКЕРЫ (фоновые задачи)
+# ВОРКЕРЫ
 # =============================
 
 def backup_db():
@@ -6185,25 +5808,6 @@ def backup_db():
         ts = time.strftime('%Y-%m-%d_%H-%M')
         backup_path = os.path.join(BACKUP_DIR, f"users_{ts}.db")
         shutil.copy2(DB_PATH, backup_path)
-        print(f"Backup created: {backup_path}")
-        try:
-            with open(backup_path, "rb") as f:
-                data = f.read()
-            days_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
-            day_name = days_ru[time.localtime().tm_wday]
-            caption = (
-                f"💾 <b>Бэкап БД</b>\n\n"
-                f"📅 <b>Дата:</b> {time.strftime('%d.%m.%Y')}\n"
-                f"📆 <b>День:</b> {day_name}\n"
-                f"⏱ <b>Время:</b> {time.strftime('%H:%M:%S')}\n"
-                f"🗓 <b>Год:</b> {time.strftime('%Y')}\n\n"
-                f"📦 Размер: <b>{len(data) / 1024:.1f} КБ</b>"
-            )
-            if ERRORS_CHANNEL_ID != 0:
-                bot.send_document(ERRORS_CHANNEL_ID, (f"users_{ts}.db", data),
-                                  caption=caption, parse_mode='HTML')
-        except Exception as e:
-            print(f"Send backup error: {e}")
         backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.startswith("users_")])
         if len(backups) > BACKUP_KEEP:
             for old in backups[:-BACKUP_KEEP]:
@@ -6267,17 +5871,9 @@ def cleanup_active_operations():
             conn = get_conn()
             c = conn.cursor()
             cutoff = int(time.time()) - 300
-            c.execute("SELECT chat_id, operation, started FROM active_operations WHERE started < ?", (cutoff,))
-            stuck = c.fetchall()
-            for chat_id, op_type, started in stuck:
-                duration = int(time.time()) - started
-                log_error(f"STUCK OPERATION: chat_id={chat_id}, type={op_type}, duration={duration}s")
             c.execute("DELETE FROM active_operations WHERE started < ?", (cutoff,))
-            deleted = c.rowcount
             conn.commit()
             conn.close()
-            if deleted > 0:
-                print(f"Cleaned {deleted} stuck operations")
         except Exception as e:
             log_error(f"cleanup_active: {e}")
         time.sleep(300)
@@ -6307,68 +5903,8 @@ def cleanup_errors_log():
                     new_lines.append(line)
             with open(path, "w", encoding="utf-8") as f:
                 f.writelines(new_lines)
-            removed = len(lines) - len(new_lines)
-            if removed > 0:
-                print(f"Cleaned {removed} old errors from errors.log")
         except Exception as e:
             log_error(f"cleanup_errors_log: {e}")
-
-
-def send_errors_to_channel():
-    if ERRORS_CHANNEL_ID == 0:
-        return False
-    path = "/app/data/errors.log"
-    if not os.path.exists(path):
-        return False
-    size = os.path.getsize(path)
-    if size == 0:
-        try:
-            os.remove(path)
-        except Exception:
-            pass
-        return False
-    errors_count = 0
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            errors_count = sum(1 for _ in f)
-    except Exception:
-        pass
-    days_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
-    now = time.localtime()
-    day_name = days_ru[now.tm_wday]
-    filename = f"errors_{time.strftime('%Y-%m-%d_%H-%M')}.log"
-    caption = (
-        f"📅 <b>Дата:</b> {time.strftime('%d.%m.%Y')}\n"
-        f"📆 <b>День:</b> {day_name}\n"
-        f"⏱ <b>Время:</b> {time.strftime('%H:%M:%S')}\n"
-        f"🗓 <b>Год:</b> {time.strftime('%Y')}\n\n"
-        f"📊 Ошибок: <b>{errors_count}</b>\n"
-        f"📦 Размер: <b>{size / 1024:.1f} КБ</b>"
-    )
-    try:
-        with open(path, "rb") as f:
-            data = f.read()
-        bot.send_document(ERRORS_CHANNEL_ID, (filename, data),
-                          caption=caption, parse_mode='HTML')
-        os.remove(path)
-        return True
-    except Exception as e:
-        print(f"Send errors to channel error: {e}")
-        return False
-
-
-def errors_uploader():
-    first_run = True
-    while True:
-        try:
-            if first_run:
-                time.sleep(300)
-                first_run = False
-            else:
-                time.sleep(86400)
-            send_errors_to_channel()
-        except Exception as e:
-            log_error(f"errors_uploader: {e}")
 
 
 def maintenance_worker():
@@ -6404,35 +5940,8 @@ def maintenance_worker():
                     except Exception:
                         pass
                 set_maintenance(0, notified=1)
-                try:
-                    bot.send_message(ADMIN_ID, f"📢 Тех.работы разосланы: {sent_count} чел.")
-                except Exception:
-                    pass
         except Exception as e:
             log_error(f"maintenance_worker: {e}")
-        time.sleep(30)
-
-
-def broadcast_worker():
-    while True:
-        try:
-            global pending_broadcast
-            if pending_broadcast["active"]:
-                waiting = int(time.time()) - pending_broadcast["waiting_since"]
-                can_run = not has_active_operations() or waiting > 600
-                if can_run:
-                    text = pending_broadcast["text"]
-                    signed = pending_broadcast["signed"]
-                    pending_broadcast = {"active": False, "text": "", "signed": False, "waiting_since": 0}
-                    try:
-                        bot.send_message(ADMIN_ID,
-                                         "✅ <b>Все операции завершены</b>\n\n🚀 Запускаю рассылку...",
-                                         parse_mode='HTML')
-                    except Exception:
-                        pass
-                    threading.Thread(target=send_broadcast, args=(text, signed), daemon=True).start()
-        except Exception as e:
-            log_error(f"broadcast_worker: {e}")
         time.sleep(30)
 
 
@@ -6444,52 +5953,23 @@ def send_startup_report():
         c = conn.cursor()
         c.execute("SELECT COUNT(*), COALESCE(SUM(tokens), 0) FROM users")
         users_count, total_tokens = c.fetchone()
-        c.execute("SELECT COUNT(*) FROM image_history WHERE kind='gen'")
-        images_gen = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM image_history WHERE kind='edit'")
-        images_edit = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM history WHERE role='user'")
-        ai_messages = c.fetchone()[0]
-        c.execute("SELECT COUNT(*), COALESCE(SUM(CASE WHEN paid=1 THEN 1 ELSE 0 END), 0) FROM orders")
-        orders_total, orders_paid = c.fetchone()
-        c.execute("SELECT COUNT(*) FROM tickets WHERE status='open'")
-        tickets_open = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM users WHERE banned=1")
-        banned_count = c.fetchone()[0]
-        errors_count = 0
-        try:
-            with open("/app/data/errors.log", "r", encoding="utf-8") as f:
-                errors_count = sum(1 for _ in f)
-        except Exception:
-            pass
         conn.close()
         text = (
             "━━━━━━━━━━━━━━━━━━━━━━━\n"
             "    🚀 Бот запущен\n"
             "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📅 Дата: {time.strftime('%d.%m.%Y %H:%M:%S')}\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "📊 Состояние базы данных:\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"👥 Юзеров всего: <b>{users_count}</b>\n"
-            f"💰 Токенов у всех: <b>{total_tokens}</b>\n"
-            f"🎨 Сгенерировано картинок: <b>{images_gen}</b>\n"
-            f"🖼 Редактирований: <b>{images_edit}</b>\n"
-            f"🤖 Сообщений в ИИ: <b>{ai_messages}</b>\n"
-            f"🛒 Заказов всего: <b>{orders_total}</b>\n"
-            f"💳 Оплачено заказов: <b>{orders_paid}</b>\n"
-            f"📋 Открытых тикетов: <b>{tickets_open}</b>\n"
-            f"🚫 Забанено юзеров: <b>{banned_count}</b>\n"
-            f"⚠️ Ошибок в errors.log: <b>{errors_count}</b>\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📅 {time.strftime('%d.%m.%Y %H:%M:%S')}\n\n"
+            f"👥 Юзеров: <b>{users_count}</b>\n"
+            f"💰 Токенов: <b>{total_tokens}</b>\n\n"
             "✅ Бот работает"
         )
         bot.send_message(ERRORS_CHANNEL_ID, text, parse_mode='HTML')
     except Exception as e:
         print(f"Startup report error: {e}")
 
+
 # ============================================================
-# Часть 5: Flask API для мини-аппы (verify_init_data + endpoints)
+# FLASK API ДЛЯ МИНИ-АППЫ
 # ============================================================
 
 import hmac as _hmac
@@ -6498,16 +5978,13 @@ import json as _json
 
 
 def verify_init_data(init_data):
-    """Проверяет подпись initData от Telegram WebApp."""
     try:
         parsed = urllib.parse.parse_qsl(init_data, keep_blank_values=True)
         data_dict = dict(parsed)
         received_hash = data_dict.pop("hash", "")
         if not received_hash:
             return None
-        data_check_string = "\n".join(
-            f"{k}={v}" for k, v in sorted(data_dict.items())
-        )
+        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(data_dict.items()))
         secret_key = _hmac.new(b"WebAppData", BOT_TOKEN.encode(), _hashlib.sha256).digest()
         calculated_hash = _hmac.new(secret_key, data_check_string.encode(), _hashlib.sha256).hexdigest()
         if not _hmac.compare_digest(calculated_hash, received_hash):
@@ -6529,10 +6006,6 @@ def api_auth(data):
     return user.get("id")
 
 
-# ============================================================
-# /health — диагностика
-# ============================================================
-
 @app.route('/health')
 def health_check():
     try:
@@ -6547,22 +6020,10 @@ def health_check():
         "status": "ok",
         "flask": "running",
         "bot_token_set": bool(BOT_TOKEN),
-        "bot_token_len": len(BOT_TOKEN) if BOT_TOKEN else 0,
-        "webapp_url": WEBAPP_URL,
-        "pay_base_url": PAY_BASE_URL,
-        "db_path": DB_PATH,
         "db_exists": os.path.exists(DB_PATH),
         "users_count": users_count,
-        "errors_channel": ERRORS_CHANNEL_ID,
-        "gigachat_set": bool(GIGACHAT_AUTH_KEY),
-        "bothub_set": bool(BOTHUB_API_KEY),
-        "yoomoney_set": bool(YOOMONEY_RECEIVER) and bool(YOOMONEY_SECRET),
     })
 
-
-# ============================================================
-# /webapp/api/me — информация о юзере
-# ============================================================
 
 @app.route('/webapp/api/me', methods=['POST'])
 def webapp_api_me():
@@ -6575,32 +6036,19 @@ def webapp_api_me():
         if user[10]:
             return jsonify({"error": "banned", "reason": user[11] or "не указана"}), 403
         return jsonify({
-            "chat_id": chat_id,
-            "tokens": user[0],
-            "mode": user[2],
-            "ai_mode": user[3],
-            "coder_mode": user[9],
-            "is_admin": chat_id == ADMIN_ID,
-            "can_image": bool(user[12]),
-            "can_chat": bool(user[13]),
-            "limit_images": user[14],
-            "used_images": user[16],
-            "limit_edits": user[20],
-            "used_edits": user[19],
-            "limit_chats": user[15],
-            "used_chats": user[17],
-            "send_files": bool(user[18]),
-            "sound_on": bool(user[23]),
+            "chat_id": chat_id, "tokens": user[0], "mode": user[2], "ai_mode": user[3],
+            "coder_mode": user[9], "is_admin": chat_id == ADMIN_ID,
+            "can_image": bool(user[12]), "can_chat": bool(user[13]),
+            "limit_images": user[14], "used_images": user[16],
+            "limit_edits": user[20], "used_edits": user[19],
+            "limit_chats": user[15], "used_chats": user[17],
+            "send_files": bool(user[18]), "sound_on": bool(user[23]),
             "username": user[6] or "",
         })
     except Exception as e:
         log_error(f"webapp_api_me: {e}")
         return jsonify({"error": str(e)}), 500
 
-
-# ============================================================
-# /webapp/api/generate — генерация картинки
-# ============================================================
 
 @app.route('/webapp/api/generate', methods=['POST'])
 def webapp_api_generate():
@@ -6613,26 +6061,18 @@ def webapp_api_generate():
         if not prompt:
             return jsonify({"error": "Пустой промт"}), 400
         user = get_user(chat_id)
-        if user[10]:
-            return jsonify({"error": "Вы забанены"}), 403
-        if not user[12]:
-            return jsonify({"error": "🚫 Картинки запрещены"}), 403
-        if user[14] >= 0 and user[16] >= user[14]:
-            return jsonify({"error": "🚫 Лимит картинок исчерпан"}), 403
-        if user[0] < IMAGE_COST:
-            return jsonify({"error": f"❌ Нужно {IMAGE_COST} токена"}), 403
+        if user[10] or not user[12] or (user[14] >= 0 and user[16] >= user[14]) or user[0] < IMAGE_COST:
+            return jsonify({"error": "Недоступно"}), 403
         mark_operation_start(chat_id, "gen")
         try:
             image_url = generate_image_bothub(prompt)
             if not image_url:
-                return jsonify({"error": "❌ Не удалось сгенерировать"}), 500
+                return jsonify({"error": "Не удалось"}), 500
             add_tokens(chat_id, -IMAGE_COST)
             log_stat(chat_id, IMAGE_COST)
             add_image_history(chat_id, prompt, image_url, kind="gen")
             inc_used(chat_id, 'used_images')
             log_action(chat_id, "gen", prompt)
-            notify_subscribers(chat_id, f"🎨 Генерация: {prompt[:100]}")
-            clear_old_logs()
             new_balance = get_user(chat_id)[0]
             return jsonify({"url": image_url, "prompt": prompt, "balance": new_balance})
         finally:
@@ -6641,10 +6081,6 @@ def webapp_api_generate():
         log_error(f"webapp_api_generate: {e}")
         return jsonify({"error": str(e)}), 500
 
-
-# ============================================================
-# /webapp/api/chat — чат с Бобом
-# ============================================================
 
 @app.route('/webapp/api/chat', methods=['POST'])
 def webapp_api_chat():
@@ -6655,26 +6091,17 @@ def webapp_api_chat():
             return jsonify({"error": "unauthorized"}), 401
         question = (data.get("question") or "").strip()
         if not question:
-            return jsonify({"error": "Пустое сообщение"}), 400
+            return jsonify({"error": "Пусто"}), 400
         user = get_user(chat_id)
-        if user[10]:
-            return jsonify({"error": "Вы забанены"}), 403
-        if not user[13]:
-            return jsonify({"error": "🚫 Чат запрещён"}), 403
-        if user[15] >= 0 and user[17] >= user[15]:
-            return jsonify({"error": "🚫 Лимит чата исчерпан"}), 403
-        if user[0] < 1:
-            return jsonify({"error": "❌ Токены закончились"}), 403
-        mode = user[2]
-        ai_mode = user[3]
+        if user[10] or not user[13] or (user[15] >= 0 and user[17] >= user[15]) or user[0] < 1:
+            return jsonify({"error": "Недоступно"}), 403
         mark_operation_start(chat_id, "ai")
         try:
-            answer = ask_gigachat(chat_id, question, mode, ai_mode)
+            answer = ask_gigachat(chat_id, question, user[2], user[3])
             add_tokens(chat_id, -1)
             log_stat(chat_id, 1)
             inc_used(chat_id, 'used_chats')
             log_action(chat_id, "ai", question[:200])
-            clear_old_logs()
             new_balance = get_user(chat_id)[0]
             return jsonify({"answer": answer, "balance": new_balance})
         finally:
@@ -6683,10 +6110,6 @@ def webapp_api_chat():
         log_error(f"webapp_api_chat: {e}")
         return jsonify({"error": str(e)}), 500
 
-
-# ============================================================
-# /webapp/api/history/image — история картинок
-# ============================================================
 
 @app.route('/webapp/api/history/image', methods=['POST'])
 def webapp_api_history_image():
@@ -6697,18 +6120,12 @@ def webapp_api_history_image():
             return jsonify({"error": "unauthorized"}), 401
         kind = data.get("kind", "gen")
         rows = get_image_history_by_kind(chat_id, kind, limit=100)
-        items = []
-        for prompt, url, ts in rows:
-            items.append({"prompt": prompt, "url": url, "ts": ts})
+        items = [{"prompt": p, "url": u, "ts": t} for p, u, t in rows]
         return jsonify({"items": items})
     except Exception as e:
         log_error(f"webapp_api_history_image: {e}")
         return jsonify({"error": str(e)}), 500
 
-
-# ============================================================
-# /webapp/api/history/chat — история чата
-# ============================================================
 
 @app.route('/webapp/api/history/chat', methods=['POST'])
 def webapp_api_history_chat():
@@ -6718,21 +6135,15 @@ def webapp_api_history_chat():
         if not chat_id:
             return jsonify({"error": "unauthorized"}), 401
         rows = get_history(chat_id, limit=100)
-        items = []
-        for role, content in rows:
-            items.append({"role": role, "content": content})
+        items = [{"role": r, "content": c} for r, c in rows]
         return jsonify({"items": items})
     except Exception as e:
         log_error(f"webapp_api_history_chat: {e}")
         return jsonify({"error": str(e)}), 500
 
 
-# ============================================================
-# /webapp/api/buy — создать счёт (тот же, что /pay)
-# ============================================================
-
-@app.route('/webapp/api/buy', methods=['POST'])
-def webapp_api_buy():
+@app.route('/webapp/api/pay', methods=['POST'])
+def webapp_api_pay():
     try:
         data = request.get_json() or {}
         chat_id = api_auth(data)
@@ -6740,20 +6151,16 @@ def webapp_api_buy():
             return jsonify({"error": "unauthorized"}), 401
         amount = int(data.get("amount", 0))
         tokens = int(data.get("tokens", 0))
-        if amount <= 0 or tokens <= 0:
+        if amount <= 0 or tokens <= 0 or amount > 100000:
             return jsonify({"error": "Неверные параметры"}), 400
         order_id = f"ORD-{chat_id}-{tokens}-{amount}"
         save_order(order_id, chat_id, tokens, amount)
         pay_url = f"{PAY_BASE_URL}/pay/{amount}/{order_id}"
         return jsonify({"pay_url": pay_url, "order_id": order_id})
     except Exception as e:
-        log_error(f"webapp_api_buy: {e}")
+        log_error(f"webapp_api_pay: {e}")
         return jsonify({"error": str(e)}), 500
 
-
-# ============================================================
-# /webapp/api/settings — настройки (режим, поведение, файлы, звук)
-# ============================================================
 
 @app.route('/webapp/api/settings', methods=['POST'])
 def webapp_api_settings():
@@ -6764,14 +6171,11 @@ def webapp_api_settings():
             return jsonify({"error": "unauthorized"}), 401
         field = data.get("field", "")
         if field == "mode":
-            value = data.get("value", "regular")
-            update_user(chat_id, 'mode', value)
+            update_user(chat_id, 'mode', data.get("value", "regular"))
         elif field == "ai_mode":
-            value = data.get("value", "regular")
-            update_user(chat_id, 'ai_mode', value)
+            update_user(chat_id, 'ai_mode', data.get("value", "regular"))
         elif field == "coder_mode":
-            value = data.get("value", "with_hints")
-            update_user(chat_id, 'coder_mode', value)
+            update_user(chat_id, 'coder_mode', data.get("value", "with_hints"))
         elif field == "send_files":
             user = get_user(chat_id)
             new_val = 0 if user[18] else 1
@@ -6790,10 +6194,6 @@ def webapp_api_settings():
         return jsonify({"error": str(e)}), 500
 
 
-# ============================================================
-# /webapp/api/new_chat — очистить историю чата
-# ============================================================
-
 @app.route('/webapp/api/new_chat', methods=['POST'])
 def webapp_api_new_chat():
     try:
@@ -6808,10 +6208,6 @@ def webapp_api_new_chat():
         log_error(f"webapp_api_new_chat: {e}")
         return jsonify({"error": str(e)}), 500
 
-
-# ============================================================
-# /webapp/api/file — загрузка файла в чат с Бобом
-# ============================================================
 
 @app.route('/webapp/api/file', methods=['POST'])
 def webapp_api_file():
@@ -6828,20 +6224,19 @@ def webapp_api_file():
             return jsonify({"error": "Нет файла"}), 400
         f = request.files['file']
         if not f.filename:
-            return jsonify({"error": "Пустое имя файла"}), 400
+            return jsonify({"error": "Пустое имя"}), 400
 
         allowed = [".txt", ".md", ".csv", ".json", ".xml", ".yaml", ".yml",
                    ".py", ".js", ".html", ".css", ".php", ".java", ".c", ".cpp",
                    ".go", ".rs", ".rb", ".sh", ".bat", ".log", ".ini", ".cfg",
                    ".sql", ".srt", ".vtt", ".tex", ".env", ".gitignore"]
         filename = f.filename
-        ext_ok = any(filename.lower().endswith(e) for e in allowed)
-        if not ext_ok:
-            return jsonify({"error": f"Формат не поддерживается: {filename}"}), 400
+        if not any(filename.lower().endswith(e) for e in allowed):
+            return jsonify({"error": f"Формат не поддерживается"}), 400
 
         file_bytes = f.read()
         if len(file_bytes) > 200 * 1024:
-            return jsonify({"error": "Файл слишком большой (макс. 200 KB)"}), 400
+            return jsonify({"error": "Файл слишком большой"}), 400
         try:
             text = file_bytes.decode('utf-8', errors='ignore')
         except Exception:
@@ -6849,29 +6244,21 @@ def webapp_api_file():
         if not text.strip():
             return jsonify({"error": "Файл пустой"}), 400
         if len(text) > 25000:
-            text = text[:25000] + "\n\n[...файл обрезан...]"
+            text = text[:25000] + "\n\n[...обрезано...]"
 
         u = get_user(chat_id)
-        if u[10]:
-            return jsonify({"error": "Вы забанены"}), 403
-        if not u[13]:
-            return jsonify({"error": "🚫 Чат запрещён"}), 403
-        if u[15] >= 0 and u[17] >= u[15]:
-            return jsonify({"error": "🚫 Лимит чата исчерпан"}), 403
-        if u[0] < 1:
-            return jsonify({"error": "❌ Нужно 1 токен"}), 403
+        if u[10] or not u[13] or (u[15] >= 0 and u[17] >= u[15]) or u[0] < 1:
+            return jsonify({"error": "Недоступно"}), 403
 
         caption = (request.form.get("caption") or "").strip()
         if caption:
-            prompt = f"Вот содержимое файла ({filename}):\n\n```\n{text}\n```\n\nЗадание: {caption}"
+            prompt = f"Файл ({filename}):\n\n```\n{text}\n```\n\nЗадание: {caption}"
         else:
-            prompt = f"Вот содержимое файла ({filename}):\n\n```\n{text}\n```\n\nЧто можно с этим сделать?"
+            prompt = f"Файл ({filename}):\n\n```\n{text}\n```\n\nЧто можно с этим сделать?"
 
-        mode = u[2]
-        ai_mode = u[3]
         mark_operation_start(chat_id, "ai")
         try:
-            answer = ask_gigachat(chat_id, prompt, mode, ai_mode)
+            answer = ask_gigachat(chat_id, prompt, u[2], u[3])
         finally:
             mark_operation_end(chat_id)
 
@@ -6879,93 +6266,12 @@ def webapp_api_file():
         log_stat(chat_id, 1)
         inc_used(chat_id, 'used_chats')
         log_action(chat_id, "file", filename[:100])
-        clear_old_logs()
         new_balance = get_user(chat_id)[0]
-        return jsonify({
-            "answer": answer,
-            "filename": filename,
-            "balance": new_balance,
-        })
+        return jsonify({"answer": answer, "filename": filename, "balance": new_balance})
     except Exception as e:
         log_error(f"webapp_api_file: {e}")
         return jsonify({"error": str(e)}), 500
 
-
-# ============================================================
-# /webapp/api/edit — редактирование фото
-# ============================================================
-
-@app.route('/webapp/api/edit', methods=['POST'])
-def webapp_api_edit():
-    try:
-        init_data = request.form.get("init_data", "")
-        user = verify_init_data(init_data)
-        if not user:
-            return jsonify({"error": "unauthorized"}), 401
-        chat_id = user.get("id")
-        if not chat_id:
-            return jsonify({"error": "unauthorized"}), 401
-
-        prompt = (request.form.get("prompt") or "").strip()
-        if not prompt:
-            return jsonify({"error": "Пустое задание"}), 400
-
-        photos_b64 = []
-        for key in request.files:
-            if key.startswith("photo"):
-                f = request.files[key]
-                if f and f.filename:
-                    file_bytes = f.read()
-                    if len(file_bytes) > 5 * 1024 * 1024:
-                        return jsonify({"error": "Фото слишком большое (макс. 5 MB)"}), 400
-                    b64 = base64.b64encode(file_bytes).decode('utf-8')
-                    photos_b64.append(b64)
-
-        if not photos_b64:
-            return jsonify({"error": "Нет фото"}), 400
-        if len(photos_b64) > 3:
-            photos_b64 = photos_b64[:3]
-
-        u = get_user(chat_id)
-        if u[10]:
-            return jsonify({"error": "Вы забанены"}), 403
-        if not u[12]:
-            return jsonify({"error": "🚫 Редактирование запрещено"}), 403
-        if u[20] >= 0 and u[19] >= u[20]:
-            return jsonify({"error": "🚫 Лимит редактирований исчерпан"}), 403
-        if u[0] < EDIT_COST:
-            return jsonify({"error": f"❌ Нужно {EDIT_COST} токена"}), 403
-
-        mark_operation_start(chat_id, "edit")
-        try:
-            result_url = edit_photo_bothub(photos_b64, prompt)
-        finally:
-            mark_operation_end(chat_id)
-
-        if not result_url:
-            return jsonify({"error": "❌ Не удалось обработать фото"}), 500
-
-        add_tokens(chat_id, -EDIT_COST)
-        log_stat(chat_id, EDIT_COST)
-        add_image_history(chat_id, prompt, result_url, kind="edit")
-        inc_used(chat_id, 'used_edits')
-        log_action(chat_id, "edit", prompt[:200])
-        notify_subscribers(chat_id, f"🖼 Редактирование: {prompt[:100]}")
-        clear_old_logs()
-        new_balance = get_user(chat_id)[0]
-        return jsonify({
-            "url": result_url,
-            "prompt": prompt,
-            "balance": new_balance,
-        })
-    except Exception as e:
-        log_error(f"webapp_api_edit: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-# ============================================================
-# /webapp/api/tickets/list и /webapp/api/tickets/create
-# ============================================================
 
 @app.route('/webapp/api/tickets/list', methods=['POST'])
 def webapp_api_tickets_list():
@@ -6975,14 +6281,7 @@ def webapp_api_tickets_list():
         if not chat_id:
             return jsonify({"error": "unauthorized"}), 401
         rows = get_user_tickets(chat_id)
-        items = []
-        for tid, msg, ans, status in rows:
-            items.append({
-                "id": tid,
-                "message": msg or "",
-                "answer": ans or "",
-                "status": status or "open",
-            })
+        items = [{"id": t[0], "message": t[1] or "", "answer": t[2] or "", "status": t[3] or "open"} for t in rows]
         return jsonify({"items": items})
     except Exception as e:
         log_error(f"webapp_api_tickets_list: {e}")
@@ -6998,7 +6297,7 @@ def webapp_api_tickets_create():
             return jsonify({"error": "unauthorized"}), 401
         message = (data.get("message") or "").strip()
         if not message:
-            return jsonify({"error": "Пустое сообщение"}), 400
+            return jsonify({"error": "Пусто"}), 400
         muted, time_left = check_support_muted(chat_id)
         if muted:
             return jsonify({"error": f"🚫 Подожди {time_left}"}), 403
@@ -7009,49 +6308,11 @@ def webapp_api_tickets_create():
             bot.send_message(ADMIN_ID, f"🔔 Новый тикет #{ticket_id} от {username}\n\n{message}")
         except Exception:
             pass
-        notify_subscribers(chat_id, f"🎫 Новый тикет #{ticket_id}")
-        log_action(chat_id, "ticket", message[:100])
         return jsonify({"ok": True, "ticket_id": ticket_id})
     except Exception as e:
         log_error(f"webapp_api_tickets_create: {e}")
         return jsonify({"error": str(e)}), 500
 
-
-# ============================================================
-# /webapp/api/pay — создать счёт (тот же buy, но с проверками)
-# ============================================================
-
-@app.route('/webapp/api/pay', methods=['POST'])
-def webapp_api_pay():
-    try:
-        data = request.get_json() or {}
-        chat_id = api_auth(data)
-        if not chat_id:
-            return jsonify({"error": "unauthorized"}), 401
-        amount = int(data.get("amount", 0))
-        tokens = int(data.get("tokens", 0))
-        if amount <= 0 or tokens <= 0:
-            return jsonify({"error": "Неверные параметры"}), 400
-        if amount > 100000:
-            return jsonify({"error": "Слишком большая сумма"}), 400
-        order_id = f"ORD-{chat_id}-{tokens}-{amount}"
-        save_order(order_id, chat_id, tokens, amount)
-        pay_url = f"{PAY_BASE_URL}/pay/{amount}/{order_id}"
-        log_action(chat_id, "buy", f"{amount} ₽ → {tokens} токенов (создан счёт)")
-        return jsonify({
-            "pay_url": pay_url,
-            "order_id": order_id,
-            "amount": amount,
-            "tokens": tokens,
-        })
-    except Exception as e:
-        log_error(f"webapp_api_pay: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-# ============================================================
-# /webapp/api/admin/* — для админа (доступ по chat_id)
-# ============================================================
 
 @app.route('/webapp/api/admin/stats', methods=['POST'])
 def webapp_api_admin_stats():
@@ -7068,206 +6329,17 @@ def webapp_api_admin_stats():
         images_gen = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM image_history WHERE kind='edit'")
         images_edit = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM history WHERE role='user'")
-        ai_messages = c.fetchone()[0]
-        c.execute("SELECT COUNT(*), COALESCE(SUM(CASE WHEN paid=1 THEN 1 ELSE 0 END), 0) FROM orders")
-        orders_total, orders_paid = c.fetchone()
-        c.execute("SELECT COUNT(*) FROM tickets WHERE status='open'")
-        tickets_open = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM users WHERE banned=1")
-        banned_count = c.fetchone()[0]
         conn.close()
-        return jsonify({
-            "users": users_count, "tokens": total_tokens,
-            "images_gen": images_gen, "images_edit": images_edit,
-            "ai_messages": ai_messages, "orders": orders_total,
-            "orders_paid": orders_paid, "tickets_open": tickets_open,
-            "banned": banned_count,
-        })
+        return jsonify({"users": users_count, "tokens": total_tokens,
+                       "images_gen": images_gen, "images_edit": images_edit})
     except Exception as e:
         log_error(f"webapp_api_admin_stats: {e}")
         return jsonify({"error": str(e)}), 500
 
-
-@app.route('/webapp/api/admin/users', methods=['POST'])
-def webapp_api_admin_users():
-    try:
-        data = request.get_json() or {}
-        chat_id = api_auth(data)
-        if chat_id != ADMIN_ID:
-            return jsonify({"error": "unauthorized"}), 401
-        page = int(data.get("page", 1))
-        users = get_all_users()
-        page_users, page, total_pages, total = paginate(users, page, per_page=20)
-        items = []
-        for uid, uname, tokens in page_users:
-            items.append({"chat_id": uid, "username": uname or "", "tokens": tokens})
-        return jsonify({
-            "items": items, "page": page,
-            "total_pages": total_pages, "total": total,
-        })
-    except Exception as e:
-        log_error(f"webapp_api_admin_users: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route('/webapp/api/admin/user/set', methods=['POST'])
-def webapp_api_admin_user_set():
-    try:
-        data = request.get_json() or {}
-        chat_id = api_auth(data)
-        if chat_id != ADMIN_ID:
-            return jsonify({"error": "unauthorized"}), 401
-        uid = int(data.get("user_id", 0))
-        action = data.get("action", "")
-        if not uid or not action:
-            return jsonify({"error": "no params"}), 400
-        user = get_user(uid)
-        if action == "ban":
-            reason = data.get("reason", "не указана")
-            update_user(uid, 'banned', 1)
-            update_user(uid, 'ban_reason', reason)
-            conn = get_conn()
-            c = conn.cursor()
-            c.execute("INSERT INTO bans (chat_id, reason, admin_id, timestamp) VALUES (?, ?, ?, ?)",
-                      (uid, reason, ADMIN_ID, int(time.time())))
-            conn.commit()
-            conn.close()
-            try:
-                bot.send_message(uid, f"🚫 <b>Вы забанены.</b>\n\nПричина: {escape_html(reason)}",
-                                 parse_mode='HTML')
-            except Exception:
-                pass
-            log_action(uid, "ban", reason)
-        elif action == "unban":
-            update_user(uid, 'banned', 0)
-            update_user(uid, 'ban_reason', '')
-        elif action == "add_tokens":
-            cnt = int(data.get("value", 0))
-            add_tokens(uid, cnt)
-        elif action == "take_tokens":
-            cnt = int(data.get("value", 0))
-            add_tokens(uid, -cnt)
-        else:
-            return jsonify({"error": "bad action"}), 400
-        return jsonify({"ok": True})
-    except Exception as e:
-        log_error(f"webapp_api_admin_user_set: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route('/webapp/api/admin/broadcast', methods=['POST'])
-def webapp_api_admin_broadcast():
-    try:
-        data = request.get_json() or {}
-        chat_id = api_auth(data)
-        if chat_id != ADMIN_ID:
-            return jsonify({"error": "unauthorized"}), 401
-        text = (data.get("text") or "").strip()
-        signed = bool(data.get("signed", False))
-        if not text:
-            return jsonify({"error": "Пусто"}), 400
-        threading.Thread(target=send_broadcast, args=(text, signed), daemon=True).start()
-        return jsonify({"ok": True})
-    except Exception as e:
-        log_error(f"webapp_api_admin_broadcast: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route('/webapp/api/admin/maintenance', methods=['POST'])
-def webapp_api_admin_maintenance():
-    try:
-        data = request.get_json() or {}
-        chat_id = api_auth(data)
-        if chat_id != ADMIN_ID:
-            return jsonify({"error": "unauthorized"}), 401
-        action = data.get("action", "get")
-        if action == "get":
-            row = get_maintenance()
-            return jsonify({"enabled": bool(row[2]), "message": row[1]})
-        elif action == "on":
-            set_maintenance(0, enabled=1, notified=0)
-            return jsonify({"ok": True})
-        elif action == "off":
-            set_maintenance(0, enabled=0, notified=1)
-            return jsonify({"ok": True})
-        elif action == "set_text":
-            new_text = data.get("text", "")
-            set_maintenance(1, new_text)
-            return jsonify({"ok": True})
-        return jsonify({"error": "bad action"}), 400
-    except Exception as e:
-        log_error(f"webapp_api_admin_maintenance: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route('/webapp/api/admin/tickets', methods=['POST'])
-def webapp_api_admin_tickets():
-    try:
-        data = request.get_json() or {}
-        chat_id = api_auth(data)
-        if chat_id != ADMIN_ID:
-            return jsonify({"error": "unauthorized"}), 401
-        status = data.get("status", "open")
-        rows = get_tickets_by_status(status)
-        items = []
-        for tid, uid, uname, msg, photo, created in rows:
-            items.append({
-                "id": tid, "chat_id": uid, "username": uname or "",
-                "message": msg, "created": created, "status": status,
-            })
-        return jsonify({"items": items})
-    except Exception as e:
-        log_error(f"webapp_api_admin_tickets: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route('/webapp/api/admin/ticket/answer', methods=['POST'])
-def webapp_api_admin_ticket_answer():
-    try:
-        data = request.get_json() or {}
-        chat_id = api_auth(data)
-        if chat_id != ADMIN_ID:
-            return jsonify({"error": "unauthorized"}), 401
-        ticket_id = int(data.get("ticket_id", 0))
-        answer = (data.get("answer") or "").strip()
-        if not ticket_id or not answer:
-            return jsonify({"error": "no params"}), 400
-        ticket = get_ticket(ticket_id)
-        if not ticket:
-            return jsonify({"error": "not found"}), 404
-        _, uid, uname, _, _, _ = ticket
-        answer_ticket(ticket_id, answer, status="done")
-        try:
-            bot.send_message(uid, f"💬 <b>Ответ от поддержки</b> (тикет #{ticket_id}):\n\n{answer}",
-                             parse_mode='HTML')
-        except Exception:
-            pass
-        return jsonify({"ok": True})
-    except Exception as e:
-        log_error(f"webapp_api_admin_ticket_answer: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route('/webapp/api/admin/ticket/delete', methods=['POST'])
-def webapp_api_admin_ticket_delete():
-    try:
-        data = request.get_json() or {}
-        chat_id = api_auth(data)
-        if chat_id != ADMIN_ID:
-            return jsonify({"error": "unauthorized"}), 401
-        ticket_id = int(data.get("ticket_id", 0))
-        if not ticket_id:
-            return jsonify({"error": "no ticket_id"}), 400
-        delete_ticket(ticket_id)
-        return jsonify({"ok": True})
-    except Exception as e:
-        log_error(f"webapp_api_admin_ticket_delete: {e}")
-        return jsonify({"error": str(e)}), 500
-
 # ============================================================
-# Часть 6: WebApp HTML + JS + запуск
+# Часть 4: WebApp HTML + JS + запуск
 # ============================================================
+
 
 WEBAPP_MAINTENANCE_HTML = '''<!DOCTYPE html>
 <html><head><meta charset="utf-8">
@@ -7297,93 +6369,68 @@ WEBAPP_HTML = '''<!DOCTYPE html>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
 html,body{overscroll-behavior:none;}
-
 :root{
   --bg:var(--tg-theme-bg-color,#0f0f1a);
   --card:var(--tg-theme-secondary-bg-color,#1c1c2e);
-  --card2:#232338;
   --text:var(--tg-theme-text-color,#fff);
-  --muted:rgba(255,255,255,0.55);
   --primary:#667eea;
-  --primary2:#764ba2;
   --grad:linear-gradient(135deg,#667eea 0%,#764ba2 100%);
-  --success:#2ecc71;
   --danger:#ff6b6b;
+  --success:#2ecc71;
   --warning:#f39c12;
 }
-
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
 background:var(--bg);color:var(--text);min-height:100vh;padding-bottom:20px;}
-
-/* ===== HEADER ===== */
 .app-header{position:sticky;top:0;z-index:100;
 background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);
 padding:14px 16px;display:flex;align-items:center;gap:12px;
 box-shadow:0 2px 16px rgba(102,126,234,0.35);}
 .app-header .logo{width:36px;height:36px;flex-shrink:0;
 background:rgba(255,255,255,0.2);border-radius:12px;
-display:flex;align-items:center;justify-content:center;
-backdrop-filter:blur(10px);}
-.app-header .title{font-size:19px;font-weight:700;color:#fff;
-flex:1;letter-spacing:0.3px;}
+display:flex;align-items:center;justify-content:center;}
+.app-header .title{font-size:19px;font-weight:700;color:#fff;flex:1;}
 .app-header .balance{font-size:14px;color:#fff;
 background:rgba(255,255,255,0.2);padding:7px 14px;border-radius:20px;
-font-weight:700;display:flex;align-items:center;gap:6px;
-backdrop-filter:blur(10px);}
-
-/* ===== CONTAINER ===== */
+font-weight:700;display:flex;align-items:center;gap:6px;}
 .container{padding:16px;padding-bottom:100px;}
-
-/* ===== BUTTONS ===== */
 .btn{display:flex;align-items:center;gap:14px;padding:18px 20px;
 background:var(--card);border:1px solid rgba(255,255,255,0.06);
 border-radius:18px;color:var(--text);font-size:16px;font-weight:500;
 cursor:pointer;transition:all 0.15s;width:100%;text-align:left;
 box-shadow:0 2px 8px rgba(0,0,0,0.15);margin-bottom:12px;}
-.btn:active{transform:scale(0.98);opacity:0.85;background:var(--card2);}
+.btn:active{transform:scale(0.98);opacity:0.85;}
 .btn .ico{width:40px;height:40px;flex-shrink:0;
 display:flex;align-items:center;justify-content:center;
 border-radius:12px;background:rgba(102,126,234,0.12);}
 .btn .ico svg{width:22px;height:22px;stroke:var(--primary);fill:none;
 stroke-width:2;stroke-linecap:round;stroke-linejoin:round;}
 .btn .lbl{flex:1;font-weight:600;}
-.btn .arrow{opacity:0.35;font-size:22px;font-weight:300;}
-
-/* ===== SCREENS ===== */
-.screen{display:none;animation:fadeIn 0.2s;}
-.screen.active{display:block;}
+.btn .arrow{opacity:0.35;font-size:22px;}
+.screen{display:none;}
+.screen.active{display:block;animation:fadeIn 0.2s;}
 @keyframes fadeIn{from{opacity:0;transform:translateY(8px);}to{opacity:1;transform:translateY(0);}}
-
 .screen-header{display:flex;align-items:center;gap:12px;
 padding:12px 16px;background:var(--card);border-radius:14px;
-margin-bottom:16px;position:sticky;top:70px;z-index:50;
-backdrop-filter:blur(20px);}
+margin-bottom:16px;position:sticky;top:70px;z-index:50;}
 .back-btn{background:none;border:none;color:var(--text);
 font-size:22px;cursor:pointer;padding:4px 8px 4px 0;
 display:flex;align-items:center;}
 .back-btn:active{opacity:0.6;}
 .screen-title{font-size:17px;font-weight:700;flex:1;}
-
-/* ===== INPUTS ===== */
 .input-wrap{margin-bottom:14px;}
 .input-wrap textarea,.input-wrap input{width:100%;padding:14px 16px;
 background:var(--card);border:1px solid rgba(255,255,255,0.08);
 border-radius:14px;color:var(--text);font-size:15px;
-font-family:inherit;resize:none;outline:none;transition:border 0.15s;}
+font-family:inherit;resize:none;outline:none;}
 .input-wrap textarea:focus,.input-wrap input:focus{border-color:var(--primary);}
 .input-wrap textarea{min-height:100px;}
-
 .action-btn{width:100%;padding:16px;border:none;border-radius:14px;
 background:var(--grad);color:#fff;font-size:16px;font-weight:700;
 cursor:pointer;transition:all 0.15s;
 box-shadow:0 4px 16px rgba(102,126,234,0.4);}
 .action-btn:active{transform:scale(0.98);opacity:0.9;}
-.action-btn:disabled{opacity:0.5;cursor:not-allowed;box-shadow:none;}
-.action-btn.secondary{background:var(--card);border:1px solid rgba(255,255,255,0.08);
-color:var(--text);box-shadow:none;}
-.action-btn.danger{background:linear-gradient(135deg,#f5576c,#f093fb);}
-
-/* ===== CHAT ===== */
+.action-btn:disabled{opacity:0.5;cursor:not-allowed;}
+.action-btn.secondary{background:var(--card);border:1px solid rgba(255,255,255,0.08);color:var(--text);box-shadow:none;}
 .chat-messages{display:flex;flex-direction:column;gap:12px;margin-bottom:16px;}
 .msg{max-width:85%;padding:12px 16px;border-radius:16px;font-size:15px;
 line-height:1.45;word-wrap:break-word;white-space:pre-wrap;}
@@ -7391,64 +6438,41 @@ line-height:1.45;word-wrap:break-word;white-space:pre-wrap;}
 border-bottom-right-radius:4px;}
 .msg.bot{align-self:flex-start;background:var(--card);color:var(--text);
 border-bottom-left-radius:4px;border:1px solid rgba(255,255,255,0.06);}
-.msg.file{align-self:flex-start;background:rgba(102,126,234,0.15);
-border:1px solid rgba(102,126,234,0.3);color:var(--text);font-size:13px;
-padding:10px 14px;border-radius:12px;}
-
-/* ===== PROGRESS ===== */
 .progress-wrap{margin:20px 0;}
 .progress-bar{width:100%;height:8px;background:rgba(255,255,255,0.08);
 border-radius:10px;overflow:hidden;}
 .progress-fill{height:100%;background:var(--grad);border-radius:10px;
-transition:width 0.3s ease;box-shadow:0 0 12px rgba(102,126,234,0.6);}
+transition:width 0.3s ease;}
 .progress-text{text-align:center;margin-top:12px;font-size:14px;opacity:0.8;}
-
-/* ===== RESULT ===== */
 .result-img{width:100%;border-radius:16px;
 box-shadow:0 4px 24px rgba(0,0,0,0.4);margin-bottom:16px;display:block;}
 .result-caption{text-align:center;font-size:14px;opacity:0.75;
-margin-bottom:16px;padding:0 10px;line-height:1.4;}
-
-/* ===== LOADING ===== */
+margin-bottom:16px;padding:0 10px;}
 .loading{text-align:center;padding:60px 20px;opacity:0.5;font-size:15px;}
-.loading::before{content:"";display:inline-block;width:24px;height:24px;
-border:3px solid rgba(255,255,255,0.1);border-top-color:var(--primary);
-border-radius:50%;animation:spin 0.8s linear infinite;
-margin-right:12px;vertical-align:middle;}
-@keyframes spin{to{transform:rotate(360deg);}}
-
-/* ===== ERROR ===== */
 .err{color:var(--danger);text-align:center;padding:40px 20px;font-size:15px;
 background:rgba(255,107,107,0.1);border-radius:12px;}
-
-/* ===== TABS ===== */
 .tabs{display:flex;gap:8px;margin-bottom:16px;
 background:var(--card);padding:4px;border-radius:14px;}
 .tab{flex:1;padding:11px;background:none;border:none;border-radius:10px;
 color:var(--text);font-size:14px;font-weight:600;cursor:pointer;
-opacity:0.6;transition:all 0.15s;}
+opacity:0.6;}
 .tab.active{background:var(--grad);opacity:1;}
-
-/* ===== HISTORY GRID ===== */
 .history-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
 .history-item{background:var(--card);border-radius:14px;overflow:hidden;
 box-shadow:0 2px 8px rgba(0,0,0,0.15);}
 .history-item img{width:100%;display:block;aspect-ratio:1;
-object-fit:cover;background:#000;}
+object-fit:cover;background:#000;cursor:pointer;}
 .history-item .cap{padding:8px 10px;font-size:11px;opacity:0.75;
 white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
 background:rgba(0,0,0,0.3);}
-
-/* ===== BUY ===== */
 .buy-option{padding:18px;background:var(--card);
 border:1px solid rgba(255,255,255,0.06);border-radius:14px;
 margin-bottom:10px;cursor:pointer;text-align:center;font-size:16px;
 font-weight:700;transition:all 0.15s;
 display:flex;align-items:center;justify-content:center;gap:10px;}
 .buy-option:active{transform:scale(0.98);opacity:0.85;}
-.buy-option.best{border-color:var(--primary);background:linear-gradient(135deg,rgba(102,126,234,0.15),rgba(118,75,162,0.15));}
-
-/* ===== SETTINGS ===== */
+.buy-option.best{border-color:var(--primary);
+background:linear-gradient(135deg,rgba(102,126,234,0.15),rgba(118,75,162,0.15));}
 .section-title{font-size:12px;opacity:0.5;text-transform:uppercase;
 letter-spacing:1.5px;margin:20px 0 10px;font-weight:700;padding-left:4px;}
 .setting-row{display:flex;align-items:center;justify-content:space-between;
@@ -7473,35 +6497,11 @@ gap:12px;font-size:15px;font-weight:500;transition:all 0.15s;}
 background:linear-gradient(135deg,rgba(102,126,234,0.15),rgba(118,75,162,0.15));}
 .mode-option .check{margin-left:auto;font-size:18px;color:var(--primary);opacity:0;}
 .mode-option.active .check{opacity:1;}
-
-/* ===== FILE UPLOAD ===== */
-.upload-zone{padding:30px 20px;background:var(--card);
-border:2px dashed rgba(102,126,234,0.4);border-radius:16px;
-text-align:center;margin-bottom:14px;cursor:pointer;transition:all 0.15s;}
-.upload-zone:active{background:var(--card2);border-color:var(--primary);}
-.upload-zone .ico{width:56px;height:56px;margin:0 auto 12px;
-background:rgba(102,126,234,0.15);border-radius:16px;
-display:flex;align-items:center;justify-content:center;}
-.upload-zone .ico svg{width:28px;height:28px;stroke:var(--primary);fill:none;stroke-width:2;}
-.upload-zone .title{font-size:15px;font-weight:600;margin-bottom:4px;}
-.upload-zone .sub{font-size:12px;opacity:0.5;}
 .upload-preview{margin-top:14px;padding:14px;
 background:rgba(102,126,234,0.1);border-radius:12px;
 border:1px solid rgba(102,126,234,0.3);font-size:13px;}
 .upload-preview .name{font-weight:600;margin-bottom:4px;word-break:break-all;}
 .upload-preview .size{opacity:0.6;font-size:11px;}
-
-/* ===== EDIT PHOTOS ===== */
-.edit-photos-preview{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0;}
-.edit-photo-thumb{width:72px;height:72px;border-radius:12px;
-overflow:hidden;position:relative;border:2px solid var(--primary);}
-.edit-photo-thumb img{width:100%;height:100%;object-fit:cover;}
-.edit-photo-thumb .remove{position:absolute;top:-6px;right:-6px;
-width:22px;height:22px;background:var(--danger);border-radius:50%;
-color:#fff;font-size:14px;line-height:22px;text-align:center;
-cursor:pointer;font-weight:700;}
-
-/* ===== TICKETS ===== */
 .ticket-card{background:var(--card);border:1px solid rgba(255,255,255,0.06);
 border-radius:14px;padding:14px;margin-bottom:10px;}
 .ticket-card .head{display:flex;justify-content:space-between;
@@ -7513,25 +6513,19 @@ margin-bottom:8px;font-size:12px;}
 .ticket-card .answer{font-size:13px;padding:10px;
 background:rgba(102,126,234,0.1);border-radius:10px;
 border-left:3px solid var(--primary);margin-top:8px;}
-
-/* ===== MODAL ===== */
 .modal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;
 background:rgba(0,0,0,0.7);z-index:1000;display:none;
-align-items:center;justify-content:center;padding:24px;
-backdrop-filter:blur(6px);}
+align-items:center;justify-content:center;padding:24px;}
 .modal-overlay.active{display:flex;}
 .modal-box{background:var(--card);border-radius:20px;padding:24px;
-width:100%;max-width:340px;box-shadow:0 8px 40px rgba(0,0,0,0.5);}
+width:100%;max-width:340px;}
 .modal-title{font-size:18px;font-weight:700;margin-bottom:12px;text-align:center;}
-.modal-text{font-size:14px;opacity:0.8;margin-bottom:20px;text-align:center;line-height:1.5;}
+.modal-text{font-size:14px;opacity:0.8;margin-bottom:20px;text-align:center;}
 .modal-buttons{display:flex;gap:10px;}
 .modal-btn{flex:1;padding:14px;border:none;border-radius:12px;
-font-size:15px;font-weight:600;cursor:pointer;transition:all 0.15s;}
+font-size:15px;font-weight:600;cursor:pointer;}
 .modal-btn.cancel{background:rgba(255,255,255,0.1);color:var(--text);}
 .modal-btn.confirm{background:var(--grad);color:#fff;}
-.modal-btn:active{transform:scale(0.97);}
-
-/* ===== ADMIN ===== */
 .stats-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px;}
 .stat-card{padding:16px;background:var(--card);border-radius:14px;
 border:1px solid rgba(255,255,255,0.06);}
@@ -7561,49 +6555,48 @@ background:var(--grad);-webkit-background-clip:text;
 </div>
 <div class="container">
 
-<!-- ===== MAIN ===== -->
 <div id="screen-main" class="screen active">
-    <button class="btn" onclick="showScreen('generate')">
+    <button class="btn" id="btn-open-generate">
         <div class="ico"><svg viewBox="0 0 24 24"><path d="M12 3v18M3 12h18"/><circle cx="12" cy="12" r="9"/></svg></div>
         <div class="lbl">Сгенерировать</div><div class="arrow">›</div>
     </button>
-    <button class="btn" onclick="openBot('menu_edit')">
+    <button class="btn" id="btn-open-edit">
         <div class="ico"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg></div>
         <div class="lbl">Редактировать фото</div><div class="arrow">›</div>
     </button>
-    <button class="btn" onclick="showScreen('chat')">
+    <button class="btn" id="btn-open-chat">
         <div class="ico"><svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
         <div class="lbl">Чат с ИИ</div><div class="arrow">›</div>
     </button>
-    <button class="btn" onclick="showScreen('history')">
+    <button class="btn" id="btn-open-history">
         <div class="ico"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg></div>
         <div class="lbl">История</div><div class="arrow">›</div>
     </button>
-    <button class="btn" onclick="showScreen('buy')">
+    <button class="btn" id="btn-open-buy">
         <div class="ico"><svg viewBox="0 0 24 24"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M2 10h20"/></svg></div>
         <div class="lbl">Купить токены</div><div class="arrow">›</div>
     </button>
-    <button class="btn" onclick="showScreen('settings')">
+    <button class="btn" id="btn-open-settings">
         <div class="ico"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></div>
         <div class="lbl">Настройки</div><div class="arrow">›</div>
     </button>
-    <button class="btn" onclick="openBot('menu_support')">
+    <button class="btn" id="btn-open-support">
         <div class="ico"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></div>
         <div class="lbl">Поддержка</div><div class="arrow">›</div>
     </button>
+    <div id="admin-btn-container"></div>
 </div>
 
-<!-- ===== GENERATE ===== -->
 <div id="screen-generate" class="screen">
     <div class="screen-header">
-        <button class="back-btn" onclick="showScreen('main')">←</button>
+        <button class="back-btn" id="btn-back-gen">←</button>
         <span class="screen-title">Генерация</span>
     </div>
     <div id="gen-form">
         <div class="input-wrap">
             <textarea id="gen-prompt" placeholder="Опиши что нарисовать..."></textarea>
         </div>
-        <button class="action-btn" id="gen-btn" onclick="doGenerate()">Нарисовать — 4💎</button>
+        <button class="action-btn" id="gen-btn">Нарисовать — 4💎</button>
     </div>
     <div id="gen-progress" style="display:none;">
         <div class="progress-wrap">
@@ -7614,90 +6607,76 @@ background:var(--grad);-webkit-background-clip:text;
     <div id="gen-result" style="display:none;"></div>
 </div>
 
-<!-- ===== CHAT ===== -->
 <div id="screen-chat" class="screen">
     <div class="screen-header">
-        <button class="back-btn" onclick="showScreen('main')">←</button>
+        <button class="back-btn" id="btn-back-chat">←</button>
         <span class="screen-title">Чат с Бобом</span>
-        <button class="back-btn" onclick="newChat()" title="Новый чат">+</button>
+        <button class="back-btn" id="btn-new-chat" title="Новый чат">+</button>
     </div>
     <div class="chat-messages" id="chat-messages"></div>
     <div id="file-preview" style="display:none;" class="upload-preview"></div>
     <div style="display:flex;gap:8px;margin-bottom:8px;">
-        <input type="file" id="chat-file-input" accept=".txt,.md,.csv,.json,.xml,.yaml,.yml,.py,.js,.html,.css,.php,.java,.c,.cpp,.go,.rs,.rb,.sh,.bat,.log,.ini,.cfg,.sql,.srt,.vtt,.tex,.env,.gitignore" style="display:none;" onchange="chatFileSelected(this)">
-        <button class="action-btn secondary" onclick="document.getElementById('chat-file-input').click()" style="flex:0 0 auto;padding:14px 18px;">
-            📎 Файл
-        </button>
+        <input type="file" id="chat-file-input" accept=".txt,.md,.csv,.json,.xml,.yaml,.yml,.py,.js,.html,.css,.php,.java,.c,.cpp,.go,.rs,.rb,.sh,.bat,.log,.ini,.cfg,.sql,.srt,.vtt,.tex,.env,.gitignore" style="display:none;">
+        <button class="action-btn secondary" id="btn-attach" style="flex:0 0 auto;padding:14px 18px;">📎 Файл</button>
         <input type="text" id="chat-input" placeholder="Задай вопрос..." style="flex:1;padding:14px 16px;background:var(--card);border:1px solid rgba(255,255,255,0.08);border-radius:14px;color:var(--text);font-size:15px;outline:none;font-family:inherit;">
     </div>
-    <button class="action-btn" id="chat-btn" onclick="doChat()">Отправить — 1💎</button>
+    <button class="action-btn" id="chat-btn">Отправить — 1💎</button>
 </div>
 
-<!-- ===== HISTORY ===== -->
 <div id="screen-history" class="screen">
     <div class="screen-header">
-        <button class="back-btn" onclick="showScreen('main')">←</button>
+        <button class="back-btn" id="btn-back-hist">←</button>
         <span class="screen-title">История</span>
     </div>
     <div class="tabs">
-        <button class="tab active" onclick="loadHistory('gen',this)">Генерации</button>
-        <button class="tab" onclick="loadHistory('edit',this)">Правки</button>
+        <button class="tab active" id="tab-hist-gen">Генерации</button>
+        <button class="tab" id="tab-hist-edit">Правки</button>
     </div>
     <div id="history-content"><div class="loading">Загрузка...</div></div>
 </div>
 
-<!-- ===== BUY ===== -->
 <div id="screen-buy" class="screen">
     <div class="screen-header">
-        <button class="back-btn" onclick="showScreen('main')">←</button>
+        <button class="back-btn" id="btn-back-buy">←</button>
         <span class="screen-title">Купить токены</span>
     </div>
-    <div class="buy-option" onclick="buyTokens(100,20)">
+    <div class="buy-option" data-amount="100" data-tokens="20">
         <span style="opacity:0.7;">100 ₽</span> — <b>20 токенов</b>
     </div>
-    <div class="buy-option best" onclick="buyTokens(250,50)">
+    <div class="buy-option best" data-amount="250" data-tokens="50">
         <span style="opacity:0.7;">250 ₽</span> — <b>50 токенов</b> 🔥
     </div>
-    <div class="buy-option" onclick="buyTokens(500,100)">
+    <div class="buy-option" data-amount="500" data-tokens="100">
         <span style="opacity:0.7;">500 ₽</span> — <b>100 токенов</b>
     </div>
-    <div class="buy-option" onclick="buyTokens(1000,200)">
+    <div class="buy-option" data-amount="1000" data-tokens="200">
         <span style="opacity:0.7;">1000 ₽</span> — <b>200 токенов</b>
-    </div>
-    <div style="margin-top:20px;padding:16px;background:var(--card);border-radius:14px;font-size:13px;opacity:0.7;line-height:1.6;">
-        💡 Чем больше пакет — тем выгоднее.<br>
-        Оплата откроется в браузере Telegram.
     </div>
 </div>
 
-<!-- ===== SETTINGS ===== -->
 <div id="screen-settings" class="screen">
     <div class="screen-header">
-        <button class="back-btn" onclick="showScreen('main')">←</button>
+        <button class="back-btn" id="btn-back-set">←</button>
         <span class="screen-title">Настройки</span>
     </div>
-
     <div class="section-title">🎯 Режим</div>
     <div id="modes-list"></div>
-
     <div class="section-title">🧠 Поведение</div>
     <div id="ai-modes-list"></div>
-
     <div class="section-title">🔧 Прочее</div>
-    <div class="setting-row" onclick="toggleSetting('send_files',this)">
+    <div class="setting-row" id="set-send-files">
         <div class="lbl">📎 Ответы файлами</div>
         <div class="toggle" id="toggle-send_files"></div>
     </div>
-    <div class="setting-row" onclick="toggleSetting('sound_on',this)">
+    <div class="setting-row" id="set-sound-on">
         <div class="lbl">🔊 Звук уведомлений</div>
         <div class="toggle" id="toggle-sound_on"></div>
     </div>
 </div>
 
-<!-- ===== ADMIN ===== -->
 <div id="screen-admin" class="screen">
     <div class="screen-header">
-        <button class="back-btn" onclick="showScreen('main')">←</button>
+        <button class="back-btn" id="btn-back-admin">←</button>
         <span class="screen-title">Админ-панель</span>
     </div>
     <div class="stats-grid" id="admin-stats"></div>
@@ -7710,359 +6689,523 @@ background:var(--grad);-webkit-background-clip:text;
         <div class="modal-title">🚪 Выйти?</div>
         <div class="modal-text">Закрыть приложение?</div>
         <div class="modal-buttons">
-            <button class="modal-btn cancel" onclick="closeExitModal()">Остаться</button>
-            <button class="modal-btn confirm" onclick="confirmExit()">Выйти</button>
+            <button class="modal-btn cancel" id="btn-modal-stay">Остаться</button>
+            <button class="modal-btn confirm" id="btn-modal-exit">Выйти</button>
         </div>
     </div>
 </div>
 
 <script>
-const tg = window.Telegram.WebApp;
-tg.ready();
-tg.expand();
-tg.setHeaderColor('#667eea');
-tg.setBackgroundColor('#0f0f1a');
-const initData = tg.initData;
-let state = {me:null, currentScreen:'main', isGenerating:false, isChatting:false, pendingFile:null};
+(function() {
+    'use strict';
 
-async function apiCall(endpoint, data = {}) {
-    data.init_data = initData;
-    try {
-        const res = await fetch('/webapp/api/' + endpoint, {
+    var tg = window.Telegram.WebApp;
+    tg.ready();
+    tg.expand();
+    try { tg.setHeaderColor('#667eea'); tg.setBackgroundColor('#0f0f1a'); } catch(e){}
+    var initData = tg.initData || '';
+
+    var state = {
+        me: null,
+        currentScreen: 'main',
+        isGenerating: false,
+        isChatting: false,
+        pendingFile: null
+    };
+
+    function $(id) { return document.getElementById(id); }
+
+    function escapeHtml(t) {
+        var d = document.createElement('div');
+        d.textContent = t == null ? '' : String(t);
+        return d.innerHTML;
+    }
+
+    function apiCall(endpoint, data) {
+        data = data || {};
+        data.init_data = initData;
+        return fetch('/webapp/api/' + endpoint, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify(data),
+            body: JSON.stringify(data)
+        }).then(function(r) { return r.json(); }).catch(function(e) {
+            return {error: 'network: ' + e.message};
         });
-        return await res.json();
-    } catch (e) { return {error: 'network: ' + e.message}; }
-}
-
-function showScreen(name) {
-    if (state.isGenerating && name !== 'generate') { tg.showAlert('⏳ Генерация идёт.'); return; }
-    if (state.isChatting && name !== 'chat') { tg.showAlert('⏳ Боб думает.'); return; }
-    document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
-    document.getElementById('screen-' + name).classList.add('active');
-    state.currentScreen = name;
-    if (name === 'history') loadHistory('gen', document.querySelector('.tab.active'));
-    if (name === 'settings') loadSettings();
-    if (name === 'admin') loadAdminStats();
-    if (name === 'chat') loadChatHistory();
-    if (name === 'generate') resetGenForm();
-    updateBackButton();
-    window.scrollTo({top:0, behavior:'smooth'});
-}
-
-function openExitModal() { document.getElementById('exit-modal').classList.add('active'); }
-function closeExitModal() { document.getElementById('exit-modal').classList.remove('active'); }
-function confirmExit() { closeExitModal(); tg.close(); }
-
-tg.BackButton.onClick(function() {
-    if (state.currentScreen === 'main') openExitModal();
-    else showScreen('main');
-});
-function updateBackButton() {
-    if (state.currentScreen !== 'main') tg.BackButton.show();
-    else tg.BackButton.hide();
-}
-
-async function loadMe() {
-    const d = await apiCall('me');
-    if (d.error === 'banned') {
-        document.body.innerHTML = '<div style="text-align:center;padding:80px 20px;"><h1 style="font-size:60px;margin-bottom:20px;">🚫</h1><h2>Вы забанены</h2><p style="opacity:0.7;margin-top:12px;">' + escapeHtml(d.reason || '') + '</p></div>';
-        return;
     }
-    if (d.error) { document.getElementById('balance-tokens').textContent = '?'; return; }
-    state.me = d;
-    document.getElementById('balance-tokens').textContent = d.tokens;
-    if (d.is_admin) {
-        const adminBtn = document.createElement('button');
-        adminBtn.className = 'btn';
-        adminBtn.style.marginTop = '20px';
-        adminBtn.style.background = 'linear-gradient(135deg,#f093fb 0%,#f5576c 100%)';
-        adminBtn.innerHTML = '<div class="ico" style="background:rgba(255,255,255,0.2);"><svg viewBox="0 0 24 24" style="stroke:#fff;"><path d="M2 20h20l-2-10-5 4-3-8-3 8-5-4z"/></svg></div><div class="lbl" style="color:#fff;">Админ-панель</div><div class="arrow" style="color:#fff;opacity:0.7;">›</div>';
-        adminBtn.onclick = () => showScreen('admin');
-        if (!document.querySelector('.admin-btn-marker')) {
-            adminBtn.classList.add('admin-btn-marker');
-            document.getElementById('screen-main').appendChild(adminBtn);
+
+    function showScreen(name) {
+        if (state.isGenerating && name !== 'generate') {
+            try { tg.showAlert('⏳ Генерация идёт.'); } catch(e){}
+            return;
         }
+        if (state.isChatting && name !== 'chat') {
+            try { tg.showAlert('⏳ Боб думает.'); } catch(e){}
+            return;
+        }
+        var screens = document.querySelectorAll('.screen');
+        for (var i = 0; i < screens.length; i++) screens[i].classList.remove('active');
+        var el = $('screen-' + name);
+        if (el) el.classList.add('active');
+        state.currentScreen = name;
+        if (name === 'history') loadHistory('gen', $('tab-hist-gen'));
+        if (name === 'settings') loadSettings();
+        if (name === 'admin') loadAdminStats();
+        if (name === 'chat') loadChatHistory();
+        if (name === 'generate') resetGenForm();
+        updateBackButton();
+        window.scrollTo({top:0, behavior:'smooth'});
     }
-}
 
-function updateBalance(b) {
-    if (b !== undefined && b !== null) {
-        state.me.tokens = b;
-        document.getElementById('balance-tokens').textContent = b;
-    }
-}
-
-// ===== GENERATE =====
-function resetGenForm() {
-    document.getElementById('gen-form').style.display = 'block';
-    document.getElementById('gen-progress').style.display = 'none';
-    document.getElementById('gen-result').style.display = 'none';
-    document.getElementById('gen-result').innerHTML = '';
-    document.getElementById('gen-fill').style.width = '0%';
-    const btn = document.getElementById('gen-btn');
-    btn.disabled = false; btn.textContent = 'Нарисовать — 4💎';
-}
-
-async function doGenerate() {
-    if (state.isGenerating) return;
-    const prompt = (document.getElementById('gen-prompt').value || '').trim();
-    if (!prompt) { tg.showAlert('❌ Введи промт'); return; }
-    if (!state.me || state.me.tokens < 4) { tg.showAlert('❌ Нужно 4 токена'); return; }
-    state.isGenerating = true;
-    document.getElementById('gen-form').style.display = 'none';
-    document.getElementById('gen-progress').style.display = 'block';
-    let percent = 0;
-    const stages = [[0,'Анализирую...'],[20,'Начинаю...'],[40,'Рисую основу...'],[60,'Добавляю детали...'],[80,'Финал...'],[95,'Почти готово...']];
-    let status = stages[0][1];
-    const interval = setInterval(() => {
-        if (percent < 90) percent += Math.random() * 8;
-        else percent = Math.min(percent + 1, 95);
-        document.getElementById('gen-fill').style.width = percent + '%';
-        for (const [p, s] of stages) if (percent >= p) status = s;
-        document.getElementById('gen-status').textContent = status;
-    }, 400);
-    const d = await apiCall('generate', {prompt});
-    clearInterval(interval);
-    if (d.error) {
-        document.getElementById('gen-fill').style.width = '100%';
-        document.getElementById('gen-status').textContent = '❌ Ошибка';
-        setTimeout(() => { resetGenForm(); tg.showAlert('❌ ' + d.error); }, 600);
-        state.isGenerating = false;
-        return;
-    }
-    document.getElementById('gen-fill').style.width = '100%';
-    document.getElementById('gen-status').textContent = '✅ Готово!';
-    updateBalance(d.balance);
-    setTimeout(() => {
-        document.getElementById('gen-progress').style.display = 'none';
-        document.getElementById('gen-result').style.display = 'block';
-        document.getElementById('gen-result').innerHTML = '<img class="result-img" src="' + d.url + '"><div class="result-caption">' + escapeHtml(d.prompt) + '</div><button class="action-btn" onclick="resetGenForm()" style="margin-bottom:10px;">🔁 Ещё раз — 4💎</button><button class="action-btn secondary" onclick="showScreen(\'main\')">🏠 В меню</button>';
-        state.isGenerating = false;
-    }, 800);
-}
-
-// ===== CHAT =====
-async function loadChatHistory() {
-    const d = await apiCall('history/chat');
-    const container = document.getElementById('chat-messages');
-    container.innerHTML = '';
-    if (d.error) { container.innerHTML = '<div class="err">Ошибка: ' + escapeHtml(d.error) + '</div>'; return; }
-    if (!d.items || d.items.length === 0) {
-        container.innerHTML = '<div style="text-align:center;opacity:0.4;padding:30px;font-size:14px;">Задай первый вопрос Бобу 👇</div>';
-        return;
-    }
-    for (const item of d.items) appendMessage(item.role, item.content);
-    scrollChatBottom();
-}
-
-function appendMessage(role, text, isFile) {
-    const container = document.getElementById('chat-messages');
-    const div = document.createElement('div');
-    if (isFile) {
-        div.className = 'msg file';
-        div.innerHTML = '📎 ' + escapeHtml(text);
-    } else {
-        div.className = 'msg ' + (role === 'user' ? 'user' : 'bot');
-        div.textContent = text;
-    }
-    container.appendChild(div);
-}
-
-function scrollChatBottom() { setTimeout(() => { window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'}); }, 100); }
-
-function chatFileSelected(input) {
-    if (!input.files || !input.files[0]) return;
-    state.pendingFile = input.files[0];
-    const preview = document.getElementById('file-preview');
-    preview.style.display = 'block';
-    preview.innerHTML = '<div class="name">📎 ' + escapeHtml(state.pendingFile.name) + '</div><div class="size">' + (state.pendingFile.size / 1024).toFixed(1) + ' KB <span style="color:#ff6b6b;cursor:pointer;float:right;" onclick="clearPendingFile()">✕ Убрать</span></div>';
-}
-
-function clearPendingFile() {
-    state.pendingFile = null;
-    document.getElementById('file-preview').style.display = 'none';
-    document.getElementById('chat-file-input').value = '';
-}
-
-async function newChat() {
-    tg.showConfirm('Начать новый чат? История будет очищена.', async (ok) => {
-        if (!ok) return;
-        const d = await apiCall('new_chat');
-        if (d.error) { tg.showAlert('❌ ' + d.error); return; }
-        document.getElementById('chat-messages').innerHTML = '<div style="text-align:center;opacity:0.4;padding:30px;font-size:14px;">Новый чат. Задай вопрос Бобу 👇</div>';
-        tg.showAlert('✅ История очищена');
-    });
-}
-
-async function doChat() {
-    if (state.isChatting) return;
-    const input = document.getElementById('chat-input');
-    const question = (input.value || '').trim();
-    const file = state.pendingFile;
-
-    if (!question && !file) return;
-    if (!state.me || state.me.tokens < 1) { tg.showAlert('❌ Нужно 1 токен'); return; }
-
-    if (file) {
-        state.isChatting = true;
-        appendMessage('user', '📎 ' + file.name + (question ? ' — ' + question : ''), true);
-        scrollChatBottom();
-        input.value = '';
-        const btn = document.getElementById('chat-btn');
-        btn.disabled = true; btn.textContent = '⏳ Обрабатываю файл...';
-        const typing = document.createElement('div');
-        typing.className = 'msg bot'; typing.id = 'typing-msg';
-        typing.textContent = '⏳ Боб читает файл...';
-        document.getElementById('chat-messages').appendChild(typing);
-        scrollChatBottom();
-
-        const fd = new FormData();
-        fd.append('init_data', initData);
-        fd.append('file', file);
-        fd.append('caption', question);
+    function updateBackButton() {
         try {
-            const res = await fetch('/webapp/api/file', {method: 'POST', body: fd});
-            const d = await res.json();
-            const t = document.getElementById('typing-msg');
-            if (t) t.remove();
-            btn.disabled = false; btn.textContent = 'Отправить — 1💎';
-            if (d.error) { appendMessage('bot', '❌ ' + d.error); }
-            else {
-                updateBalance(d.balance);
-                appendMessage('bot', d.answer);
-            }
-        } catch (e) {
-            appendMessage('bot', '❌ Ошибка сети');
+            if (state.currentScreen !== 'main') tg.BackButton.show();
+            else tg.BackButton.hide();
+        } catch(e){}
+    }
+
+    function openExitModal() { $('exit-modal').classList.add('active'); }
+    function closeExitModal() { $('exit-modal').classList.remove('active'); }
+
+    try {
+        tg.BackButton.onClick(function() {
+            if (state.currentScreen === 'main') openExitModal();
+            else showScreen('main');
+        });
+    } catch(e){}
+
+    function updateBalance(b) {
+        if (b !== undefined && b !== null && state.me) {
+            state.me.tokens = b;
+            $('balance-tokens').textContent = b;
         }
-        clearPendingFile();
+    }
+
+    function loadMe() {
+        apiCall('me').then(function(d) {
+            if (d.error === 'banned') {
+                document.body.innerHTML = '<div style="text-align:center;padding:80px 20px;"><h1 style="font-size:60px;margin-bottom:20px;">🚫</h1><h2>Вы забанены</h2><p style="opacity:0.7;margin-top:12px;">' + escapeHtml(d.reason || '') + '</p></div>';
+                return;
+            }
+            if (d.error) {
+                $('balance-tokens').textContent = '?';
+                return;
+            }
+            state.me = d;
+            $('balance-tokens').textContent = d.tokens;
+            if (d.is_admin) {
+                var c = $('admin-btn-container');
+                if (c && !c.dataset.done) {
+                    c.dataset.done = '1';
+                    var b = document.createElement('button');
+                    b.className = 'btn';
+                    b.style.background = 'linear-gradient(135deg,#f093fb 0%,#f5576c 100%)';
+                    b.innerHTML = '<div class="ico" style="background:rgba(255,255,255,0.2);"><svg viewBox="0 0 24 24" style="stroke:#fff;"><path d="M2 20h20l-2-10-5 4-3-8-3 8-5-4z"/></svg></div><div class="lbl" style="color:#fff;">Админ-панель</div><div class="arrow" style="color:#fff;opacity:0.7;">›</div>';
+                    b.addEventListener('click', function() { showScreen('admin'); });
+                    c.appendChild(b);
+                }
+            }
+        });
+    }
+
+    // === GENERATE ===
+    function resetGenForm() {
+        $('gen-form').style.display = 'block';
+        $('gen-progress').style.display = 'none';
+        $('gen-result').style.display = 'none';
+        $('gen-result').innerHTML = '';
+        $('gen-fill').style.width = '0%';
+        $('gen-btn').disabled = false;
+        $('gen-btn').textContent = 'Нарисовать — 4💎';
+    }
+
+    function doGenerate() {
+        if (state.isGenerating) return;
+        var prompt = ($('gen-prompt').value || '').trim();
+        if (!prompt) { try{tg.showAlert('❌ Введи промт');}catch(e){} return; }
+        if (!state.me || state.me.tokens < 4) { try{tg.showAlert('❌ Нужно 4 токена');}catch(e){} return; }
+        state.isGenerating = true;
+        $('gen-form').style.display = 'none';
+        $('gen-progress').style.display = 'block';
+        var percent = 0;
+        var stages = [[0,'Анализирую...'],[20,'Начинаю...'],[40,'Рисую основу...'],[60,'Добавляю детали...'],[80,'Финал...'],[95,'Почти готово...']];
+        var status = stages[0][1];
+        var interval = setInterval(function() {
+            if (percent < 90) percent += Math.random() * 8;
+            else percent = Math.min(percent + 1, 95);
+            $('gen-fill').style.width = percent + '%';
+            for (var i = 0; i < stages.length; i++) {
+                if (percent >= stages[i][0]) status = stages[i][1];
+            }
+            $('gen-status').textContent = status;
+        }, 400);
+
+        apiCall('generate', {prompt: prompt}).then(function(d) {
+            clearInterval(interval);
+            if (d.error) {
+                $('gen-fill').style.width = '100%';
+                $('gen-status').textContent = '❌ Ошибка';
+                setTimeout(function() { resetGenForm(); try{tg.showAlert('❌ ' + d.error);}catch(e){} }, 600);
+                state.isGenerating = false;
+                return;
+            }
+            $('gen-fill').style.width = '100%';
+            $('gen-status').textContent = '✅ Готово!';
+            updateBalance(d.balance);
+            setTimeout(function() {
+                $('gen-progress').style.display = 'none';
+                $('gen-result').style.display = 'block';
+                var r = $('gen-result');
+                r.innerHTML = '';
+                var img = document.createElement('img');
+                img.className = 'result-img';
+                img.src = d.url;
+                r.appendChild(img);
+                var cap = document.createElement('div');
+                cap.className = 'result-caption';
+                cap.textContent = '🎨 ' + (d.prompt || '');
+                r.appendChild(cap);
+                var b1 = document.createElement('button');
+                b1.className = 'action-btn';
+                b1.style.marginBottom = '10px';
+                b1.textContent = '🔁 Ещё раз — 4💎';
+                b1.addEventListener('click', resetGenForm);
+                r.appendChild(b1);
+                var b2 = document.createElement('button');
+                b2.className = 'action-btn secondary';
+                b2.textContent = '🏠 В меню';
+                b2.addEventListener('click', function() { showScreen('main'); });
+                r.appendChild(b2);
+                state.isGenerating = false;
+            }, 800);
+        });
+    }
+
+    // === CHAT ===
+    function loadChatHistory() {
+        apiCall('history/chat').then(function(d) {
+            var container = $('chat-messages');
+            container.innerHTML = '';
+            if (d.error) {
+                container.innerHTML = '<div class="err">Ошибка: ' + escapeHtml(d.error) + '</div>';
+                return;
+            }
+            if (!d.items || d.items.length === 0) {
+                container.innerHTML = '<div style="text-align:center;opacity:0.4;padding:30px;font-size:14px;">Задай первый вопрос Бобу 👇</div>';
+                return;
+            }
+            for (var i = 0; i < d.items.length; i++) {
+                appendMessage(d.items[i].role, d.items[i].content, false);
+            }
+            scrollChatBottom();
+        });
+    }
+
+    function appendMessage(role, text, isFile) {
+        var container = $('chat-messages');
+        var div = document.createElement('div');
+        if (isFile) {
+            div.className = 'msg bot';
+            div.textContent = '📎 ' + text;
+        } else {
+            div.className = 'msg ' + (role === 'user' ? 'user' : 'bot');
+            div.textContent = text;
+        }
+        container.appendChild(div);
+    }
+
+    function scrollChatBottom() {
+        setTimeout(function() { window.scrollTo({top: document.body.scrollHeight, behavior:'smooth'}); }, 100);
+    }
+
+    function chatFileSelected(input) {
+        if (!input.files || !input.files[0]) return;
+        state.pendingFile = input.files[0];
+        var preview = $('file-preview');
+        preview.style.display = 'block';
+        preview.innerHTML = '';
+        var name = document.createElement('div');
+        name.className = 'name';
+        name.textContent = '📎 ' + state.pendingFile.name;
+        preview.appendChild(name);
+        var sz = document.createElement('div');
+        sz.className = 'size';
+        sz.innerHTML = (state.pendingFile.size / 1024).toFixed(1) + ' KB <span style="color:#ff6b6b;cursor:pointer;float:right;">✕ Убрать</span>';
+        sz.querySelector('span').addEventListener('click', clearPendingFile);
+        preview.appendChild(sz);
+    }
+
+    function clearPendingFile() {
+        state.pendingFile = null;
+        $('file-preview').style.display = 'none';
+        $('chat-file-input').value = '';
+    }
+
+    function newChat() {
+        try {
+            tg.showConfirm('Начать новый чат? История будет очищена.', function(ok) {
+                if (!ok) return;
+                apiCall('new_chat').then(function(d) {
+                    if (d.error) { try{tg.showAlert('❌ ' + d.error);}catch(e){} return; }
+                    $('chat-messages').innerHTML = '<div style="text-align:center;opacity:0.4;padding:30px;font-size:14px;">Новый чат 👇</div>';
+                    try{tg.showAlert('✅ История очищена');}catch(e){}
+                });
+            });
+        } catch(e){}
+    }
+
+    function doChat() {
+        if (state.isChatting) return;
+        var input = $('chat-input');
+        var question = (input.value || '').trim();
+        var file = state.pendingFile;
+        if (!question && !file) return;
+        if (!state.me || state.me.tokens < 1) { try{tg.showAlert('❌ Нужно 1 токен');}catch(e){} return; }
+
+        if (file) {
+            state.isChatting = true;
+            appendMessage('user', file.name + (question ? ' — ' + question : ''), true);
+            scrollChatBottom();
+            input.value = '';
+            var btn = $('chat-btn');
+            btn.disabled = true;
+            btn.textContent = '⏳ Обрабатываю файл...';
+            var typing = document.createElement('div');
+            typing.className = 'msg bot';
+            typing.id = 'typing-msg';
+            typing.textContent = '⏳ Боб читает файл...';
+            $('chat-messages').appendChild(typing);
+            scrollChatBottom();
+
+            var fd = new FormData();
+            fd.append('init_data', initData);
+            fd.append('file', file);
+            fd.append('caption', question);
+            fetch('/webapp/api/file', {method:'POST', body: fd}).then(function(r) { return r.json(); }).then(function(d) {
+                var t = $('typing-msg');
+                if (t) t.remove();
+                btn.disabled = false;
+                btn.textContent = 'Отправить — 1💎';
+                if (d.error) { appendMessage('bot', '❌ ' + d.error, false); }
+                else {
+                    updateBalance(d.balance);
+                    appendMessage('bot', d.answer, false);
+                }
+            }).catch(function(e) {
+                var t = $('typing-msg');
+                if (t) t.remove();
+                btn.disabled = false;
+                btn.textContent = 'Отправить — 1💎';
+                appendMessage('bot', '❌ Ошибка сети', false);
+            });
+            clearPendingFile();
+            scrollChatBottom();
+            state.isChatting = false;
+            return;
+        }
+
+        state.isChatting = true;
+        input.value = '';
+        appendMessage('user', question, false);
         scrollChatBottom();
-        state.isChatting = false;
-        return;
+        var btn2 = $('chat-btn');
+        btn2.disabled = true;
+        btn2.textContent = '⏳ Боб думает...';
+        var typing2 = document.createElement('div');
+        typing2.className = 'msg bot';
+        typing2.id = 'typing-msg';
+        typing2.textContent = '⏳ Печатает...';
+        $('chat-messages').appendChild(typing2);
+        scrollChatBottom();
+
+        apiCall('chat', {question: question}).then(function(d) {
+            var t = $('typing-msg');
+            if (t) t.remove();
+            btn2.disabled = false;
+            btn2.textContent = 'Отправить — 1💎';
+            if (d.error) {
+                appendMessage('bot', '❌ ' + d.error, false);
+                state.isChatting = false;
+                scrollChatBottom();
+                return;
+            }
+            updateBalance(d.balance);
+            appendMessage('bot', d.answer, false);
+            scrollChatBottom();
+            state.isChatting = false;
+        });
     }
 
-    state.isChatting = true;
-    input.value = '';
-    appendMessage('user', question);
-    scrollChatBottom();
-    const btn = document.getElementById('chat-btn');
-    btn.disabled = true; btn.textContent = '⏳ Боб думает...';
-    const typing = document.createElement('div');
-    typing.className = 'msg bot'; typing.id = 'typing-msg';
-    typing.textContent = '⏳ Печатает...';
-    document.getElementById('chat-messages').appendChild(typing);
-    scrollChatBottom();
-    const d = await apiCall('chat', {question});
-    const t = document.getElementById('typing-msg');
-    if (t) t.remove();
-    btn.disabled = false; btn.textContent = 'Отправить — 1💎';
-    if (d.error) { appendMessage('bot', '❌ ' + d.error); state.isChatting = false; scrollChatBottom(); return; }
-    updateBalance(d.balance);
-    appendMessage('bot', d.answer);
-    scrollChatBottom();
-    state.isChatting = false;
-}
-
-// ===== HISTORY =====
-async function loadHistory(kind, tabEl) {
-    document.querySelectorAll('#screen-history .tab').forEach(t => t.classList.remove('active'));
-    if (tabEl) tabEl.classList.add('active');
-    const c = document.getElementById('history-content');
-    c.innerHTML = '<div class="loading">Загрузка...</div>';
-    const d = await apiCall('history/image', {kind});
-    if (d.error) { c.innerHTML = '<div class="err">Ошибка: ' + escapeHtml(d.error) + '</div>'; return; }
-    if (!d.items || d.items.length === 0) {
-        c.innerHTML = '<div style="text-align:center;padding:50px 20px;opacity:0.4;">История пуста</div>';
-        return;
+    // === HISTORY ===
+    function loadHistory(kind, tabEl) {
+        var tabs = document.querySelectorAll('#screen-history .tab');
+        for (var i = 0; i < tabs.length; i++) tabs[i].classList.remove('active');
+        if (tabEl) tabEl.classList.add('active');
+        var c = $('history-content');
+        c.innerHTML = '<div class="loading">Загрузка...</div>';
+        apiCall('history/image', {kind: kind}).then(function(d) {
+            if (d.error) {
+                c.innerHTML = '<div class="err">Ошибка: ' + escapeHtml(d.error) + '</div>';
+                return;
+            }
+            if (!d.items || d.items.length === 0) {
+                c.innerHTML = '<div style="text-align:center;padding:50px 20px;opacity:0.4;">История пуста</div>';
+                return;
+            }
+            var html = '<div class="history-grid">';
+            for (var i = 0; i < d.items.length; i++) {
+                var it = d.items[i];
+                html += '<div class="history-item"><img src="' + it.url + '" loading="lazy" data-url="' + it.url + '" class="hist-img"><div class="cap">' + escapeHtml((it.prompt || '').substring(0, 40)) + '</div></div>';
+            }
+            html += '</div>';
+            c.innerHTML = html;
+            var imgs = c.querySelectorAll('.hist-img');
+            for (var j = 0; j < imgs.length; j++) {
+                imgs[j].addEventListener('click', function() {
+                    var url = this.getAttribute('data-url');
+                    try { tg.openLink(url); } catch(e) {}
+                });
+            }
+        });
     }
-    let html = '<div class="history-grid">';
-    for (const it of d.items) {
-        html += '<div class="history-item"><img src="' + it.url + '" loading="lazy" onclick="tg.openLink(\'' + it.url + '\')"><div class="cap">' + escapeHtml((it.prompt || '').substring(0, 40)) + '</div></div>';
-    }
-    html += '</div>';
-    c.innerHTML = html;
-}
 
-// ===== BUY =====
-async function buyTokens(amount, tokens) {
-    tg.showConfirm('Купить ' + tokens + ' токенов за ' + amount + ' ₽?', async (ok) => {
-        if (!ok) return;
-        const d = await apiCall('pay', {amount, tokens});
-        if (d.error) { tg.showAlert('❌ ' + d.error); return; }
-        tg.openLink(d.pay_url);
+    // === BUY ===
+    function buyTokens(amount, tokens) {
+        try {
+            tg.showConfirm('Купить ' + tokens + ' токенов за ' + amount + ' ₽?', function(ok) {
+                if (!ok) return;
+                apiCall('pay', {amount: amount, tokens: tokens}).then(function(d) {
+                    if (d.error) { try{tg.showAlert('❌ ' + d.error);}catch(e){} return; }
+                    try { tg.openLink(d.pay_url); } catch(e) {}
+                });
+            });
+        } catch(e){}
+    }
+
+    // === SETTINGS ===
+    function loadSettings() {
+        if (!state.me) return;
+        var modes = [
+            {key:'regular',label:'🤖 Обычный ИИ'},
+            {key:'coder',label:'💻 Кодер'},
+            {key:'explainer',label:'📖 Объяснятор'},
+            {key:'translator',label:'🌍 Переводчик'}
+        ];
+        var modesEl = $('modes-list');
+        modesEl.innerHTML = '';
+        for (var i = 0; i < modes.length; i++) {
+            (function(m) {
+                var div = document.createElement('div');
+                div.className = 'mode-option' + (state.me.mode === m.key ? ' active' : '');
+                div.innerHTML = m.label + '<span class="check">✓</span>';
+                div.addEventListener('click', function() { setMode('mode', m.key); });
+                modesEl.appendChild(div);
+            })(modes[i]);
+        }
+        var aiModes = [
+            {key:'regular',label:'🤖 Обычный'},
+            {key:'smart',label:'🧠 Умный'},
+            {key:'open',label:'💬 Откровенный'},
+            {key:'uncensored',label:'🔥 Без цензуры'}
+        ];
+        var aiEl = $('ai-modes-list');
+        aiEl.innerHTML = '';
+        for (var j = 0; j < aiModes.length; j++) {
+            (function(m) {
+                var div = document.createElement('div');
+                div.className = 'mode-option' + (state.me.ai_mode === m.key ? ' active' : '');
+                div.innerHTML = m.label + '<span class="check">✓</span>';
+                div.addEventListener('click', function() { setMode('ai_mode', m.key); });
+                aiEl.appendChild(div);
+            })(aiModes[j]);
+        }
+        var tsf = $('toggle-send_files');
+        if (state.me.send_files) tsf.classList.add('on'); else tsf.classList.remove('on');
+        var tso = $('toggle-sound_on');
+        if (state.me.sound_on) tso.classList.add('on'); else tso.classList.remove('on');
+    }
+
+    function setMode(field, value) {
+        apiCall('settings', {field: field, value: value}).then(function(d) {
+            if (d.error) { try{tg.showAlert('❌ ' + d.error);}catch(e){} return; }
+            state.me[field] = value;
+            try { tg.HapticFeedback.impactOccurred('light'); } catch(e){}
+            loadSettings();
+        });
+    }
+
+    function toggleSetting(field) {
+        apiCall('settings', {field: field}).then(function(d) {
+            if (d.error) { try{tg.showAlert('❌ ' + d.error);}catch(e){} return; }
+            state.me[field] = d.value;
+            var t = $('toggle-' + field);
+            if (d.value) t.classList.add('on'); else t.classList.remove('on');
+            try { tg.HapticFeedback.impactOccurred('light'); } catch(e){}
+        });
+    }
+
+    // === ADMIN ===
+    function loadAdminStats() {
+        apiCall('admin/stats').then(function(d) {
+            if (d.error) {
+                $('admin-stats').innerHTML = '<div class="err">Ошибка: ' + escapeHtml(d.error) + '</div>';
+                return;
+            }
+            $('admin-stats').innerHTML = '<div class="stat-card"><div class="num">' + d.users + '</div><div class="lbl">👥 Юзеров</div></div><div class="stat-card"><div class="num">' + d.tokens + '</div><div class="lbl">💰 Токенов</div></div><div class="stat-card"><div class="num">' + d.images_gen + '</div><div class="lbl">🎨 Генераций</div></div><div class="stat-card"><div class="num">' + d.images_edit + '</div><div class="lbl">🖼 Правок</div></div>';
+        });
+    }
+
+    // === BIND ===
+    $('btn-open-generate').addEventListener('click', function() { showScreen('generate'); });
+    $('btn-open-chat').addEventListener('click', function() { showScreen('chat'); });
+    $('btn-open-history').addEventListener('click', function() { showScreen('history'); });
+    $('btn-open-buy').addEventListener('click', function() { showScreen('buy'); });
+    $('btn-open-settings').addEventListener('click', function() { showScreen('settings'); });
+    $('btn-open-edit').addEventListener('click', function() {
+        // Открытие редактирования в боте через deep-link
+        try {
+            tg.openTelegramLink('https://t.me/Bbelasobot?start=edit');
+        } catch(e) {
+            try { tg.showAlert('⚠️ Нажми «Открыть приложение» в боте, потом «Редактировать»'); } catch(e2){}
+        }
     });
-}
+    $('btn-open-support').addEventListener('click', function() {
+        try {
+            tg.openTelegramLink('https://t.me/Bbelasobot?start=support');
+        } catch(e) {
+            try { tg.showAlert('⚠️ Нажми «Открыть приложение» в боте, потом «Поддержка»'); } catch(e2){}
+        }
+    });
+    $('btn-back-gen').addEventListener('click', function() { showScreen('main'); });
+    $('btn-back-chat').addEventListener('click', function() { showScreen('main'); });
+    $('btn-back-hist').addEventListener('click', function() { showScreen('main'); });
+    $('btn-back-buy').addEventListener('click', function() { showScreen('main'); });
+    $('btn-back-set').addEventListener('click', function() { showScreen('main'); });
+    $('btn-back-admin').addEventListener('click', function() { showScreen('main'); });
+    $('btn-new-chat').addEventListener('click', newChat);
+    $('gen-btn').addEventListener('click', doGenerate);
+    $('chat-btn').addEventListener('click', doChat);
+    $('btn-attach').addEventListener('click', function() { $('chat-file-input').click(); });
+    $('chat-file-input').addEventListener('change', function() { chatFileSelected(this); });
+    $('tab-hist-gen').addEventListener('click', function() { loadHistory('gen', this); });
+    $('tab-hist-edit').addEventListener('click', function() { loadHistory('edit', this); });
+    $('btn-modal-stay').addEventListener('click', closeExitModal);
+    $('btn-modal-exit').addEventListener('click', function() { closeExitModal(); try{tg.close();}catch(e){} });
+    $('set-send-files').addEventListener('click', function() { toggleSetting('send_files'); });
+    $('set-sound-on').addEventListener('click', function() { toggleSetting('sound_on'); });
 
-// ===== SETTINGS =====
-async function loadSettings() {
-    if (!state.me) return;
-    const modes = [
-        {key:'regular',label:'🤖 Обычный ИИ'},
-        {key:'coder',label:'💻 Кодер'},
-        {key:'explainer',label:'📖 Объяснятор'},
-        {key:'translator',label:'🌍 Переводчик'}
-    ];
-    const modesEl = document.getElementById('modes-list');
-    modesEl.innerHTML = '';
-    for (const m of modes) {
-        const div = document.createElement('div');
-        div.className = 'mode-option' + (state.me.mode === m.key ? ' active' : '');
-        div.innerHTML = m.label + '<span class="check">✓</span>';
-        div.onclick = () => setMode('mode', m.key);
-        modesEl.appendChild(div);
+    var buyOpts = document.querySelectorAll('.buy-option');
+    for (var k = 0; k < buyOpts.length; k++) {
+        buyOpts[k].addEventListener('click', function() {
+            var amt = parseInt(this.getAttribute('data-amount'), 10);
+            var tks = parseInt(this.getAttribute('data-tokens'), 10);
+            buyTokens(amt, tks);
+        });
     }
-    const aiModes = [
-        {key:'regular',label:'🤖 Обычный'},
-        {key:'smart',label:'🧠 Умный'},
-        {key:'open',label:'💬 Откровенный'},
-        {key:'uncensored',label:'🔥 Без цензуры'}
-    ];
-    const aiEl = document.getElementById('ai-modes-list');
-    aiEl.innerHTML = '';
-    for (const m of aiModes) {
-        const div = document.createElement('div');
-        div.className = 'mode-option' + (state.me.ai_mode === m.key ? ' active' : '');
-        div.innerHTML = m.label + '<span class="check">✓</span>';
-        div.onclick = () => setMode('ai_mode', m.key);
-        aiEl.appendChild(div);
-    }
-    document.getElementById('toggle-send_files').classList.toggle('on', state.me.send_files);
-    document.getElementById('toggle-sound_on').classList.toggle('on', state.me.sound_on);
-}
 
-async function setMode(field, value) {
-    const d = await apiCall('settings', {field, value});
-    if (d.error) { tg.showAlert('❌ ' + d.error); return; }
-    state.me[field] = value;
-    tg.HapticFeedback.impactOccurred('light');
-    loadSettings();
-}
-
-async function toggleSetting(field, el) {
-    const d = await apiCall('settings', {field});
-    if (d.error) { tg.showAlert('❌ ' + d.error); return; }
-    state.me[field] = d.value;
-    document.getElementById('toggle-' + field).classList.toggle('on', d.value);
-    tg.HapticFeedback.impactOccurred('light');
-}
-
-// ===== ADMIN =====
-async function loadAdminStats() {
-    const d = await apiCall('admin/stats');
-    if (d.error) { document.getElementById('admin-stats').innerHTML = '<div class="err">Ошибка: ' + escapeHtml(d.error) + '</div>'; return; }
-    const el = document.getElementById('admin-stats');
-    el.innerHTML = '<div class="stat-card"><div class="num">' + d.users + '</div><div class="lbl">👥 Юзеров</div></div><div class="stat-card"><div class="num">' + d.tokens + '</div><div class="lbl">💰 Токенов</div></div><div class="stat-card"><div class="num">' + d.images_gen + '</div><div class="lbl">🎨 Генераций</div></div><div class="stat-card"><div class="num">' + d.images_edit + '</div><div class="lbl">🖼 Правок</div></div><div class="stat-card"><div class="num">' + d.ai_messages + '</div><div class="lbl">🤖 Сообщений</div></div><div class="stat-card"><div class="num">' + d.orders_paid + '</div><div class="lbl">💳 Оплат</div></div><div class="stat-card"><div class="num">' + d.tickets_open + '</div><div class="lbl">📋 Тикетов</div></div><div class="stat-card"><div class="num">' + d.banned + '</div><div class="lbl">🚫 Банов</div></div>';
-}
-
-// ===== UTILS =====
-function openBot(callback) { tg.sendData(JSON.stringify({callback})); tg.close(); }
-function escapeHtml(t) { const d = document.createElement('div'); d.textContent = t == null ? '' : String(t); return d.innerHTML; }
-
-loadMe();
-document.addEventListener('DOMContentLoaded', () => { updateBackButton(); });
-setInterval(() => { if (state.currentScreen === 'main') loadMe(); }, 60000);
+    loadMe();
+    updateBackButton();
+    setInterval(function() { if (state.currentScreen === 'main') loadMe(); }, 60000);
+})();
 </script>
 </body>
 </html>'''
@@ -8148,9 +7291,7 @@ def start_background_workers():
         ("cleanup_edit_cache", cleanup_edit_cache),
         ("cleanup_active_operations", cleanup_active_operations),
         ("cleanup_errors_log", cleanup_errors_log),
-        ("errors_uploader", errors_uploader),
         ("backup_worker", backup_worker),
-        ("broadcast_worker", broadcast_worker),
     ]
     for name, fn in workers:
         try:
