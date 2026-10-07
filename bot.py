@@ -1445,7 +1445,6 @@ def start(message):
     send_main_menu(message.chat.id)
 
 
-# === НАВИГАЦИЯ НАЗАД ===
 @bot.callback_query_handler(func=lambda call: call.data == "back_to_main")
 def back_to_main(call):
     back_to_main_handler(call.message.chat.id, callback_query=call)
@@ -1619,8 +1618,6 @@ def back_to_wipe(call):
 def noop_handler(call):
     bot.answer_callback_query(call.id, "")
 
-
-# === МЕНЮ НАСТРОЙКИ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_settings")
 def settings_menu_handler(call):
     if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
@@ -1652,7 +1649,6 @@ def toggle_sound(call):
         pass
 
 
-# === МЕНЮ ИНСТРУКЦИИ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_help")
 def menu_help(call):
     if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
@@ -1785,7 +1781,6 @@ def help_edit(call):
     bot.answer_callback_query(call.id)
 
 
-# === МЕНЮ СГЕНЕРИРОВАТЬ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_generate")
 def menu_generate(call):
     if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
@@ -1803,7 +1798,6 @@ def menu_generate(call):
     bot.answer_callback_query(call.id)
 
 
-# === МЕНЮ ИСТОРИЯ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_history")
 def menu_history(call):
     if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
@@ -1821,7 +1815,6 @@ def menu_history(call):
     bot.answer_callback_query(call.id)
 
 
-# === МЕНЮ ПОДДЕРЖКИ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_support")
 def support(call):
     if send_banned_message(call.message.chat.id):
@@ -1839,7 +1832,6 @@ def support(call):
     bot.answer_callback_query(call.id)
 
 
-# === ТЕХ.РАБОТЫ → ПОДДЕРЖКА ===
 @bot.callback_query_handler(func=lambda call: call.data == "maint_support")
 def maint_support(call):
     if send_banned_message(call.message.chat.id):
@@ -1956,7 +1948,6 @@ def maint_ticket_my(call):
     bot.answer_callback_query(call.id)
 
 
-# === ТИКЕТЫ (обычные) ===
 @bot.callback_query_handler(func=lambda call: call.data == "ticket_new")
 def ticket_new(call):
     if send_banned_message(call.message.chat.id):
@@ -2028,7 +2019,6 @@ def ticket_my(call):
         pass
     bot.answer_callback_query(call.id)
 
-# === ГЕНЕРАЦИЯ КАРТИНОК ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_image")
 def image_menu(call):
     if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
@@ -2317,8 +2307,6 @@ def generate_image_bothub(prompt):
         log_error(f"BotHub error: {e}")
         return None
 
-
-# === РЕДАКТИРОВАНИЕ ФОТО ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_edit")
 def edit_menu(call):
     if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
@@ -2806,8 +2794,6 @@ def edit_photo_bothub(photos_b64, prompt):
         log_error(f"Edit error: {e}")
         return None
 
-
-# === НАСТРОЙКИ ЧАТА С ИИ ===
 @bot.callback_query_handler(func=lambda call: call.data == "settings_from_chat")
 def settings_from_chat(call):
     if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
@@ -2854,7 +2840,6 @@ def toggle_send_files(call):
         pass
 
 
-# === ЧАТ С ИИ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_chat")
 def enter_chat(call):
     if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
@@ -2978,181 +2963,6 @@ def set_mode(call):
             parse_mode='HTML', reply_markup=chat_menu())
     except Exception:
         pass
-
-# === ИСТОРИЯ ===
-@bot.callback_query_handler(func=lambda call: call.data == "hist_image" or call.data.startswith("hist_image_page_"))
-def hist_image(call):
-    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
-        return
-    if call.data.startswith("hist_image_page_"):
-        page_str = call.data.replace("hist_image_page_", "")
-        page = int(page_str) if page_str.isdigit() else 1
-    else:
-        page = 1
-    rows = get_image_history_by_kind(call.message.chat.id, "gen", limit=200)
-    if not rows:
-        try:
-            bot.edit_message_text(
-                "🎨 История генераций пуста.",
-                chat_id=call.message.chat.id, message_id=call.message.message_id,
-                reply_markup=history_menu())
-        except Exception:
-            pass
-        bot.answer_callback_query(call.id)
-        return
-    per_page = 5
-    total = len(rows)
-    total_pages = max(1, (total + per_page - 1) // per_page)
-    page = max(1, min(page, total_pages))
-    start = (page - 1) * per_page
-    end = start + per_page
-    page_items = rows[start:end]
-    try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
-        pass
-    clear_old_messages(call.message.chat.id)
-    sent = bot.send_message(
-        call.message.chat.id,
-        f"🎨 <b>История генераций</b> (стр. {page}/{total_pages})\n"
-        f"Всего: <b>{total}</b>\n\n"
-        f"Фото: <b>{start + 1}—{min(end, total)}</b>",
-        parse_mode='HTML')
-    remember(call.message.chat.id, sent.message_id)
-    for prompt, image_url, ts in page_items:
-        when = time.strftime('%d.%m.%Y %H:%M', time.localtime(ts)) if ts else "—"
-        msg_id = send_photo_safe(
-            call.message.chat.id, image_url,
-            f"🎨 <b>{escape_html(prompt)}</b>\n📅 {when}")
-        if msg_id:
-            remember(call.message.chat.id, msg_id)
-        time.sleep(0.3)
-    markup = telebot.types.InlineKeyboardMarkup()
-    nav = []
-    if page > 1:
-        nav.append(telebot.types.InlineKeyboardButton("⬅️", callback_data=f"hist_image_page_{page - 1}"))
-    nav.append(telebot.types.InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
-    if page < total_pages:
-        nav.append(telebot.types.InlineKeyboardButton("➡️", callback_data=f"hist_image_page_{page + 1}"))
-    markup.row(*nav)
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_history"))
-    sent = bot.send_message(call.message.chat.id, "Выбери страницу 👇", reply_markup=markup)
-    remember(call.message.chat.id, sent.message_id)
-    bot.answer_callback_query(call.id)
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "hist_edit" or call.data.startswith("hist_edit_page_"))
-def hist_edit(call):
-    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
-        return
-    if call.data.startswith("hist_edit_page_"):
-        page_str = call.data.replace("hist_edit_page_", "")
-        page = int(page_str) if page_str.isdigit() else 1
-    else:
-        page = 1
-    rows = get_image_history_by_kind(call.message.chat.id, "edit", limit=200)
-    if not rows:
-        try:
-            bot.edit_message_text(
-                "🖼 История редактирований пуста.",
-                chat_id=call.message.chat.id, message_id=call.message.message_id,
-                reply_markup=history_menu())
-        except Exception:
-            pass
-        bot.answer_callback_query(call.id)
-        return
-    per_page = 5
-    total = len(rows)
-    total_pages = max(1, (total + per_page - 1) // per_page)
-    page = max(1, min(page, total_pages))
-    start = (page - 1) * per_page
-    end = start + per_page
-    page_items = rows[start:end]
-    try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except Exception:
-        pass
-    clear_old_messages(call.message.chat.id)
-    sent = bot.send_message(
-        call.message.chat.id,
-        f"🖼 <b>История редактирований</b> (стр. {page}/{total_pages})\n"
-        f"Всего: <b>{total}</b>\n\n"
-        f"Фото: <b>{start + 1}—{min(end, total)}</b>",
-        parse_mode='HTML')
-    remember(call.message.chat.id, sent.message_id)
-    for prompt, image_url, ts in page_items:
-        when = time.strftime('%d.%m.%Y %H:%M', time.localtime(ts)) if ts else "—"
-        msg_id = send_photo_safe(
-            call.message.chat.id, image_url,
-            f"🖼 <b>{escape_html(prompt)}</b>\n📅 {when}")
-        if msg_id:
-            remember(call.message.chat.id, msg_id)
-        time.sleep(0.3)
-    markup = telebot.types.InlineKeyboardMarkup()
-    nav = []
-    if page > 1:
-        nav.append(telebot.types.InlineKeyboardButton("⬅️", callback_data=f"hist_edit_page_{page - 1}"))
-    nav.append(telebot.types.InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
-    if page < total_pages:
-        nav.append(telebot.types.InlineKeyboardButton("➡️", callback_data=f"hist_edit_page_{page + 1}"))
-    markup.row(*nav)
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_history"))
-    sent = bot.send_message(call.message.chat.id, "Выбери страницу 👇", reply_markup=markup)
-    remember(call.message.chat.id, sent.message_id)
-    bot.answer_callback_query(call.id)
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "hist_chat" or call.data.startswith("hist_chat_page_"))
-def hist_chat(call):
-    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
-        return
-    if call.data.startswith("hist_chat_page_"):
-        page_str = call.data.replace("hist_chat_page_", "")
-        page = int(page_str) if page_str.isdigit() else 1
-    else:
-        page = 1
-    history = get_history(call.message.chat.id, limit=500)
-    if not history:
-        try:
-            bot.edit_message_text(
-                "🤖 История чата пуста.",
-                chat_id=call.message.chat.id, message_id=call.message.message_id,
-                reply_markup=history_menu())
-        except Exception:
-            pass
-        bot.answer_callback_query(call.id)
-        return
-    per_page = 20
-    total = len(history)
-    total_pages = max(1, (total + per_page - 1) // per_page)
-    page = max(1, min(page, total_pages))
-    start = (page - 1) * per_page
-    end = start + per_page
-    page_items = history[start:end]
-    text = f"🤖 <b>История ИИ</b> (стр. {page}/{total_pages})\n"
-    text += f"Всего: <b>{total}</b> сообщений\n\n"
-    for role, content in page_items:
-        prefix = "👤 <b>Вы:</b> " if role == "user" else "🤖 <b>Боб:</b> "
-        short = content[:150] + "..." if len(content) > 150 else content
-        text += f"{prefix}{escape_html(short)}\n\n"
-    if len(text) > 4000:
-        text = text[:4000] + "..."
-    markup = telebot.types.InlineKeyboardMarkup()
-    nav = []
-    if page > 1:
-        nav.append(telebot.types.InlineKeyboardButton("⬅️", callback_data=f"hist_chat_page_{page - 1}"))
-    nav.append(telebot.types.InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
-    if page < total_pages:
-        nav.append(telebot.types.InlineKeyboardButton("➡️", callback_data=f"hist_chat_page_{page + 1}"))
-    markup.row(*nav)
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_history"))
-    try:
-        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id,
-                              parse_mode='HTML', reply_markup=markup)
-    except Exception:
-        sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=markup)
-        remember(call.message.chat.id, sent.message_id)
-    bot.answer_callback_query(call.id)
 
 
 # === GIGACHAT ===
@@ -3377,8 +3187,6 @@ def ask_gigachat_with_progress(chat_id, question, mode, ai_mode):
             pass
     return answer
 
-
-# === ОБРАБОТКА ТЕКСТОВЫХ СООБЩЕНИЙ ===
 @bot.message_handler(content_types=['text'])
 def handle_message(message):
     if message.text == "⬅️ Назад":
@@ -3539,7 +3347,6 @@ def handle_message(message):
     _last_ai_message[message.chat.id] = sent.message_id
 
 
-# === ОБРАБОТКА ФОТО ===
 @bot.message_handler(content_types=['photo'])
 def handle_photo(message):
     if send_banned_message(message.chat.id):
@@ -3565,7 +3372,6 @@ def handle_photo(message):
         return
 
 
-# === ФАЙЛЫ В ИИ ===
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
     if send_banned_message(message.chat.id):
@@ -3697,7 +3503,563 @@ def handle_document(message):
     remember(message.chat.id, s.message_id)
     _last_ai_message[message.chat.id] = s.message_id
 
-# === АДМИН-МЕНЮ ===
+
+# === ИСТОРИЯ ===
+@bot.callback_query_handler(func=lambda call: call.data == "hist_image" or call.data.startswith("hist_image_page_"))
+def hist_image(call):
+    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
+        return
+    if call.data.startswith("hist_image_page_"):
+        page_str = call.data.replace("hist_image_page_", "")
+        page = int(page_str) if page_str.isdigit() else 1
+    else:
+        page = 1
+    rows = get_image_history_by_kind(call.message.chat.id, "gen", limit=200)
+    if not rows:
+        try:
+            bot.edit_message_text(
+                "🎨 История генераций пуста.",
+                chat_id=call.message.chat.id, message_id=call.message.message_id,
+                reply_markup=history_menu())
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id)
+        return
+    per_page = 5
+    total = len(rows)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * per_page
+    end = start + per_page
+    page_items = rows[start:end]
+    try:
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
+    clear_old_messages(call.message.chat.id)
+    sent = bot.send_message(
+        call.message.chat.id,
+        f"🎨 <b>История генераций</b> (стр. {page}/{total_pages})\n"
+        f"Всего: <b>{total}</b>\n\n"
+        f"Фото: <b>{start + 1}—{min(end, total)}</b>",
+        parse_mode='HTML')
+    remember(call.message.chat.id, sent.message_id)
+    for prompt, image_url, ts in page_items:
+        when = time.strftime('%d.%m.%Y %H:%M', time.localtime(ts)) if ts else "—"
+        msg_id = send_photo_safe(
+            call.message.chat.id, image_url,
+            f"🎨 <b>{escape_html(prompt)}</b>\n📅 {when}")
+        if msg_id:
+            remember(call.message.chat.id, msg_id)
+        time.sleep(0.3)
+    markup = telebot.types.InlineKeyboardMarkup()
+    nav = []
+    if page > 1:
+        nav.append(telebot.types.InlineKeyboardButton("⬅️", callback_data=f"hist_image_page_{page - 1}"))
+    nav.append(telebot.types.InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+    if page < total_pages:
+        nav.append(telebot.types.InlineKeyboardButton("➡️", callback_data=f"hist_image_page_{page + 1}"))
+    markup.row(*nav)
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_history"))
+    sent = bot.send_message(call.message.chat.id, "Выбери страницу 👇", reply_markup=markup)
+    remember(call.message.chat.id, sent.message_id)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "hist_edit" or call.data.startswith("hist_edit_page_"))
+def hist_edit(call):
+    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
+        return
+    if call.data.startswith("hist_edit_page_"):
+        page_str = call.data.replace("hist_edit_page_", "")
+        page = int(page_str) if page_str.isdigit() else 1
+    else:
+        page = 1
+    rows = get_image_history_by_kind(call.message.chat.id, "edit", limit=200)
+    if not rows:
+        try:
+            bot.edit_message_text(
+                "🖼 История редактирований пуста.",
+                chat_id=call.message.chat.id, message_id=call.message.message_id,
+                reply_markup=history_menu())
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id)
+        return
+    per_page = 5
+    total = len(rows)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * per_page
+    end = start + per_page
+    page_items = rows[start:end]
+    try:
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
+    clear_old_messages(call.message.chat.id)
+    sent = bot.send_message(
+        call.message.chat.id,
+        f"🖼 <b>История редактирований</b> (стр. {page}/{total_pages})\n"
+        f"Всего: <b>{total}</b>\n\n"
+        f"Фото: <b>{start + 1}—{min(end, total)}</b>",
+        parse_mode='HTML')
+    remember(call.message.chat.id, sent.message_id)
+    for prompt, image_url, ts in page_items:
+        when = time.strftime('%d.%m.%Y %H:%M', time.localtime(ts)) if ts else "—"
+        msg_id = send_photo_safe(
+            call.message.chat.id, image_url,
+            f"🖼 <b>{escape_html(prompt)}</b>\n📅 {when}")
+        if msg_id:
+            remember(call.message.chat.id, msg_id)
+        time.sleep(0.3)
+    markup = telebot.types.InlineKeyboardMarkup()
+    nav = []
+    if page > 1:
+        nav.append(telebot.types.InlineKeyboardButton("⬅️", callback_data=f"hist_edit_page_{page - 1}"))
+    nav.append(telebot.types.InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+    if page < total_pages:
+        nav.append(telebot.types.InlineKeyboardButton("➡️", callback_data=f"hist_edit_page_{page + 1}"))
+    markup.row(*nav)
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_history"))
+    sent = bot.send_message(call.message.chat.id, "Выбери страницу 👇", reply_markup=markup)
+    remember(call.message.chat.id, sent.message_id)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "hist_chat" or call.data.startswith("hist_chat_page_"))
+def hist_chat(call):
+    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
+        return
+    if call.data.startswith("hist_chat_page_"):
+        page_str = call.data.replace("hist_chat_page_", "")
+        page = int(page_str) if page_str.isdigit() else 1
+    else:
+        page = 1
+    history = get_history(call.message.chat.id, limit=500)
+    if not history:
+        try:
+            bot.edit_message_text(
+                "🤖 История чата пуста.",
+                chat_id=call.message.chat.id, message_id=call.message.message_id,
+                reply_markup=history_menu())
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id)
+        return
+    per_page = 20
+    total = len(history)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * per_page
+    end = start + per_page
+    page_items = history[start:end]
+    text = f"🤖 <b>История ИИ</b> (стр. {page}/{total_pages})\n"
+    text += f"Всего: <b>{total}</b> сообщений\n\n"
+    for role, content in page_items:
+        prefix = "👤 <b>Вы:</b> " if role == "user" else "🤖 <b>Боб:</b> "
+        short = content[:150] + "..." if len(content) > 150 else content
+        text += f"{prefix}{escape_html(short)}\n\n"
+    if len(text) > 4000:
+        text = text[:4000] + "..."
+    markup = telebot.types.InlineKeyboardMarkup()
+    nav = []
+    if page > 1:
+        nav.append(telebot.types.InlineKeyboardButton("⬅️", callback_data=f"hist_chat_page_{page - 1}"))
+    nav.append(telebot.types.InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+    if page < total_pages:
+        nav.append(telebot.types.InlineKeyboardButton("➡️", callback_data=f"hist_chat_page_{page + 1}"))
+    markup.row(*nav)
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_history"))
+    try:
+        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id,
+                              parse_mode='HTML', reply_markup=markup)
+    except Exception:
+        sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=markup)
+        remember(call.message.chat.id, sent.message_id)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "menu_buy")
+def buy_tokens(call):
+    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
+        return
+    user = get_user(call.message.chat.id)
+    trial_started = user[4]
+    trial_used = user[5]
+    now = int(time.time())
+    show_gift = False
+    if not trial_used:
+        if trial_started == 0:
+            update_user(call.message.chat.id, 'trial_started', int(time.time()))
+            trial_started = now
+        if now - trial_started < TRIAL_WINDOW:
+            show_gift = True
+    tokens = user[0]
+    if show_gift:
+        left = TRIAL_WINDOW - (now - trial_started)
+        minutes = left // 60
+        text = (
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "   🎁 ПОДАРОК ДЛЯ НОВЫХ\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🎫 <b>10 токенов</b> за <b>50 ₽</b>\n\n"
+            f"⏳ Осталось: <b>{minutes} мин</b>\n\n"
+            "💎 Текущий баланс: " + str(tokens)
+        )
+        try:
+            bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id,
+                                  parse_mode='HTML', reply_markup=gift_menu())
+        except Exception:
+            sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=gift_menu())
+            remember(call.message.chat.id, sent.message_id)
+    else:
+        text = (
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "   💳 ПОКУПКА ТОКЕНОВ\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"💎 Баланс: <b>{tokens}</b>\n\n"
+            "Выбери пакет 👇"
+        )
+        try:
+            bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id,
+                                  parse_mode='HTML', reply_markup=buy_menu(call.message.chat.id))
+        except Exception:
+            sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML',
+                                    reply_markup=buy_menu(call.message.chat.id))
+            remember(call.message.chat.id, sent.message_id)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "decline_gift")
+def decline_gift(call):
+    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
+        return
+    tokens = get_user(call.message.chat.id)[0]
+    text = (
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "   💳 ПОКУПКА ТОКЕНОВ\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"💎 Баланс: <b>{tokens}</b>\n\n"
+        "Выбери пакет 👇"
+    )
+    try:
+        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id,
+                              parse_mode='HTML', reply_markup=buy_menu(call.message.chat.id))
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "pack_trial")
+def pack_trial(call):
+    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
+        return
+    user = get_user(call.message.chat.id)
+    trial_started = user[4]
+    trial_used = user[5]
+    if trial_used:
+        bot.answer_callback_query(call.id, "❌ Подарок уже использован.")
+        return
+    if trial_started == 0:
+        trial_started = int(time.time())
+        update_user(call.message.chat.id, 'trial_started', trial_started)
+    if int(time.time()) - trial_started > TRIAL_WINDOW:
+        bot.answer_callback_query(call.id, "⏳ Время подарка истекло.")
+        return
+    update_user(call.message.chat.id, 'trial_used', 1)
+    create_invoice(call.message.chat.id, TRIAL_PRICE, TRIAL_TOKENS)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("pack_"))
+def pack_selected(call):
+    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
+        return
+    if call.data == "pack_trial":
+        return
+    parts = call.data.split("_")
+    try:
+        amount = int(parts[1])
+        tokens = int(parts[2])
+    except (IndexError, ValueError):
+        return
+    create_invoice(call.message.chat.id, amount, tokens)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "custom_amount")
+def custom_amount(call):
+    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
+        return
+    bot.answer_callback_query(call.id)
+    try:
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
+    clear_old_messages(call.message.chat.id)
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_buy"))
+    text = (
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "    ✏️ СВОЯ СУММА\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Введи количество токенов\n"
+        f"от <b>{MIN_CUSTOM_TOKENS}</b> до <b>{MAX_CUSTOM_TOKENS}</b>\n\n"
+        f"💰 Цена: <b>5 ₽ за 1 токен</b>\n\n"
+        f"<i>Например: 100 токенов = 500 ₽</i>"
+    )
+    sent = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=markup)
+    remember(call.message.chat.id, sent.message_id)
+    bot.register_next_step_handler(sent, custom_tokens)
+
+
+def custom_tokens(message):
+    if message.text == "⬅️ Назад":
+        back_to_main_handler(message.chat.id, message=message)
+        return
+    if deny_if_banned_or_maintenance(message.chat.id, message=message):
+        return
+    try:
+        bot.delete_message(message.chat.id, message.message_id)
+    except Exception:
+        pass
+    clear_old_messages(message.chat.id)
+    try:
+        tokens = int(message.text)
+    except ValueError:
+        sent = bot.send_message(message.chat.id, "❌ Введи число.", reply_markup=back_to_generate_menu())
+        remember(message.chat.id, sent.message_id)
+        return
+    if tokens < MIN_CUSTOM_TOKENS or tokens > MAX_CUSTOM_TOKENS:
+        sent = bot.send_message(
+            message.chat.id,
+            f"❌ Неверно.\n\nМинимум: <b>{MIN_CUSTOM_TOKENS}</b>\nМаксимум: <b>{MAX_CUSTOM_TOKENS}</b>",
+            parse_mode='HTML', reply_markup=back_to_generate_menu())
+        remember(message.chat.id, sent.message_id)
+        return
+    amount = tokens * 5
+    create_invoice(message.chat.id, amount, tokens)
+
+
+def create_invoice(chat_id, amount, tokens):
+    order_id = f"ORD-{chat_id}-{tokens}-{amount}"
+    save_order(order_id, chat_id, tokens, amount)
+    pay_url = f"{PAY_BASE_URL}/pay/{amount}/{order_id}"
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton(text=f"💳 Оплатить {amount} ₽", url=pay_url))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_buy"))
+    sent = bot.send_message(
+        chat_id,
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"      🧾 СЧЁТ\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🆔 <code>{order_id}</code>\n"
+        f"🎫 Токенов: <b>{tokens}</b>\n"
+        f"💰 Сумма: <b>{amount} ₽</b>\n\n"
+        f"Нажми кнопку ниже 👇\n\n"
+        f"⏳ <i>Счёт действует 20 минут</i>",
+        parse_mode='HTML', reply_markup=markup)
+    remember(chat_id, sent.message_id)
+
+
+# === МОИ ПОКУПКИ ===
+@bot.callback_query_handler(func=lambda call: call.data == "menu_my_orders")
+def my_orders(call):
+    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
+        return
+    try:
+        bot.edit_message_text(
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "      🛒 ПОКУПКИ\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━",
+            chat_id=call.message.chat.id, message_id=call.message.message_id,
+            parse_mode='HTML', reply_markup=orders_menu())
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "my_orders_paid")
+def my_orders_paid(call):
+    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
+        return
+    rows = get_user_orders_paid(call.message.chat.id)
+    if not rows:
+        try:
+            bot.edit_message_text(
+                "✅ Завершённых покупок нет.",
+                chat_id=call.message.chat.id, message_id=call.message.message_id,
+                reply_markup=orders_menu())
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id)
+        return
+    text = "✅ <b>Завершённые покупки:</b>\n\n"
+    for oid, tk, amt, created, tx_id in rows:
+        when = time.strftime('%d.%m.%Y %H:%M', time.localtime(created)) if created else "—"
+        text += f"🧾 <code>{oid}</code>\n💰 {amt} ₽ → <b>{tk}</b> ток.\n📅 {when}\n"
+        if tx_id:
+            text += f"🆔 TX: <code>{tx_id}</code>\n"
+        text += "\n"
+    if len(text) > 4000:
+        text = text[:4000] + "..."
+    try:
+        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id,
+                              parse_mode='HTML', reply_markup=orders_menu())
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "my_orders_pending")
+def my_orders_pending(call):
+    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
+        return
+    rows = get_user_orders_pending(call.message.chat.id)
+    if not rows:
+        try:
+            bot.edit_message_text(
+                "⏳ Незавершённых покупок нет.",
+                chat_id=call.message.chat.id, message_id=call.message.message_id,
+                reply_markup=orders_menu())
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id)
+        return
+    text = "⏳ <b>Незавершённые покупки:</b>\n\n"
+    markup = telebot.types.InlineKeyboardMarkup()
+    now = int(time.time())
+    for oid, tk, amt, created, expires in rows:
+        left = max(0, expires - now) if expires else 0
+        minutes = left // 60
+        seconds = left % 60
+        text += f"🧾 <code>{oid}</code>\n💰 {amt} ₽ → <b>{tk}</b> ток.\n⏳ Осталось: {minutes}:{seconds:02d}\n\n"
+        markup.add(telebot.types.InlineKeyboardButton(f"💳 Оплатить {amt} ₽", callback_data=f"pay_{oid}"))
+        markup.add(telebot.types.InlineKeyboardButton(f"❌ Отменить #{oid[:15]}", callback_data=f"cancel_{oid}"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_orders"))
+    if len(text) > 4000:
+        text = text[:4000] + "..."
+    try:
+        bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id,
+                              parse_mode='HTML', reply_markup=markup)
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("pay_"))
+def pay_order(call):
+    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
+        return
+    order_id = call.data.replace("pay_", "")
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT amount, expires, paid FROM orders WHERE order_id=? AND chat_id=?",
+              (order_id, call.message.chat.id))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        bot.answer_callback_query(call.id, "❌ Заказ не найден.")
+        return
+    amount, expires, paid = row
+    if paid:
+        bot.answer_callback_query(call.id, "✅ Уже оплачен.")
+        return
+    if expires and int(time.time()) > expires:
+        bot.answer_callback_query(call.id, "⏳ Время истекло.")
+        return
+    pay_url = f"{PAY_BASE_URL}/pay/{amount}/{order_id}"
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton(f"💳 Оплатить {amount} ₽", url=pay_url))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="my_orders_pending"))
+    try:
+        bot.edit_message_text(
+            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"      🧾 СЧЁТ\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🆔 <code>{order_id}</code>\n"
+            f"💰 Сумма: <b>{amount} ₽</b>\n\n"
+            f"Нажми кнопку ниже 👇",
+            chat_id=call.message.chat.id, message_id=call.message.message_id,
+            parse_mode='HTML', reply_markup=markup)
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("cancel_"))
+def cancel_order(call):
+    if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
+        return
+    order_id = call.data.replace("cancel_", "")
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("DELETE FROM orders WHERE order_id=? AND chat_id=? AND paid=0",
+              (order_id, call.message.chat.id))
+    conn.commit()
+    conn.close()
+    bot.answer_callback_query(call.id, "❌ Отменено")
+    my_orders_pending(call)
+
+
+# === ОПЛАТА (FLASK) ===
+@app.route('/pay/<amount>/<label>')
+def pay_page(amount, label):
+    html = f'''<html><head><meta charset="utf-8"><title>Оплата...</title></head>
+    <body onload="document.forms[0].submit()">
+    <form method="POST" action="https://yoomoney.ru/quickpay/confirm">
+    <input type="hidden" name="receiver" value="{YOOMONEY_RECEIVER}"/>
+    <input type="hidden" name="quickpay-form" value="button"/>
+    <input type="hidden" name="sum" value="{amount}"/>
+    <input type="hidden" name="label" value="{label}"/>
+    <input type="hidden" name="paymentType" value="AC"/>
+    </form></body></html>'''
+    return html
+
+
+@app.route('/webhook', methods=['POST'])
+def yoomoney_webhook():
+    data = request.form.to_dict()
+    received_sign = data.pop('sign', '')
+    if received_sign:
+        sorted_items = sorted(data.items())
+        check_string = '&'.join(f"{k}={urllib.parse.quote_plus(str(v))}" for k, v in sorted_items)
+        calculated_sign = hmac.new(YOOMONEY_SECRET.encode('utf-8'), check_string.encode('utf-8'), sha256).hexdigest()
+        if not hmac.compare_digest(calculated_sign, received_sign):
+            return jsonify({"status": "error"}), 403
+    else:
+        received_hash = data.pop('sha1_hash', '')
+        if received_hash:
+            check_string = '&'.join([f"{k}={v}" for k, v in sorted(data.items())]) + YOOMONEY_SECRET
+            if hashlib.sha1(check_string.encode('utf-8')).hexdigest() != received_hash:
+                return jsonify({"status": "error"}), 403
+    label = data.get('label', '')
+    amount = data.get('amount', '')
+    tx_id = data.get('operation_id', '') or data.get('withdraw_amount', '')
+    order = get_order(label)
+    if order:
+        chat_id, tokens = order
+        add_tokens(chat_id, tokens)
+        mark_order_paid(label, tx_id)
+        new_balance = get_user(chat_id)[0]
+        clear_old_messages(chat_id)
+        parts = label.split("-")
+        real_amount = parts[-1] if len(parts) >= 4 else amount
+        sent = bot.send_message(
+            chat_id,
+            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"   ✅ ОПЛАТА ПРОШЛА!\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🧾 Счёт: <code>{label}</code>\n"
+            f"💰 Сумма: {real_amount} ₽\n"
+            f"🎫 Токенов: <b>{tokens}</b>\n"
+            f"💎 Баланс: <b>{new_balance}</b>",
+            parse_mode='HTML', reply_markup=main_menu(chat_id))
+        remember(chat_id, sent.message_id)
+        log_action(chat_id, "buy", f"{real_amount} ₽ → {tokens} токенов")
+        notify_subscribers(chat_id, f"💳 Оплата: {real_amount} ₽ → {tokens} токенов")
+    return jsonify({"status": "ok"}), 200
+
 def admin_menu():
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("📋 Тикеты", callback_data="admin_tickets"))
@@ -3809,7 +4171,6 @@ def admin_panel(call):
     bot.answer_callback_query(call.id)
 
 
-# === ТЕХ.РАБОТЫ ===
 @bot.callback_query_handler(func=lambda call: call.data == "admin_maintenance")
 def admin_maintenance(call):
     if call.message.chat.id != ADMIN_ID:
@@ -3954,7 +4315,6 @@ def maint_edit_save(message):
     remember(message.chat.id, sent.message_id)
 
 
-# === ОШИБКИ ===
 @bot.callback_query_handler(func=lambda call: call.data == "admin_errors")
 def admin_errors(call):
     if call.message.chat.id != ADMIN_ID:
@@ -4094,7 +4454,6 @@ def admin_errors_clear(call):
     admin_errors(call)
 
 
-# === ЛОГИ ===
 @bot.callback_query_handler(func=lambda call: call.data == "admin_logs")
 def admin_logs(call):
     if call.message.chat.id != ADMIN_ID:
@@ -4216,7 +4575,6 @@ def logs_clear_execute(call):
     admin_logs(call)
 
 
-# === ОЧИСТКА ===
 @bot.callback_query_handler(func=lambda call: call.data == "admin_wipe")
 def admin_wipe(call):
     if call.message.chat.id != ADMIN_ID:
@@ -4417,7 +4775,6 @@ def wipe_do(call):
         pass
 
 
-# === ПОДПИСКИ ===
 @bot.callback_query_handler(func=lambda call: call.data == "admin_subs")
 def admin_subs(call):
     if call.message.chat.id != ADMIN_ID:
@@ -4541,7 +4898,6 @@ def subs_rm(call):
     subs_remove(call)
 
 
-# === ТИКЕТЫ АДМИНА ===
 @bot.callback_query_handler(func=lambda call: call.data == "admin_tickets")
 def admin_tickets(call):
     if call.message.chat.id != ADMIN_ID:
@@ -4692,7 +5048,6 @@ def admin_send_reply(message, ticket_id):
                             reply_markup=tickets_menu())
     remember(message.chat.id, sent.message_id)
 
-# === НАЧИСЛИТЬ / ЗАБРАТЬ ===
 @bot.callback_query_handler(func=lambda call: call.data == "admin_give")
 def admin_give(call):
     if call.message.chat.id != ADMIN_ID:
@@ -4822,7 +5177,6 @@ def admin_take_amount(message, uid):
     remember(message.chat.id, sent.message_id)
 
 
-# === СПИСОК ЮЗЕРОВ ===
 @bot.callback_query_handler(func=lambda call: call.data == "admin_users" or call.data.startswith("admin_users_page_"))
 def admin_users(call):
     if call.message.chat.id != ADMIN_ID:
@@ -4857,7 +5211,6 @@ def admin_users(call):
     bot.answer_callback_query(call.id)
 
 
-# === УПРАВЛЕНИЕ ЮЗЕРОМ ===
 @bot.callback_query_handler(func=lambda call: call.data == "admin_manage" or call.data.startswith("admin_manage_page_"))
 def admin_manage(call):
     if call.message.chat.id != ADMIN_ID:
@@ -4956,7 +5309,6 @@ def admin_mng_user(call):
     bot.answer_callback_query(call.id)
 
 
-# === БАН ===
 @bot.callback_query_handler(func=lambda call: call.data.startswith("admin_mng_ban_"))
 def admin_mng_ban(call):
     if call.message.chat.id != ADMIN_ID:
@@ -5139,7 +5491,6 @@ def admin_mng_mute_save(message, uid):
     remember(message.chat.id, sent.message_id)
 
 
-# === ЛИМИТЫ ===
 @bot.callback_query_handler(func=lambda call: call.data.startswith("admin_mng_limits_"))
 def admin_mng_limits(call):
     if call.message.chat.id != ADMIN_ID:
@@ -5306,7 +5657,6 @@ def admin_lim_clear(call):
     admin_mng_limits(call)
 
 
-# === ИСТОРИЯ ЮЗЕРА ===
 @bot.callback_query_handler(func=lambda call: call.data.startswith("admin_mng_hist_"))
 def admin_mng_hist(call):
     if call.message.chat.id != ADMIN_ID:
@@ -5449,7 +5799,6 @@ def admin_limits_root(call):
     bot.answer_callback_query(call.id)
 
 
-# === ПОКУПКИ ===
 @bot.callback_query_handler(func=lambda call: call.data == "admin_orders")
 def admin_orders(call):
     if call.message.chat.id != ADMIN_ID:
@@ -5482,7 +5831,6 @@ def admin_orders(call):
     bot.answer_callback_query(call.id)
 
 
-# === РАССЫЛКА ===
 def send_broadcast(text, signed=False):
     global last_broadcast
     conn = get_conn()
@@ -5658,7 +6006,6 @@ def admin_bc_delete(call):
         pass
 
 
-# === ПОИСК ЮЗЕРА ===
 @bot.message_handler(commands=['find_user'])
 def find_user_cmd(message):
     if message.chat.id != ADMIN_ID:
@@ -5679,7 +6026,7 @@ def find_user_cmd(message):
                      f"🆔 <code>{chat_id}</code>\n👤 {uname}\n💰 {tokens} токенов",
                      parse_mode='HTML')
 
-# === БЭКАП БД ===
+
 def backup_db():
     try:
         if not os.path.exists(DB_PATH):
@@ -5734,7 +6081,6 @@ def backup_worker():
             log_error(f"backup_worker: {e}")
 
 
-# === WORKER ОЧИСТКИ ЗАКАЗОВ ===
 def cleanup_orders_worker():
     while True:
         try:
@@ -5749,7 +6095,6 @@ def cleanup_orders_worker():
         time.sleep(60)
 
 
-# === WORKER ОЧИСТКИ EDIT CACHE ===
 def cleanup_edit_cache():
     while True:
         try:
@@ -5767,7 +6112,6 @@ def cleanup_edit_cache():
         time.sleep(600)
 
 
-# === WORKER ОЧИСТКИ ACTIVE OPERATIONS ===
 def cleanup_active_operations():
     while True:
         try:
@@ -5790,7 +6134,6 @@ def cleanup_active_operations():
         time.sleep(300)
 
 
-# === WORKER ОЧИСТКИ ERRORS.LOG ===
 def cleanup_errors_log():
     while True:
         try:
@@ -5822,7 +6165,6 @@ def cleanup_errors_log():
             log_error(f"cleanup_errors_log: {e}")
 
 
-# === ОТПРАВКА ERRORS.LOG В КАНАЛ ===
 def send_errors_to_channel():
     if ERRORS_CHANNEL_ID == 0:
         return False
@@ -5881,7 +6223,6 @@ def errors_uploader():
             log_error(f"errors_uploader: {e}")
 
 
-# === WORKER ТЕХ.РАБОТ ===
 def maintenance_worker():
     while True:
         try:
@@ -5924,7 +6265,6 @@ def maintenance_worker():
         time.sleep(30)
 
 
-# === WORKER ОТЛОЖЕННОЙ РАССЫЛКИ ===
 def broadcast_worker():
     while True:
         try:
@@ -5948,7 +6288,6 @@ def broadcast_worker():
         time.sleep(30)
 
 
-# === ОТЧЁТ О ЗАПУСКЕ ===
 def send_startup_report():
     if ERRORS_CHANNEL_ID == 0:
         return
@@ -6000,65 +6339,6 @@ def send_startup_report():
         bot.send_message(ERRORS_CHANNEL_ID, text, parse_mode='HTML')
     except Exception as e:
         print(f"Startup report error: {e}")
-
-
-# === ОПЛАТА ===
-@app.route('/pay/<amount>/<label>')
-def pay_page(amount, label):
-    html = f'''<html><head><meta charset="utf-8"><title>Оплата...</title></head>
-    <body onload="document.forms[0].submit()">
-    <form method="POST" action="https://yoomoney.ru/quickpay/confirm">
-    <input type="hidden" name="receiver" value="{YOOMONEY_RECEIVER}"/>
-    <input type="hidden" name="quickpay-form" value="button"/>
-    <input type="hidden" name="sum" value="{amount}"/>
-    <input type="hidden" name="label" value="{label}"/>
-    <input type="hidden" name="paymentType" value="AC"/>
-    </form></body></html>'''
-    return html
-
-
-@app.route('/webhook', methods=['POST'])
-def yoomoney_webhook():
-    data = request.form.to_dict()
-    received_sign = data.pop('sign', '')
-    if received_sign:
-        sorted_items = sorted(data.items())
-        check_string = '&'.join(f"{k}={urllib.parse.quote_plus(str(v))}" for k, v in sorted_items)
-        calculated_sign = hmac.new(YOOMONEY_SECRET.encode('utf-8'), check_string.encode('utf-8'), sha256).hexdigest()
-        if not hmac.compare_digest(calculated_sign, received_sign):
-            return jsonify({"status": "error"}), 403
-    else:
-        received_hash = data.pop('sha1_hash', '')
-        if received_hash:
-            check_string = '&'.join([f"{k}={v}" for k, v in sorted(data.items())]) + YOOMONEY_SECRET
-            if hashlib.sha1(check_string.encode('utf-8')).hexdigest() != received_hash:
-                return jsonify({"status": "error"}), 403
-    label = data.get('label', '')
-    amount = data.get('amount', '')
-    tx_id = data.get('operation_id', '') or data.get('withdraw_amount', '')
-    order = get_order(label)
-    if order:
-        chat_id, tokens = order
-        add_tokens(chat_id, tokens)
-        mark_order_paid(label, tx_id)
-        new_balance = get_user(chat_id)[0]
-        clear_old_messages(chat_id)
-        parts = label.split("-")
-        real_amount = parts[-1] if len(parts) >= 4 else amount
-        sent = bot.send_message(
-            chat_id,
-            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"   ✅ ОПЛАТА ПРОШЛА!\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🧾 Счёт: <code>{label}</code>\n"
-            f"💰 Сумма: {real_amount} ₽\n"
-            f"🎫 Токенов: <b>{tokens}</b>\n"
-            f"💎 Баланс: <b>{new_balance}</b>",
-            parse_mode='HTML', reply_markup=main_menu(chat_id))
-        remember(chat_id, sent.message_id)
-        log_action(chat_id, "buy", f"{real_amount} ₽ → {tokens} токенов")
-        notify_subscribers(chat_id, f"💳 Оплата: {real_amount} ₽ → {tokens} токенов")
-    return jsonify({"status": "ok"}), 200
 
 
 # === WEBAPP API ===
@@ -6132,41 +6412,6 @@ def webapp_api_me():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route('/webapp/api/history/image', methods=['POST'])
-def webapp_api_history_image():
-    try:
-        data = request.get_json() or {}
-        chat_id = api_auth(data)
-        if not chat_id:
-            return jsonify({"error": "unauthorized"}), 401
-        kind = data.get("kind", "gen")
-        rows = get_image_history_by_kind(chat_id, kind, limit=100)
-        items = []
-        for prompt, url, ts in rows:
-            items.append({"prompt": prompt, "url": url, "ts": ts})
-        return jsonify({"items": items})
-    except Exception as e:
-        log_error(f"webapp_api_history_image: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route('/webapp/api/history/chat', methods=['POST'])
-def webapp_api_history_chat():
-    try:
-        data = request.get_json() or {}
-        chat_id = api_auth(data)
-        if not chat_id:
-            return jsonify({"error": "unauthorized"}), 401
-        rows = get_history(chat_id, limit=200)
-        items = []
-        for role, content in rows:
-            items.append({"role": role, "content": content})
-        return jsonify({"items": items})
-    except Exception as e:
-        log_error(f"webapp_api_history_chat: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
 @app.route('/webapp/api/generate', methods=['POST'])
 def webapp_api_generate():
     try:
@@ -6179,7 +6424,7 @@ def webapp_api_generate():
             return jsonify({"error": "Пустой промт"}), 400
         user = get_user(chat_id)
         if user[10]:
-            return jsonify({"error": "banned"}), 403
+            return jsonify({"error": "Вы забанены"}), 403
         if not user[12]:
             return jsonify({"error": "🚫 Картинки запрещены"}), 403
         if user[14] >= 0 and user[16] >= user[14]:
@@ -6219,7 +6464,7 @@ def webapp_api_chat():
             return jsonify({"error": "Пустое сообщение"}), 400
         user = get_user(chat_id)
         if user[10]:
-            return jsonify({"error": "banned"}), 403
+            return jsonify({"error": "Вы забанены"}), 403
         if not user[13]:
             return jsonify({"error": "🚫 Чат запрещён"}), 403
         if user[15] >= 0 and user[17] >= user[15]:
@@ -6245,6 +6490,41 @@ def webapp_api_chat():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/webapp/api/history/image', methods=['POST'])
+def webapp_api_history_image():
+    try:
+        data = request.get_json() or {}
+        chat_id = api_auth(data)
+        if not chat_id:
+            return jsonify({"error": "unauthorized"}), 401
+        kind = data.get("kind", "gen")
+        rows = get_image_history_by_kind(chat_id, kind, limit=100)
+        items = []
+        for prompt, url, ts in rows:
+            items.append({"prompt": prompt, "url": url, "ts": ts})
+        return jsonify({"items": items})
+    except Exception as e:
+        log_error(f"webapp_api_history_image: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/webapp/api/history/chat', methods=['POST'])
+def webapp_api_history_chat():
+    try:
+        data = request.get_json() or {}
+        chat_id = api_auth(data)
+        if not chat_id:
+            return jsonify({"error": "unauthorized"}), 401
+        rows = get_history(chat_id, limit=100)
+        items = []
+        for role, content in rows:
+            items.append({"role": role, "content": content})
+        return jsonify({"items": items})
+    except Exception as e:
+        log_error(f"webapp_api_history_chat: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/webapp/api/buy', methods=['POST'])
 def webapp_api_buy():
     try:
@@ -6255,7 +6535,7 @@ def webapp_api_buy():
         amount = int(data.get("amount", 0))
         tokens = int(data.get("tokens", 0))
         if amount <= 0 or tokens <= 0:
-            return jsonify({"error": "bad params"}), 400
+            return jsonify({"error": "Неверные параметры"}), 400
         order_id = f"ORD-{chat_id}-{tokens}-{amount}"
         save_order(order_id, chat_id, tokens, amount)
         pay_url = f"{PAY_BASE_URL}/pay/{amount}/{order_id}"
@@ -6273,12 +6553,14 @@ def webapp_api_settings():
         if not chat_id:
             return jsonify({"error": "unauthorized"}), 401
         field = data.get("field", "")
-        value = data.get("value", "")
         if field == "mode":
+            value = data.get("value", "regular")
             update_user(chat_id, 'mode', value)
         elif field == "ai_mode":
+            value = data.get("value", "regular")
             update_user(chat_id, 'ai_mode', value)
         elif field == "coder_mode":
+            value = data.get("value", "with_hints")
             update_user(chat_id, 'coder_mode', value)
         elif field == "send_files":
             user = get_user(chat_id)
@@ -6298,7 +6580,53 @@ def webapp_api_settings():
         return jsonify({"error": str(e)}), 500
 
 
-# === ADMIN API ===
+@app.route('/webapp/api/tickets/new', methods=['POST'])
+def webapp_api_tickets_new():
+    try:
+        data = request.get_json() or {}
+        chat_id = api_auth(data)
+        if not chat_id:
+            return jsonify({"error": "unauthorized"}), 401
+        message = (data.get("message") or "").strip()
+        if not message:
+            return jsonify({"error": "Пустое сообщение"}), 400
+        muted, time_left = check_support_muted(chat_id)
+        if muted:
+            return jsonify({"error": f"🚫 Подожди {time_left}"}), 403
+        user = get_user(chat_id)
+        username = user[6] if user[6] else f"ID:{chat_id}"
+        ticket_id = create_ticket(chat_id, username, message)
+        try:
+            bot.send_message(ADMIN_ID, f"🔔 Новый тикет #{ticket_id} от {username}\n\n{message}")
+        except Exception:
+            pass
+        notify_subscribers(chat_id, f"🎫 Новый тикет #{ticket_id}")
+        return jsonify({"ok": True, "ticket_id": ticket_id})
+    except Exception as e:
+        log_error(f"webapp_api_tickets_new: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/webapp/api/tickets/my', methods=['POST'])
+def webapp_api_tickets_my():
+    try:
+        data = request.get_json() or {}
+        chat_id = api_auth(data)
+        if not chat_id:
+            return jsonify({"error": "unauthorized"}), 401
+        rows = get_user_tickets(chat_id)
+        items = []
+        for tid, msg, ans, status in rows:
+            items.append({
+                "id": tid, "message": msg,
+                "answer": ans or "", "status": status,
+            })
+        return jsonify({"items": items})
+    except Exception as e:
+        log_error(f"webapp_api_tickets_my: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/webapp/api/admin/stats', methods=['POST'])
 def webapp_api_admin_stats():
     try:
@@ -6324,18 +6652,14 @@ def webapp_api_admin_stats():
         banned_count = c.fetchone()[0]
         conn.close()
         return jsonify({
-            "users": users_count,
-            "tokens": total_tokens,
-            "images_gen": images_gen,
-            "images_edit": images_edit,
-            "ai_messages": ai_messages,
-            "orders": orders_total,
-            "orders_paid": orders_paid,
-            "tickets_open": tickets_open,
+            "users": users_count, "tokens": total_tokens,
+            "images_gen": images_gen, "images_edit": images_edit,
+            "ai_messages": ai_messages, "orders": orders_total,
+            "orders_paid": orders_paid, "tickets_open": tickets_open,
             "banned": banned_count,
         })
     except Exception as e:
-        log_error(f"webapp_admin_stats: {e}")
+        log_error(f"webapp_api_admin_stats: {e}")
         return jsonify({"error": str(e)}), 500
 
 
@@ -6352,9 +6676,135 @@ def webapp_api_admin_users():
         items = []
         for uid, uname, tokens in page_users:
             items.append({"chat_id": uid, "username": uname or "", "tokens": tokens})
-        return jsonify({"items": items, "page": page, "total_pages": total_pages, "total": total})
+        return jsonify({
+            "items": items, "page": page,
+            "total_pages": total_pages, "total": total,
+        })
     except Exception as e:
-        log_error(f"webapp_admin_users: {e}")
+        log_error(f"webapp_api_admin_users: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/webapp/api/admin/user', methods=['POST'])
+def webapp_api_admin_user():
+    try:
+        data = request.get_json() or {}
+        chat_id = api_auth(data)
+        if chat_id != ADMIN_ID:
+            return jsonify({"error": "unauthorized"}), 401
+        uid = int(data.get("user_id", 0))
+        if not uid:
+            return jsonify({"error": "no user_id"}), 400
+        user = get_user(uid)
+        return jsonify({
+            "chat_id": uid,
+            "tokens": user[0],
+            "username": user[6] or "",
+            "banned": bool(user[10]),
+            "ban_reason": user[11] or "",
+            "can_image": bool(user[12]),
+            "can_chat": bool(user[13]),
+            "limit_images": user[14],
+            "used_images": user[16],
+            "limit_edits": user[20],
+            "used_edits": user[19],
+            "limit_chats": user[15],
+            "used_chats": user[17],
+            "support_muted_until": user[21],
+            "ignore_maintenance": bool(user[22]),
+        })
+    except Exception as e:
+        log_error(f"webapp_api_admin_user: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/webapp/api/admin/user/set', methods=['POST'])
+def webapp_api_admin_user_set():
+    try:
+        data = request.get_json() or {}
+        chat_id = api_auth(data)
+        if chat_id != ADMIN_ID:
+            return jsonify({"error": "unauthorized"}), 401
+        uid = int(data.get("user_id", 0))
+        action = data.get("action", "")
+        if not uid or not action:
+            return jsonify({"error": "no params"}), 400
+        user = get_user(uid)
+        if action == "ban":
+            reason = data.get("reason", "не указана")
+            update_user(uid, 'banned', 1)
+            update_user(uid, 'ban_reason', reason)
+            conn = get_conn()
+            c = conn.cursor()
+            c.execute("INSERT INTO bans (chat_id, reason, admin_id, timestamp) VALUES (?, ?, ?, ?)",
+                      (uid, reason, ADMIN_ID, int(time.time())))
+            conn.commit()
+            conn.close()
+            try:
+                bot.send_message(uid, f"🚫 <b>Вы забанены.</b>\n\nПричина: {escape_html(reason)}",
+                                 parse_mode='HTML')
+            except Exception:
+                pass
+            log_action(uid, "ban", reason)
+        elif action == "unban":
+            update_user(uid, 'banned', 0)
+            update_user(uid, 'ban_reason', '')
+            try:
+                bot.send_message(uid, "✅ <b>Вы разбанены.</b>", parse_mode='HTML')
+            except Exception:
+                pass
+        elif action == "toggle_image":
+            update_user(uid, 'can_image', 0 if user[12] else 1)
+        elif action == "toggle_chat":
+            update_user(uid, 'can_chat', 0 if user[13] else 1)
+        elif action == "toggle_ignore_maint":
+            update_user(uid, 'ignore_maintenance', 0 if user[22] else 1)
+        elif action == "set_limit_images":
+            val = int(data.get("value", -1))
+            update_user(uid, 'limit_images', val)
+            reset_used(uid, 'used_images')
+        elif action == "set_limit_edits":
+            val = int(data.get("value", -1))
+            update_user(uid, 'limit_edits', val)
+            reset_used(uid, 'used_edits')
+        elif action == "set_limit_chats":
+            val = int(data.get("value", -1))
+            update_user(uid, 'limit_chats', val)
+            reset_used(uid, 'used_chats')
+        elif action == "reset_limits":
+            reset_used(uid)
+        elif action == "clear_all":
+            wipe_user_data(uid, "all")
+        elif action == "add_tokens":
+            cnt = int(data.get("value", 0))
+            add_tokens(uid, cnt)
+            try:
+                new_bal = get_user(uid)[0]
+                bot.send_message(uid, f"🎁 <b>Вам зачислено {cnt} токенов!</b>\n\n💎 Баланс: <b>{new_bal}</b>",
+                                 parse_mode='HTML')
+            except Exception:
+                pass
+        elif action == "take_tokens":
+            cnt = int(data.get("value", 0))
+            add_tokens(uid, -cnt)
+            try:
+                new_bal = get_user(uid)[0]
+                bot.send_message(uid, f"⚠️ <b>Списано {cnt} токенов.</b>\n\n💎 Баланс: <b>{new_bal}</b>",
+                                 parse_mode='HTML')
+            except Exception:
+                pass
+        elif action == "send_message":
+            text = data.get("text", "")
+            try:
+                bot.send_message(uid, f"📩 <b>Сообщение от администрации:</b>\n\n{escape_html(text)}",
+                                 parse_mode='HTML')
+            except Exception:
+                pass
+        else:
+            return jsonify({"error": "bad action"}), 400
+        return jsonify({"ok": True})
+    except Exception as e:
+        log_error(f"webapp_api_admin_user_set: {e}")
         return jsonify({"error": str(e)}), 500
 
 
@@ -6372,7 +6822,7 @@ def webapp_api_admin_broadcast():
         threading.Thread(target=send_broadcast, args=(text, signed), daemon=True).start()
         return jsonify({"ok": True})
     except Exception as e:
-        log_error(f"webapp_admin_broadcast: {e}")
+        log_error(f"webapp_api_admin_broadcast: {e}")
         return jsonify({"error": str(e)}), 500
 
 
@@ -6399,7 +6849,7 @@ def webapp_api_admin_maintenance():
             return jsonify({"ok": True})
         return jsonify({"error": "bad action"}), 400
     except Exception as e:
-        log_error(f"webapp_admin_maintenance: {e}")
+        log_error(f"webapp_api_admin_maintenance: {e}")
         return jsonify({"error": str(e)}), 500
 
 
@@ -6420,8 +6870,53 @@ def webapp_api_admin_tickets():
             })
         return jsonify({"items": items})
     except Exception as e:
-        log_error(f"webapp_admin_tickets: {e}")
+        log_error(f"webapp_api_admin_tickets: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+@app.route('/webapp/api/admin/ticket/answer', methods=['POST'])
+def webapp_api_admin_ticket_answer():
+    try:
+        data = request.get_json() or {}
+        chat_id = api_auth(data)
+        if chat_id != ADMIN_ID:
+            return jsonify({"error": "unauthorized"}), 401
+        ticket_id = int(data.get("ticket_id", 0))
+        answer = (data.get("answer") or "").strip()
+        if not ticket_id or not answer:
+            return jsonify({"error": "no params"}), 400
+        ticket = get_ticket(ticket_id)
+        if not ticket:
+            return jsonify({"error": "not found"}), 404
+        _, uid, uname, _, _, _ = ticket
+        answer_ticket(ticket_id, answer, status="done")
+        try:
+            bot.send_message(uid, f"💬 <b>Ответ от поддержки</b> (тикет #{ticket_id}):\n\n{answer}",
+                             parse_mode='HTML')
+        except Exception:
+            pass
+        return jsonify({"ok": True})
+    except Exception as e:
+        log_error(f"webapp_api_admin_ticket_answer: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/webapp/api/admin/ticket/delete', methods=['POST'])
+def webapp_api_admin_ticket_delete():
+    try:
+        data = request.get_json() or {}
+        chat_id = api_auth(data)
+        if chat_id != ADMIN_ID:
+            return jsonify({"error": "unauthorized"}), 401
+        ticket_id = int(data.get("ticket_id", 0))
+        if not ticket_id:
+            return jsonify({"error": "no ticket_id"}), 400
+        delete_ticket(ticket_id)
+        return jsonify({"ok": True})
+    except Exception as e:
+        log_error(f"webapp_api_admin_ticket_delete: {e}")
+        return jsonify({"error": str(e)}), 500
+
 
 WEBAPP_MAINTENANCE_HTML = '''<!DOCTYPE html>
 <html><head><meta charset="utf-8">
@@ -6454,8 +6949,6 @@ html,body{overscroll-behavior:none;}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
 background:var(--tg-theme-bg-color,#0f0f1a);color:var(--tg-theme-text-color,#fff);
 min-height:100vh;padding:0;padding-bottom:20px;position:relative;}
-
-/* Заголовок приложения */
 .app-header{position:sticky;top:0;z-index:100;
 background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);
 padding:16px;display:flex;align-items:center;gap:12px;
@@ -6466,11 +6959,7 @@ flex:1;display:flex;align-items:center;gap:8px;}
 .app-header .balance{font-size:14px;color:#fff;opacity:0.95;
 background:rgba(255,255,255,0.2);padding:6px 12px;border-radius:20px;
 font-weight:600;}
-
-/* Основной контейнер */
 .container{padding:16px;padding-bottom:100px;}
-
-/* Кнопки меню */
 .menu{display:flex;flex-direction:column;gap:12px;}
 .btn{display:flex;align-items:center;gap:14px;padding:18px 20px;
 background:var(--tg-theme-secondary-bg-color,#1c1c2e);
@@ -6484,8 +6973,6 @@ background:var(--tg-theme-secondary-bg-color,#252540);}
 .btn .emoji{font-size:24px;width:32px;text-align:center;}
 .btn .label{flex:1;}
 .btn .arrow{opacity:0.4;font-size:20px;}
-
-/* Секция админа */
 .admin-section{margin-top:24px;padding-top:20px;
 border-top:1px solid rgba(255,255,255,0.1);}
 .admin-title{font-size:12px;opacity:0.5;margin-bottom:12px;
@@ -6493,14 +6980,9 @@ text-align:center;text-transform:uppercase;letter-spacing:1.5px;
 font-weight:600;}
 .admin-section .btn{background:linear-gradient(135deg,#f093fb 0%,#f5576c 100%);
 border:none;}
-.admin-section .btn:active{opacity:0.9;}
-
-/* Экраны */
 .screen{display:none;animation:fadeIn 0.2s;}
 .screen.active{display:block;}
 @keyframes fadeIn{from{opacity:0;transform:translateY(8px);}to{opacity:1;transform:translateY(0);}}
-
-/* Верхний бар экрана */
 .screen-header{display:flex;align-items:center;gap:12px;
 padding:12px 16px;background:var(--tg-theme-secondary-bg-color,#1c1c2e);
 border-radius:14px;margin-bottom:16px;
@@ -6510,17 +6992,12 @@ font-size:24px;cursor:pointer;padding:4px 8px 4px 0;
 display:flex;align-items:center;}
 .back-btn:active{opacity:0.6;}
 .screen-title{font-size:17px;font-weight:600;flex:1;}
-
-/* Меню покупки */
 .buy-option{padding:20px;background:var(--tg-theme-secondary-bg-color,#1c1c2e);
 border:1px solid rgba(255,255,255,0.06);
 border-radius:14px;margin-bottom:10px;cursor:pointer;
 text-align:center;font-size:16px;font-weight:600;
 transition:all 0.15s;display:flex;align-items:center;justify-content:center;gap:10px;}
-.buy-option:active{transform:scale(0.98);opacity:0.85;
-background:var(--tg-theme-secondary-bg-color,#252540);}
-
-/* Сетка истории */
+.buy-option:active{transform:scale(0.98);opacity:0.85;}
 .history-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
 .history-item{background:var(--tg-theme-secondary-bg-color,#1c1c2e);
 border-radius:12px;overflow:hidden;
@@ -6530,8 +7007,6 @@ background:#000;}
 .history-item .cap{padding:8px 10px;font-size:11px;opacity:0.75;
 white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
 background:rgba(0,0,0,0.3);}
-
-/* Загрузка */
 .loading{text-align:center;padding:60px 20px;opacity:0.5;font-size:15px;}
 .loading::before{content:"";display:inline-block;width:24px;height:24px;
 border:3px solid rgba(255,255,255,0.1);
@@ -6539,8 +7014,6 @@ border-top-color:#667eea;border-radius:50%;
 animation:spin 0.8s linear infinite;margin-right:12px;
 vertical-align:middle;}
 @keyframes spin{to{transform:rotate(360deg);}}
-
-/* Табы */
 .tabs{display:flex;gap:8px;margin-bottom:16px;
 background:var(--tg-theme-secondary-bg-color,#1c1c2e);
 padding:4px;border-radius:12px;}
@@ -6550,8 +7023,6 @@ font-size:14px;font-weight:500;cursor:pointer;opacity:0.6;
 transition:all 0.15s;}
 .tab.active{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);
 opacity:1;font-weight:600;}
-
-/* Поле ввода */
 .input-wrap{margin-bottom:14px;}
 .input-wrap textarea,.input-wrap input{width:100%;padding:14px 16px;
 background:var(--tg-theme-secondary-bg-color,#1c1c2e);
@@ -6559,11 +7030,8 @@ border:1px solid rgba(255,255,255,0.08);
 border-radius:12px;color:var(--tg-theme-text-color,#fff);
 font-size:15px;font-family:inherit;resize:none;outline:none;
 transition:border 0.15s;}
-.input-wrap textarea:focus,.input-wrap input:focus{
-border-color:#667eea;}
+.input-wrap textarea:focus,.input-wrap input:focus{border-color:#667eea;}
 .input-wrap textarea{min-height:100px;}
-
-/* Кнопка действия */
 .action-btn{width:100%;padding:16px;border:none;border-radius:14px;
 background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);
 color:#fff;font-size:16px;font-weight:600;cursor:pointer;
@@ -6571,10 +7039,8 @@ transition:all 0.15s;box-shadow:0 4px 16px rgba(102,126,234,0.4);}
 .action-btn:active{transform:scale(0.98);opacity:0.9;}
 .action-btn:disabled{opacity:0.5;cursor:not-allowed;
 box-shadow:none;transform:none;}
-
-/* Сообщения чата */
 .chat-messages{display:flex;flex-direction:column;gap:12px;
-margin-bottom:16px;max-height:none;}
+margin-bottom:16px;}
 .msg{max-width:85%;padding:12px 16px;border-radius:16px;
 font-size:15px;line-height:1.4;word-wrap:break-word;
 white-space:pre-wrap;}
@@ -6586,30 +7052,22 @@ background:var(--tg-theme-secondary-bg-color,#1c1c2e);
 color:var(--tg-theme-text-color,#fff);
 border-bottom-left-radius:4px;
 border:1px solid rgba(255,255,255,0.06);}
-
-/* Прогресс */
 .progress-wrap{margin:20px 0;}
 .progress-bar{width:100%;height:8px;background:rgba(255,255,255,0.1);
-border-radius:10px;overflow:hidden;position:relative;}
+border-radius:10px;overflow:hidden;}
 .progress-fill{height:100%;
 background:linear-gradient(90deg,#667eea 0%,#764ba2 100%);
 border-radius:10px;transition:width 0.3s ease;
 box-shadow:0 0 12px rgba(102,126,234,0.6);}
 .progress-text{text-align:center;margin-top:12px;
 font-size:14px;opacity:0.8;}
-
-/* Результат */
 .result-img{width:100%;border-radius:16px;
 box-shadow:0 4px 24px rgba(0,0,0,0.4);margin-bottom:16px;
 display:block;}
 .result-caption{text-align:center;font-size:14px;opacity:0.7;
 margin-bottom:16px;padding:0 10px;line-height:1.4;}
-
-/* Ошибка */
 .err{color:#ff6b6b;text-align:center;padding:40px 20px;font-size:15px;
 background:rgba(255,107,107,0.1);border-radius:12px;}
-
-/* Модальное окно */
 .modal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;
 background:rgba(0,0,0,0.7);z-index:1000;
 display:none;align-items:center;justify-content:center;padding:24px;
@@ -6626,15 +7084,11 @@ text-align:center;}
 text-align:center;line-height:1.4;}
 .modal-buttons{display:flex;gap:10px;}
 .modal-btn{flex:1;padding:14px;border:none;border-radius:12px;
-font-size:15px;font-weight:600;cursor:pointer;
-transition:all 0.15s;}
+font-size:15px;font-weight:600;cursor:pointer;transition:all 0.15s;}
 .modal-btn.cancel{background:rgba(255,255,255,0.1);
 color:var(--tg-theme-text-color,#fff);}
-.modal-btn.confirm{background:linear-gradient(135deg,#f5576c 0%,#f093fb 100%);
-color:#fff;}
+.modal-btn.confirm{background:linear-gradient(135deg,#f5576c 0%,#f093fb 100%);color:#fff;}
 .modal-btn:active{transform:scale(0.97);}
-
-/* Настройки */
 .setting-row{display:flex;align-items:center;justify-content:space-between;
 padding:16px;background:var(--tg-theme-secondary-bg-color,#1c1c2e);
 border-radius:14px;margin-bottom:10px;
@@ -6651,8 +7105,6 @@ top:3px;left:3px;width:24px;height:24px;border-radius:50%;
 background:#fff;transition:transform 0.2s;
 box-shadow:0 2px 6px rgba(0,0,0,0.3);}
 .setting-row .toggle.on::after{transform:translateX(22px);}
-
-/* Список режимов */
 .mode-option{padding:14px 18px;background:var(--tg-theme-secondary-bg-color,#1c1c2e);
 border:1px solid rgba(255,255,255,0.06);
 border-radius:12px;margin-bottom:8px;cursor:pointer;
@@ -6664,19 +7116,13 @@ background:linear-gradient(135deg,rgba(102,126,234,0.15),rgba(118,75,162,0.15));
 .mode-option .check{margin-left:auto;font-size:18px;
 color:#667eea;opacity:0;}
 .mode-option.active .check{opacity:1;}
-
-/* Текстовое поле вывода */
 .output-box{padding:16px;background:var(--tg-theme-secondary-bg-color,#1c1c2e);
 border-radius:14px;font-size:14px;line-height:1.5;
 white-space:pre-wrap;word-wrap:break-word;margin-bottom:14px;
 border:1px solid rgba(255,255,255,0.06);
 max-height:60vh;overflow-y:auto;}
-
-/* Заголовок секции */
 .section-title{font-size:13px;opacity:0.6;text-transform:uppercase;
 letter-spacing:1px;margin:20px 0 12px;font-weight:600;}
-
-/* Статистика админа */
 .stats-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;
 margin-bottom:16px;}
 .stat-card{padding:16px;background:var(--tg-theme-secondary-bg-color,#1c1c2e);
@@ -6689,21 +7135,17 @@ background-clip:text;margin-bottom:4px;}
 </style>
 </head>
 <body>
-
 <div class="app-header">
     <div class="title"><span class="emoji">🤖</span> БОБ</div>
     <div class="balance">💰 <span id="balance-tokens">...</span></div>
 </div>
-
 <div class="container">
-
-<!-- ГЛАВНЫЙ ЭКРАН -->
 <div id="screen-main" class="screen active">
     <div class="menu">
         <button class="btn" onclick="showScreen('generate')">
             <span class="emoji">🎨</span><span class="label">Сгенерировать</span><span class="arrow">›</span>
         </button>
-        <button class="btn" onclick="showScreen('edit')">
+        <button class="btn" onclick="openBot('menu_edit')">
             <span class="emoji">🖼</span><span class="label">Редактировать фото</span><span class="arrow">›</span>
         </button>
         <button class="btn" onclick="showScreen('chat')">
@@ -6729,8 +7171,6 @@ background-clip:text;margin-bottom:4px;}
         </div>
     </div>
 </div>
-
-<!-- ЭКРАН ГЕНЕРАЦИИ -->
 <div id="screen-generate" class="screen">
     <div class="screen-header">
         <button class="back-btn" onclick="showScreen('main')">←</button>
@@ -6750,26 +7190,6 @@ background-clip:text;margin-bottom:4px;}
     </div>
     <div id="gen-result" style="display:none;"></div>
 </div>
-
-<!-- ЭКРАН РЕДАКТИРОВАНИЯ -->
-<div id="screen-edit" class="screen">
-    <div class="screen-header">
-        <button class="back-btn" onclick="showScreen('main')">←</button>
-        <span class="screen-title">🖼 Редактирование</span>
-    </div>
-    <div style="padding:20px;text-align:center;opacity:0.7;font-size:15px;line-height:1.5;">
-        📸 Загрузи фото и опиши что сделать<br><br>
-        <span style="font-size:13px;opacity:0.6;">
-        • убери фон<br>
-        • сделай аниме<br>
-        • помести на пляж<br>
-        • добавь шляпу
-        </span>
-    </div>
-    <button class="action-btn" onclick="openBot('menu_edit')">🖼 Открыть в боте</button>
-</div>
-
-<!-- ЭКРАН ЧАТА -->
 <div id="screen-chat" class="screen">
     <div class="screen-header">
         <button class="back-btn" onclick="showScreen('main')">←</button>
@@ -6781,8 +7201,6 @@ background-clip:text;margin-bottom:4px;}
     </div>
     <button class="action-btn" id="chat-btn" onclick="doChat()">📤 Отправить — 1💎</button>
 </div>
-
-<!-- ЭКРАН ИСТОРИИ -->
 <div id="screen-history" class="screen">
     <div class="screen-header">
         <button class="back-btn" onclick="showScreen('main')">←</button>
@@ -6794,8 +7212,6 @@ background-clip:text;margin-bottom:4px;}
     </div>
     <div id="history-content"><div class="loading">Загрузка...</div></div>
 </div>
-
-<!-- ЭКРАН ПОКУПКИ -->
 <div id="screen-buy" class="screen">
     <div class="screen-header">
         <button class="back-btn" onclick="showScreen('main')">←</button>
@@ -6806,8 +7222,6 @@ background-clip:text;margin-bottom:4px;}
     <div class="buy-option" onclick="buyTokens(500,100)">💵 500 ₽ — 100 токенов</div>
     <div class="buy-option" onclick="buyTokens(1000,200)">💵 1000 ₽ — 200 токенов</div>
 </div>
-
-<!-- ЭКРАН НАСТРОЕК -->
 <div id="screen-settings" class="screen">
     <div class="screen-header">
         <button class="back-btn" onclick="showScreen('main')">←</button>
@@ -6827,8 +7241,6 @@ background-clip:text;margin-bottom:4px;}
         <div class="toggle" id="toggle-sound_on"></div>
     </div>
 </div>
-
-<!-- ЭКРАН АДМИНА -->
 <div id="screen-admin" class="screen">
     <div class="screen-header">
         <button class="back-btn" onclick="showScreen('main')">←</button>
@@ -6845,8 +7257,6 @@ background-clip:text;margin-bottom:4px;}
     <div class="section-title">👥 Список юзеров</div>
     <div id="admin-users" class="loading">Загрузка...</div>
 </div>
-
-<!-- МОДАЛЬНОЕ ОКНО ВЫХОДА -->
 <div class="modal-overlay" id="exit-modal">
     <div class="modal-box">
         <div class="modal-title">🚪 Выйти из приложения?</div>
@@ -6857,7 +7267,6 @@ background-clip:text;margin-bottom:4px;}
         </div>
     </div>
 </div>
-
 </div>
 <script>
 const tg = window.Telegram.WebApp;
@@ -6865,19 +7274,8 @@ tg.ready();
 tg.expand();
 tg.setHeaderColor('#667eea');
 tg.setBackgroundColor('#0f0f1a');
-
 const initData = tg.initData;
-
-let state = {
-    me: null,
-    isAdmin: false,
-    currentScreen: 'main',
-    isGenerating: false,
-    isChatting: false,
-    genAbort: false,
-};
-
-// === API helper ===
+let state = {me:null,isAdmin:false,currentScreen:'main',isGenerating:false,isChatting:false};
 async function apiCall(endpoint, data = {}) {
     data.init_data = initData;
     try {
@@ -6887,111 +7285,49 @@ async function apiCall(endpoint, data = {}) {
             body: JSON.stringify(data),
         });
         return await res.json();
-    } catch (e) {
-        return {error: 'network: ' + e.message};
-    }
+    } catch (e) { return {error: 'network: ' + e.message}; }
 }
-
-// === Экраны ===
 function showScreen(name) {
-    if (state.isGenerating && name !== 'generate') {
-        tg.showAlert('⏳ Генерация идёт. Подожди окончания.');
-        return;
-    }
-    if (state.isChatting && name !== 'chat') {
-        tg.showAlert('⏳ Боб думает. Подожди ответа.');
-        return;
-    }
+    if (state.isGenerating && name !== 'generate') { tg.showAlert('⏳ Генерация идёт. Подожди окончания.'); return; }
+    if (state.isChatting && name !== 'chat') { tg.showAlert('⏳ Боб думает. Подожди ответа.'); return; }
     document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
     document.getElementById('screen-' + name).classList.add('active');
     state.currentScreen = name;
-    if (name === 'history') {
-        loadHistory('gen', document.querySelector('.tab.active'));
-    }
-    if (name === 'settings') {
-        loadSettings();
-    }
-    if (name === 'admin') {
-        loadAdminStats();
-        loadAdminUsers(1);
-        loadMaintenanceStatus();
-    }
-    if (name === 'chat') {
-        loadChatHistory();
-    }
-    if (name === 'generate') {
-        resetGenForm();
-    }
-}
-
-// === Модальное окно выхода ===
-function openExitModal() {
-    document.getElementById('exit-modal').classList.add('active');
-}
-function closeExitModal() {
-    document.getElementById('exit-modal').classList.remove('active');
-}
-function confirmExit() {
-    closeExitModal();
-    tg.close();
-}
-
-// Перехват кнопки "Назад" в Telegram
-tg.BackButton.onClick(function() {
-    if (state.currentScreen === 'main') {
-        openExitModal();
-    } else {
-        showScreen('main');
-    }
-});
-
-// Показываем кнопку "Назад" только не на главном
-function updateBackButton() {
-    if (state.currentScreen !== 'main') {
-        tg.BackButton.show();
-    } else {
-        tg.BackButton.hide();
-    }
-}
-
-// Переопределяем showScreen для обновления кнопки
-const _origShowScreen = showScreen;
-showScreen = function(name) {
-    _origShowScreen(name);
+    if (name === 'history') loadHistory('gen', document.querySelector('.tab.active'));
+    if (name === 'settings') loadSettings();
+    if (name === 'admin') { loadAdminStats(); loadAdminUsers(1); loadMaintenanceStatus(); }
+    if (name === 'chat') loadChatHistory();
+    if (name === 'generate') resetGenForm();
     updateBackButton();
-};
-
-// === Загрузка инфо о юзере ===
+}
+function openExitModal() { document.getElementById('exit-modal').classList.add('active'); }
+function closeExitModal() { document.getElementById('exit-modal').classList.remove('active'); }
+function confirmExit() { closeExitModal(); tg.close(); }
+tg.BackButton.onClick(function() {
+    if (state.currentScreen === 'main') openExitModal();
+    else showScreen('main');
+});
+function updateBackButton() {
+    if (state.currentScreen !== 'main') tg.BackButton.show();
+    else tg.BackButton.hide();
+}
 async function loadMe() {
     const d = await apiCall('me');
     if (d.error === 'banned') {
-        document.body.innerHTML = '<div style="text-align:center;padding:80px 20px;">' +
-            '<h1 style="font-size:60px;margin-bottom:20px;">🚫</h1>' +
-            '<h2 style="margin-bottom:12px;">Вы забанены</h2>' +
-            '<p style="opacity:0.7;">Причина: ' + escapeHtml(d.reason || 'не указана') + '</p>' +
-            '</div>';
+        document.body.innerHTML = '<div style="text-align:center;padding:80px 20px;"><h1 style="font-size:60px;margin-bottom:20px;">🚫</h1><h2 style="margin-bottom:12px;">Вы забанены</h2><p style="opacity:0.7;">Причина: ' + escapeHtml(d.reason || 'не указана') + '</p></div>';
         return;
     }
-    if (d.error) {
-        document.getElementById('balance-tokens').textContent = 'ошибка';
-        return;
-    }
-    state.me = d;
-    state.isAdmin = d.is_admin;
+    if (d.error) { document.getElementById('balance-tokens').textContent = 'ошибка'; return; }
+    state.me = d; state.isAdmin = d.is_admin;
     document.getElementById('balance-tokens').textContent = d.tokens;
-    if (d.is_admin) {
-        document.getElementById('admin-block').style.display = 'block';
-    }
+    if (d.is_admin) document.getElementById('admin-block').style.display = 'block';
 }
-
 function updateBalance(newBalance) {
     if (newBalance !== undefined && newBalance !== null) {
         state.me.tokens = newBalance;
         document.getElementById('balance-tokens').textContent = newBalance;
     }
 }
-
-// === Генерация ===
 function resetGenForm() {
     document.getElementById('gen-form').style.display = 'block';
     document.getElementById('gen-progress').style.display = 'none';
@@ -7000,105 +7336,56 @@ function resetGenForm() {
     document.getElementById('gen-fill').style.width = '0%';
     document.getElementById('gen-status').textContent = '⏳ Анализирую...';
     const btn = document.getElementById('gen-btn');
-    btn.disabled = false;
-    btn.textContent = '✅ Нарисовать — 4💎';
+    btn.disabled = false; btn.textContent = '✅ Нарисовать — 4💎';
 }
-
 async function doGenerate() {
     if (state.isGenerating) return;
     const prompt = (document.getElementById('gen-prompt').value || '').trim();
-    if (!prompt) {
-        tg.showAlert('❌ Введи промт');
-        return;
-    }
-    if (!state.me) {
-        tg.showAlert('❌ Ошибка загрузки профиля');
-        return;
-    }
-    if (state.me.tokens < 4) {
-        tg.showAlert('❌ Нужно 4 токена');
-        return;
-    }
-
+    if (!prompt) { tg.showAlert('❌ Введи промт'); return; }
+    if (!state.me) { tg.showAlert('❌ Ошибка загрузки профиля'); return; }
+    if (state.me.tokens < 4) { tg.showAlert('❌ Нужно 4 токена'); return; }
     state.isGenerating = true;
-    state.genAbort = false;
-
     document.getElementById('gen-form').style.display = 'none';
     document.getElementById('gen-progress').style.display = 'block';
     document.getElementById('gen-result').style.display = 'none';
-
-    // Анимация прогресса (пока ждём ответа)
     let percent = 0;
-    const stages = [
-        [0, '⏳ Анализирую...'],
-        [20, '🎨 Начинаю...'],
-        [40, '💎 Рисую основу...'],
-        [60, '✨ Добавляю детали...'],
-        [80, '🔥 Финал...'],
-        [95, '✅ Почти готово...'],
-    ];
+    const stages = [[0,'⏳ Анализирую...'],[20,'🎨 Начинаю...'],[40,'💎 Рисую основу...'],[60,'✨ Добавляю детали...'],[80,'🔥 Финал...'],[95,'✅ Почти готово...']];
     let status = '⏳ Анализирую...';
     const interval = setInterval(() => {
         if (percent < 90) percent += Math.random() * 8;
         else percent = Math.min(percent + 1, 95);
         document.getElementById('gen-fill').style.width = percent + '%';
-        for (const [p, s] of stages) {
-            if (percent >= p) status = s;
-        }
+        for (const [p, s] of stages) if (percent >= p) status = s;
         document.getElementById('gen-status').textContent = status;
     }, 400);
-
     const d = await apiCall('generate', {prompt});
-
     clearInterval(interval);
-
     if (d.error) {
         document.getElementById('gen-fill').style.width = '100%';
         document.getElementById('gen-status').textContent = '❌ Ошибка';
-        setTimeout(() => {
-            resetGenForm();
-            tg.showAlert('❌ ' + d.error);
-        }, 600);
+        setTimeout(() => { resetGenForm(); tg.showAlert('❌ ' + d.error); }, 600);
         state.isGenerating = false;
         return;
     }
-
     document.getElementById('gen-fill').style.width = '100%';
     document.getElementById('gen-status').textContent = '✅ Готово!';
     updateBalance(d.balance);
-
     setTimeout(() => {
         document.getElementById('gen-progress').style.display = 'none';
         document.getElementById('gen-result').style.display = 'block';
-        document.getElementById('gen-result').innerHTML = `
-            <img class="result-img" src="${d.url}" alt="result">
-            <div class="result-caption">🎨 ${escapeHtml(d.prompt)}</div>
-            <button class="action-btn" onclick="resetGenForm()" style="margin-bottom:10px;">🔁 Ещё раз — 4💎</button>
-            <button class="action-btn" onclick="showScreen('main')" style="background:rgba(255,255,255,0.1);box-shadow:none;">🏠 В меню</button>
-        `;
+        document.getElementById('gen-result').innerHTML = '<img class="result-img" src="' + d.url + '"><div class="result-caption">🎨 ' + escapeHtml(d.prompt) + '</div><button class="action-btn" onclick="resetGenForm()" style="margin-bottom:10px;">🔁 Ещё раз — 4💎</button><button class="action-btn" onclick="showScreen(\'main\')" style="background:rgba(255,255,255,0.1);box-shadow:none;">🏠 В меню</button>';
         state.isGenerating = false;
     }, 800);
 }
-
-// === Чат ===
 async function loadChatHistory() {
     const d = await apiCall('history/chat');
     const container = document.getElementById('chat-messages');
     container.innerHTML = '';
-    if (d.error) {
-        container.innerHTML = '<div class="err">Ошибка: ' + escapeHtml(d.error) + '</div>';
-        return;
-    }
-    if (!d.items || d.items.length === 0) {
-        container.innerHTML = '<div style="text-align:center;opacity:0.5;padding:30px;font-size:14px;">Задай первый вопрос Бобу 👇</div>';
-        return;
-    }
-    for (const item of d.items) {
-        appendMessage(item.role, item.content);
-    }
+    if (d.error) { container.innerHTML = '<div class="err">Ошибка: ' + escapeHtml(d.error) + '</div>'; return; }
+    if (!d.items || d.items.length === 0) { container.innerHTML = '<div style="text-align:center;opacity:0.5;padding:30px;font-size:14px;">Задай первый вопрос Бобу 👇</div>'; return; }
+    for (const item of d.items) appendMessage(item.role, item.content);
     scrollChatBottom();
 }
-
 function appendMessage(role, text) {
     const container = document.getElementById('chat-messages');
     const div = document.createElement('div');
@@ -7106,115 +7393,60 @@ function appendMessage(role, text) {
     div.textContent = text;
     container.appendChild(div);
 }
-
-function scrollChatBottom() {
-    const container = document.getElementById('chat-messages');
-    setTimeout(() => {
-        window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'});
-    }, 100);
-}
-
+function scrollChatBottom() { setTimeout(() => { window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'}); }, 100); }
 async function doChat() {
     if (state.isChatting) return;
     const input = document.getElementById('chat-input');
     const question = (input.value || '').trim();
     if (!question) return;
-    if (!state.me || state.me.tokens < 1) {
-        tg.showAlert('❌ Нужно 1 токен');
-        return;
-    }
-
+    if (!state.me || state.me.tokens < 1) { tg.showAlert('❌ Нужно 1 токен'); return; }
     state.isChatting = true;
     input.value = '';
-
     appendMessage('user', question);
     scrollChatBottom();
-
     const btn = document.getElementById('chat-btn');
-    btn.disabled = true;
-    btn.textContent = '⏳ Боб думает...';
-
+    btn.disabled = true; btn.textContent = '⏳ Боб думает...';
     const typingDiv = document.createElement('div');
-    typingDiv.className = 'msg bot';
-    typingDiv.id = 'typing-msg';
+    typingDiv.className = 'msg bot'; typingDiv.id = 'typing-msg';
     typingDiv.textContent = '⏳ Печатает...';
     document.getElementById('chat-messages').appendChild(typingDiv);
     scrollChatBottom();
-
     const d = await apiCall('chat', {question});
-
     const typing = document.getElementById('typing-msg');
     if (typing) typing.remove();
-
-    btn.disabled = false;
-    btn.textContent = '📤 Отправить — 1💎';
-
-    if (d.error) {
-        appendMessage('bot', '❌ ' + d.error);
-        state.isChatting = false;
-        scrollChatBottom();
-        return;
-    }
-
+    btn.disabled = false; btn.textContent = '📤 Отправить — 1💎';
+    if (d.error) { appendMessage('bot', '❌ ' + d.error); state.isChatting = false; scrollChatBottom(); return; }
     updateBalance(d.balance);
     appendMessage('bot', d.answer);
     scrollChatBottom();
     state.isChatting = false;
 }
-
-// === История ===
 async function loadHistory(kind, tabEl) {
     document.querySelectorAll('#screen-history .tab').forEach(t => t.classList.remove('active'));
     if (tabEl) tabEl.classList.add('active');
     const c = document.getElementById('history-content');
     c.innerHTML = '<div class="loading">Загрузка...</div>';
     const d = await apiCall('history/image', {kind});
-    if (d.error) {
-        c.innerHTML = '<div class="err">Ошибка: ' + escapeHtml(d.error) + '</div>';
-        return;
-    }
-    if (!d.items || d.items.length === 0) {
-        c.innerHTML = '<div style="text-align:center;padding:50px 20px;opacity:0.5;">' +
-            'История пуста<br><span style="font-size:13px;">Сгенерируй первую картинку 🎨</span></div>';
-        return;
-    }
+    if (d.error) { c.innerHTML = '<div class="err">Ошибка: ' + escapeHtml(d.error) + '</div>'; return; }
+    if (!d.items || d.items.length === 0) { c.innerHTML = '<div style="text-align:center;padding:50px 20px;opacity:0.5;">История пуста<br><span style="font-size:13px;">Сгенерируй первую картинку 🎨</span></div>'; return; }
     let html = '<div class="history-grid">';
     for (const it of d.items) {
-        html += '<div class="history-item">';
-        html += '<img src="' + it.url + '" loading="lazy" onclick="openImage(\'' + escapeAttr(it.url) + '\')">';
-        html += '<div class="cap">' + escapeHtml((it.prompt || '').substring(0, 40)) + '</div>';
-        html += '</div>';
+        html += '<div class="history-item"><img src="' + it.url + '" loading="lazy" onclick="tg.openLink(\'' + it.url + '\')"><div class="cap">' + escapeHtml((it.prompt || '').substring(0, 40)) + '</div></div>';
     }
     html += '</div>';
     c.innerHTML = html;
 }
-
-function openImage(url) {
-    tg.openLink(url);
-}
-
-// === Покупка ===
 async function buyTokens(amount, tokens) {
-    tg.showConfirm(`Купить ${tokens} токенов за ${amount} ₽?`, async (ok) => {
+    tg.showConfirm('Купить ' + tokens + ' токенов за ' + amount + ' ₽?', async (ok) => {
         if (!ok) return;
         const d = await apiCall('buy', {amount, tokens});
-        if (d.error) {
-            tg.showAlert('❌ ' + d.error);
-            return;
-        }
+        if (d.error) { tg.showAlert('❌ ' + d.error); return; }
         tg.openLink(d.pay_url);
     });
 }
-
-// === Настройки ===
 async function loadSettings() {
     if (!state.me) return;
-    const modes = [
-        {key: 'regular', label: '🤖 Обычный ИИ'},
-        {key: 'coder', label: '💻 Кодер'},
-        {key: 'explainer', label: '📖 Объяснятор'},
-        {key: 'translator', label: '🌍 Переводчик'},
-    ];
+    const modes = [{key:'regular',label:'🤖 Обычный ИИ'},{key:'coder',label:'💻 Кодер'},{key:'explainer',label:'📖 Объяснятор'},{key:'translator',label:'🌍 Переводчик'}];
     const modesEl = document.getElementById('modes-list');
     modesEl.innerHTML = '';
     for (const m of modes) {
@@ -7224,12 +7456,7 @@ async function loadSettings() {
         div.onclick = () => setMode('mode', m.key);
         modesEl.appendChild(div);
     }
-    const aiModes = [
-        {key: 'regular', label: '🤖 Обычный'},
-        {key: 'smart', label: '🧠 Умный'},
-        {key: 'open', label: '💬 Откровенный'},
-        {key: 'uncensored', label: '🔥 Без цензуры'},
-    ];
+    const aiModes = [{key:'regular',label:'🤖 Обычный'},{key:'smart',label:'🧠 Умный'},{key:'open',label:'💬 Откровенный'},{key:'uncensored',label:'🔥 Без цензуры'}];
     const aiEl = document.getElementById('ai-modes-list');
     aiEl.innerHTML = '';
     for (const m of aiModes) {
@@ -7242,148 +7469,75 @@ async function loadSettings() {
     document.getElementById('toggle-send_files').classList.toggle('on', state.me.send_files);
     document.getElementById('toggle-sound_on').classList.toggle('on', state.me.sound_on);
 }
-
 async function setMode(field, value) {
     const d = await apiCall('settings', {field, value});
-    if (d.error) {
-        tg.showAlert('❌ ' + d.error);
-        return;
-    }
+    if (d.error) { tg.showAlert('❌ ' + d.error); return; }
     state.me[field] = value;
     tg.HapticFeedback.impactOccurred('light');
     loadSettings();
 }
-
 async function toggleSetting(field, el) {
     const d = await apiCall('settings', {field});
-    if (d.error) {
-        tg.showAlert('❌ ' + d.error);
-        return;
-    }
+    if (d.error) { tg.showAlert('❌ ' + d.error); return; }
     state.me[field] = d.value;
     document.getElementById('toggle-' + field).classList.toggle('on', d.value);
     tg.HapticFeedback.impactOccurred('light');
 }
-
-// === Админ ===
 async function loadAdminStats() {
     const d = await apiCall('admin/stats');
     if (d.error) return;
     const el = document.getElementById('admin-stats');
-    el.innerHTML = `
-        <div class="stat-card"><div class="num">${d.users}</div><div class="lbl">👥 Юзеров</div></div>
-        <div class="stat-card"><div class="num">${d.tokens}</div><div class="lbl">💰 Токенов</div></div>
-        <div class="stat-card"><div class="num">${d.images_gen}</div><div class="lbl">🎨 Генераций</div></div>
-        <div class="stat-card"><div class="num">${d.images_edit}</div><div class="lbl">🖼 Правок</div></div>
-        <div class="stat-card"><div class="num">${d.ai_messages}</div><div class="lbl">🤖 Сообщений</div></div>
-        <div class="stat-card"><div class="num">${d.orders_paid}</div><div class="lbl">💳 Оплат</div></div>
-        <div class="stat-card"><div class="num">${d.tickets_open}</div><div class="lbl">📋 Тикетов</div></div>
-        <div class="stat-card"><div class="num">${d.banned}</div><div class="lbl">🚫 Банов</div></div>
-    `;
+    el.innerHTML = '<div class="stat-card"><div class="num">' + d.users + '</div><div class="lbl">👥 Юзеров</div></div><div class="stat-card"><div class="num">' + d.tokens + '</div><div class="lbl">💰 Токенов</div></div><div class="stat-card"><div class="num">' + d.images_gen + '</div><div class="lbl">🎨 Генераций</div></div><div class="stat-card"><div class="num">' + d.images_edit + '</div><div class="lbl">🖼 Правок</div></div><div class="stat-card"><div class="num">' + d.ai_messages + '</div><div class="lbl">🤖 Сообщений</div></div><div class="stat-card"><div class="num">' + d.orders_paid + '</div><div class="lbl">💳 Оплат</div></div><div class="stat-card"><div class="num">' + d.tickets_open + '</div><div class="lbl">📋 Тикетов</div></div><div class="stat-card"><div class="num">' + d.banned + '</div><div class="lbl">🚫 Банов</div></div>';
 }
-
 async function loadAdminUsers(page) {
     const el = document.getElementById('admin-users');
     el.innerHTML = '<div class="loading">Загрузка...</div>';
     const d = await apiCall('admin/users', {page});
-    if (d.error) {
-        el.innerHTML = '<div class="err">Ошибка: ' + escapeHtml(d.error) + '</div>';
-        return;
-    }
+    if (d.error) { el.innerHTML = '<div class="err">Ошибка: ' + escapeHtml(d.error) + '</div>'; return; }
     let html = '';
     for (const u of d.items) {
         const name = u.username || '—';
-        html += '<div class="setting-row" style="padding:12px 14px;">' +
-            '<div class="lbl" style="font-size:14px;">🆔 <code style="font-size:12px;">' + u.chat_id + '</code> ' + escapeHtml(name) + '</div>' +
-            '<div class="val">' + u.tokens + ' 💎</div>' +
-            '</div>';
+        html += '<div class="setting-row" style="padding:12px 14px;"><div class="lbl" style="font-size:14px;">🆔 <code style="font-size:12px;">' + u.chat_id + '</code> ' + escapeHtml(name) + '</div><div class="val">' + u.tokens + ' 💎</div></div>';
     }
-    html += '<div style="text-align:center;margin-top:10px;opacity:0.6;font-size:13px;">' +
-        'Стр. ' + d.page + '/' + d.total_pages + ' • Всего: ' + d.total + '</div>';
+    html += '<div style="text-align:center;margin-top:10px;opacity:0.6;font-size:13px;">Стр. ' + d.page + '/' + d.total_pages + ' • Всего: ' + d.total + '</div>';
     el.innerHTML = html;
 }
-
 async function sendBroadcast() {
     const text = (document.getElementById('broadcast-text').value || '').trim();
-    if (!text) {
-        tg.showAlert('❌ Введи текст');
-        return;
-    }
+    if (!text) { tg.showAlert('❌ Введи текст'); return; }
     tg.showConfirm('Отправить рассылку всем юзерам?', async (ok) => {
         if (!ok) return;
         const d = await apiCall('admin/broadcast', {text, signed: true});
-        if (d.error) {
-            tg.showAlert('❌ ' + d.error);
-            return;
-        }
+        if (d.error) { tg.showAlert('❌ ' + d.error); return; }
         document.getElementById('broadcast-text').value = '';
         tg.showAlert('✅ Рассылка запущена');
     });
 }
-
 async function loadMaintenanceStatus() {
     const d = await apiCall('admin/maintenance', {action: 'get'});
     const btn = document.getElementById('maint-btn');
-    if (d.error) {
-        btn.textContent = '❌ Ошибка';
-        return;
-    }
+    if (d.error) { btn.textContent = '❌ Ошибка'; return; }
     btn.textContent = d.enabled ? '🔴 Выключить тех.работы' : '🟢 Включить тех.работы';
     btn.dataset.enabled = d.enabled ? '1' : '0';
 }
-
 async function toggleMaintenance() {
     const btn = document.getElementById('maint-btn');
     const enabled = btn.dataset.enabled === '1';
     const action = enabled ? 'off' : 'on';
-    tg.showConfirm(enabled ? 'Выключить тех.работы?' : '⚠️ Включить тех.работы? Приложение и бот станут недоступны.', async (ok) => {
+    tg.showConfirm(enabled ? 'Выключить тех.работы?' : '⚠️ Включить тех.работы?', async (ok) => {
         if (!ok) return;
         const d = await apiCall('admin/maintenance', {action});
-        if (d.error) {
-            tg.showAlert('❌ ' + d.error);
-            return;
-        }
-        tg.showAlert(enabled ? '✅ Тех.работы выключены' : '✅ Тех.работы включены');
+        if (d.error) { tg.showAlert('❌ ' + d.error); return; }
+        tg.showAlert(enabled ? '✅ Выключены' : '✅ Включены');
         loadMaintenanceStatus();
     });
 }
-
-// === Открытие бота (для функций которых нет в приложении) ===
-function openBot(callback) {
-    tg.sendData(JSON.stringify({callback}));
-    tg.close();
-}
-
-// === Helpers ===
-function escapeHtml(t) {
-    const d = document.createElement('div');
-    d.textContent = t == null ? '' : String(t);
-    return d.innerHTML;
-}
-function escapeAttr(t) {
-    return String(t).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-}
-
-// === Инициализация ===
+function openBot(callback) { tg.sendData(JSON.stringify({callback})); tg.close(); }
+function escapeHtml(t) { const d = document.createElement('div'); d.textContent = t == null ? '' : String(t); return d.innerHTML; }
 loadMe();
-
-// Обработка клавиши "Назад"
-document.addEventListener('DOMContentLoaded', () => {
-    updateBackButton();
-});
-
-// Автоматический показ кнопки "Назад" в Telegram
-const origShow = tg.BackButton.show.bind(tg.BackButton);
-const origHide = tg.BackButton.hide.bind(tg.BackButton);
-
-// Периодическое обновление баланса раз в минуту
-setInterval(() => {
-    if (state.currentScreen === 'main') {
-        loadMe();
-    }
-}, 60000);
+document.addEventListener('DOMContentLoaded', () => { updateBackButton(); });
+setInterval(() => { if (state.currentScreen === 'main') loadMe(); }, 60000);
 </script>
-
 </body>
 </html>'''
 
@@ -7401,7 +7555,6 @@ def webapp_index():
         return WEBAPP_HTML
 
 
-# === ОБРАБОТКА tg.sendData ===
 @bot.message_handler(content_types=['web_app_data'])
 def handle_web_app_data(message):
     try:
@@ -7424,7 +7577,6 @@ def run_flask():
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 3000)), threaded=True)
 
 
-# === ГЛАВНЫЙ ЗАПУСК ===
 if __name__ == '__main__':
     threading.Thread(target=run_flask, daemon=True).start()
     threading.Thread(target=send_startup_report, daemon=True).start()
