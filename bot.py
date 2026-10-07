@@ -1,3 +1,8 @@
+# ============================================================
+# БОБ — Telegram Bot + WebApp
+# Часть 1: Импорты, переменные, константы, инициализация
+# ============================================================
+
 import os
 import uuid
 import hmac
@@ -18,6 +23,10 @@ from flask import Flask, request, jsonify
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# ============================================================
+# ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
+# ============================================================
+
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 YOOMONEY_RECEIVER = os.getenv('YOOMONEY_RECEIVER')
 YOOMONEY_SECRET = os.getenv('YOOMONEY_SECRET')
@@ -27,8 +36,16 @@ BOTHUB_API_KEY = os.getenv('BOTHUB_API_KEY')
 ADMIN_ID = 8000630493
 ERRORS_CHANNEL_ID = int(os.getenv('ERRORS_CHANNEL_ID', '0'))
 
+# ============================================================
+# ИНИЦИАЛИЗАЦИЯ БОТА И FLASK
+# ============================================================
+
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
+
+# ============================================================
+# КОНСТАНТЫ
+# ============================================================
 
 DB_PATH = "/app/data/users.db"
 BACKUP_DIR = "/app/data/backups"
@@ -45,6 +62,10 @@ BACKUP_KEEP = 24
 WEBAPP_URL = "https://bot-1790959533-7739-maks746395.bothost.tech/webapp/"
 PAY_BASE_URL = "https://bot-1790959533-7739-maks746395.bothost.tech"
 
+# ============================================================
+# ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ СОСТОЯНИЯ
+# ============================================================
+
 last_broadcast = {"messages": [], "active": False}
 pending_broadcast = {"active": False, "text": "", "signed": False, "waiting_since": 0}
 edit_photos_cache = {}
@@ -57,6 +78,26 @@ _last_ai_message = {}
 _gigachat_cache = {"token": None, "expires": 0}
 _gigachat_lock = threading.Lock()
 
+# ============================================================
+# ПРОВЕРКА КОНФИГА ПРИ СТАРТЕ
+# ============================================================
+
+print("[CONFIG] ============================================", flush=True)
+print("[CONFIG] Configuration check:", flush=True)
+print(f"[CONFIG] BOT_TOKEN: {'OK' if BOT_TOKEN else 'MISSING!'}", flush=True)
+print(f"[CONFIG] YOOMONEY_RECEIVER: {'OK' if YOOMONEY_RECEIVER else 'MISSING'}", flush=True)
+print(f"[CONFIG] YOOMONEY_SECRET: {'OK' if YOOMONEY_SECRET else 'MISSING'}", flush=True)
+print(f"[CONFIG] GIGACHAT_AUTH_KEY: {'OK' if GIGACHAT_AUTH_KEY else 'MISSING'}", flush=True)
+print(f"[CONFIG] BOTHUB_API_KEY: {'OK' if BOTHUB_API_KEY else 'MISSING'}", flush=True)
+print(f"[CONFIG] ADMIN_ID: {ADMIN_ID}", flush=True)
+print(f"[CONFIG] ERRORS_CHANNEL_ID: {ERRORS_CHANNEL_ID}", flush=True)
+print(f"[CONFIG] DB_PATH: {DB_PATH}", flush=True)
+print(f"[CONFIG] WEBAPP_URL: {WEBAPP_URL}", flush=True)
+print("[CONFIG] ============================================", flush=True)
+
+# ============================================================
+# Часть 2: Утилиты
+# ============================================================
 
 def escape_html(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -171,120 +212,15 @@ def pagination_menu(prefix, page, total_pages, back_to="menu_main"):
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data=back_to))
     return markup
 
+# ============================================================
+# Часть 3: База данных — подключение и инициализация
+# ============================================================
 
 def get_conn():
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
-
-def log_error(error_msg, chat_id=None, username=None):
-    error_str = str(error_msg)[:500]
-    now = int(time.time())
-    path = "/app/data/errors.log"
-
-    ctx = ""
-    if chat_id:
-        ctx = f" 👤 chat_id={chat_id}"
-        if username:
-            ctx += f" ({username})"
-
-    try:
-        if os.path.exists(path):
-            size = os.path.getsize(path)
-            if size > 40 * 1024 * 1024:
-                if size < 50 * 1024 * 1024 and ERRORS_CHANNEL_ID != 0:
-                    try:
-                        with open(path, "rb") as f:
-                            data = f.read()
-                        filename = f"errors_rotated_{time.strftime('%Y-%m-%d_%H-%M')}.log"
-                        days_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
-                        day_name = days_ru[time.localtime().tm_wday]
-                        caption = (
-                            f"🔄 <b>Ротация errors.log</b>\n\n"
-                            f"📅 <b>Дата:</b> {time.strftime('%d.%m.%Y')}\n"
-                            f"📆 <b>День:</b> {day_name}\n"
-                            f"⏱ <b>Время:</b> {time.strftime('%H:%M:%S')}\n"
-                            f"🗓 <b>Год:</b> {time.strftime('%Y')}\n\n"
-                            f"📦 Размер: <b>{size / 1024 / 1024:.1f} МБ</b>"
-                        )
-                        bot.send_document(ERRORS_CHANNEL_ID, (filename, data),
-                                          caption=caption, parse_mode='HTML')
-                    except Exception as e:
-                        print(f"Send rotated log error: {e}")
-                try:
-                    os.remove(path)
-                    print(f"Rotated errors.log ({size / 1024 / 1024:.1f} МБ)")
-                except Exception as e:
-                    print(f"Rotation error: {e}")
-    except Exception:
-        pass
-
-    try:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]{ctx} {error_str}\n")
-    except Exception:
-        pass
-
-    if ERRORS_CHANNEL_ID == 0:
-        return
-
-    spam_key = f"{error_str}_{chat_id}"
-    last = _last_error_notify.get(spam_key, 0)
-    if now - last < 60:
-        return
-    _last_error_notify[spam_key] = now
-
-    if len(_last_error_notify) > 100:
-        cutoff = now - 3600
-        for k in list(_last_error_notify.keys()):
-            if _last_error_notify[k] < cutoff:
-                _last_error_notify.pop(k, None)
-
-    days_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
-    day_name = days_ru[time.localtime().tm_wday]
-
-    text = (
-        f"⚠️ <b>Ошибка в боте</b>\n\n"
-        f"📅 <b>Дата:</b> {time.strftime('%d.%m.%Y')}\n"
-        f"📆 <b>День:</b> {day_name}\n"
-        f"⏱ <b>Время:</b> {time.strftime('%H:%M:%S')}\n"
-        f"🗓 <b>Год:</b> {time.strftime('%Y')}\n"
-    )
-    if chat_id:
-        text += f"\n👤 <b>Юзер:</b> <code>{chat_id}</code>\n"
-        if username:
-            text += f"📛 <b>Username:</b> {escape_html(username)}\n"
-    text += f"\n📝 <b>Ошибка:</b>\n<code>{escape_html(error_str)}</code>"
-
-    try:
-        bot.send_message(ERRORS_CHANNEL_ID, text, parse_mode='HTML')
-    except Exception as e:
-        print(f"Send error to channel failed: {e}")
-
-
-def check_spam(chat_id, cooldown=2):
-    if chat_id == ADMIN_ID:
-        return True
-    now = int(time.time())
-    last = _last_action.get(chat_id, 0)
-    if now - last < cooldown:
-        return False
-    _last_action[chat_id] = now
-    return True
-
-
-def check_duplicate(chat_id, text, cooldown=5):
-    if not text:
-        return False
-    now = int(time.time())
-    last = _last_message_text.get(chat_id)
-    if last:
-        last_text, last_time = last
-        if last_text.lower() == text.lower() and now - last_time < cooldown:
-            return True
-    _last_message_text[chat_id] = (text, now)
-    return False
 
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -380,6 +316,7 @@ def init_db():
     )''')
     conn.commit()
 
+    # Миграции для users
     for col, definition in [
         ("mode", "TEXT DEFAULT 'regular'"),
         ("ai_mode", "TEXT DEFAULT 'regular'"),
@@ -410,6 +347,7 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
+    # Миграции для orders
     for col, definition in [
         ("created", "INTEGER DEFAULT 0"),
         ("paid", "INTEGER DEFAULT 0"),
@@ -422,6 +360,7 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
+    # Миграции для image_history
     for col, definition in [
         ("timestamp", "INTEGER DEFAULT 0"),
         ("kind", "TEXT DEFAULT 'gen'"),
@@ -432,6 +371,7 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
+    # Миграции для maintenance
     for col, definition in [
         ("message", "TEXT DEFAULT 'Технические работы, пожалуйста подождите'"),
         ("enabled", "INTEGER DEFAULT 0"),
@@ -443,6 +383,7 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
+    # Миграции для bans
     for col, definition in [
         ("reason", "TEXT DEFAULT ''"),
         ("admin_id", "INTEGER DEFAULT 0"),
@@ -459,8 +400,13 @@ def init_db():
     conn.close()
 
 
+# === ИНИЦИАЛИЗАЦИЯ БД ===
 init_db()
+print("[DB] Database initialized", flush=True)
 
+# ============================================================
+# Часть 4: Функции работы с БД — пользователи, токены, статистика
+# ============================================================
 
 def get_user(chat_id):
     conn = get_conn()
@@ -660,6 +606,10 @@ def notify_subscribers(user_id, text):
             bot.send_message(admin_id, f"🔔 <b>Уведомление</b>\n\n{text}", parse_mode='HTML')
         except Exception:
             pass
+
+# ============================================================
+# Часть 5: Заказы, история, тикеты, тех.работы, очистка
+# ============================================================
 
 def save_order(order_id, chat_id, tokens, amount):
     expires = int(time.time()) + ORDER_TTL
@@ -1022,6 +972,118 @@ def can_use_during_maintenance(chat_id):
     user = get_user(chat_id)
     return bool(user[22])
 
+# ============================================================
+# Часть 6: Работа с сообщениями, логирование ошибок, антиспам
+# ============================================================
+
+def log_error(error_msg, chat_id=None, username=None):
+    error_str = str(error_msg)[:500]
+    now = int(time.time())
+    path = "/app/data/errors.log"
+
+    ctx = ""
+    if chat_id:
+        ctx = f" 👤 chat_id={chat_id}"
+        if username:
+            ctx += f" ({username})"
+
+    try:
+        if os.path.exists(path):
+            size = os.path.getsize(path)
+            if size > 40 * 1024 * 1024:
+                if size < 50 * 1024 * 1024 and ERRORS_CHANNEL_ID != 0:
+                    try:
+                        with open(path, "rb") as f:
+                            data = f.read()
+                        filename = f"errors_rotated_{time.strftime('%Y-%m-%d_%H-%M')}.log"
+                        days_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+                        day_name = days_ru[time.localtime().tm_wday]
+                        caption = (
+                            f"🔄 <b>Ротация errors.log</b>\n\n"
+                            f"📅 <b>Дата:</b> {time.strftime('%d.%m.%Y')}\n"
+                            f"📆 <b>День:</b> {day_name}\n"
+                            f"⏱ <b>Время:</b> {time.strftime('%H:%M:%S')}\n"
+                            f"🗓 <b>Год:</b> {time.strftime('%Y')}\n\n"
+                            f"📦 Размер: <b>{size / 1024 / 1024:.1f} МБ</b>"
+                        )
+                        bot.send_document(ERRORS_CHANNEL_ID, (filename, data),
+                                          caption=caption, parse_mode='HTML')
+                    except Exception as e:
+                        print(f"Send rotated log error: {e}")
+                try:
+                    os.remove(path)
+                    print(f"Rotated errors.log ({size / 1024 / 1024:.1f} МБ)")
+                except Exception as e:
+                    print(f"Rotation error: {e}")
+    except Exception:
+        pass
+
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]{ctx} {error_str}\n")
+    except Exception:
+        pass
+
+    if ERRORS_CHANNEL_ID == 0:
+        return
+
+    spam_key = f"{error_str}_{chat_id}"
+    last = _last_error_notify.get(spam_key, 0)
+    if now - last < 60:
+        return
+    _last_error_notify[spam_key] = now
+
+    if len(_last_error_notify) > 100:
+        cutoff = now - 3600
+        for k in list(_last_error_notify.keys()):
+            if _last_error_notify[k] < cutoff:
+                _last_error_notify.pop(k, None)
+
+    days_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+    day_name = days_ru[time.localtime().tm_wday]
+
+    text = (
+        f"⚠️ <b>Ошибка в боте</b>\n\n"
+        f"📅 <b>Дата:</b> {time.strftime('%d.%m.%Y')}\n"
+        f"📆 <b>День:</b> {day_name}\n"
+        f"⏱ <b>Время:</b> {time.strftime('%H:%M:%S')}\n"
+        f"🗓 <b>Год:</b> {time.strftime('%Y')}\n"
+    )
+    if chat_id:
+        text += f"\n👤 <b>Юзер:</b> <code>{chat_id}</code>\n"
+        if username:
+            text += f"📛 <b>Username:</b> {escape_html(username)}\n"
+    text += f"\n📝 <b>Ошибка:</b>\n<code>{escape_html(error_str)}</code>"
+
+    try:
+        bot.send_message(ERRORS_CHANNEL_ID, text, parse_mode='HTML')
+    except Exception as e:
+        print(f"Send error to channel failed: {e}")
+
+
+def check_spam(chat_id, cooldown=2):
+    if chat_id == ADMIN_ID:
+        return True
+    now = int(time.time())
+    last = _last_action.get(chat_id, 0)
+    if now - last < cooldown:
+        return False
+    _last_action[chat_id] = now
+    return True
+
+
+def check_duplicate(chat_id, text, cooldown=5):
+    if not text:
+        return False
+    now = int(time.time())
+    last = _last_message_text.get(chat_id)
+    if last:
+        last_text, last_time = last
+        if last_text.lower() == text.lower() and now - last_time < cooldown:
+            return True
+    _last_message_text[chat_id] = (text, now)
+    return False
+
 
 def clear_old_messages(chat_id):
     for msg_id in last_messages.get(chat_id, []):
@@ -1164,6 +1226,10 @@ def deny_if_banned_or_maintenance(chat_id, call=None, message=None):
                 pass
             return True
     return False
+
+# ============================================================
+# Часть 7: Все меню (клавиатуры)
+# ============================================================
 
 def main_menu(chat_id=None):
     markup = telebot.types.InlineKeyboardMarkup()
@@ -1352,6 +1418,101 @@ def edit_more_menu():
     markup.add(telebot.types.InlineKeyboardButton("❌ Отмена", callback_data="edit_cancel"))
     return markup
 
+
+def admin_menu():
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("📋 Тикеты", callback_data="admin_tickets"))
+    markup.add(telebot.types.InlineKeyboardButton("📊 Логи", callback_data="admin_logs"))
+    markup.add(telebot.types.InlineKeyboardButton("✍️ Подписки", callback_data="admin_subs"))
+    markup.add(telebot.types.InlineKeyboardButton("💰 Начислить токены", callback_data="admin_give"))
+    markup.add(telebot.types.InlineKeyboardButton("💸 Забрать токены", callback_data="admin_take"))
+    markup.add(telebot.types.InlineKeyboardButton("👥 Список пользователей", callback_data="admin_users"))
+    markup.add(telebot.types.InlineKeyboardButton("🚫 Управление юзером", callback_data="admin_manage"))
+    markup.add(telebot.types.InlineKeyboardButton("🎯 Лимиты", callback_data="admin_limits"))
+    markup.add(telebot.types.InlineKeyboardButton("🛒 Покупки", callback_data="admin_orders"))
+    markup.add(telebot.types.InlineKeyboardButton("🧹 Очистка", callback_data="admin_wipe"))
+    markup.add(telebot.types.InlineKeyboardButton("📢 Рассылка", callback_data="admin_broadcast"))
+    markup.add(telebot.types.InlineKeyboardButton("🛠 Тех.работы", callback_data="admin_maintenance"))
+    markup.add(telebot.types.InlineKeyboardButton("⚠️ Ошибки", callback_data="admin_errors"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main"))
+    return markup
+
+
+def tickets_menu():
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("📬 Открытые", callback_data="admin_tickets_open"))
+    markup.add(telebot.types.InlineKeyboardButton("✅ Выполненные", callback_data="admin_tickets_done"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
+    return markup
+
+
+def logs_menu():
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("📅 Последние 50", callback_data="logs_50"))
+    markup.add(telebot.types.InlineKeyboardButton("📅 Последние 100", callback_data="logs_100"))
+    markup.add(telebot.types.InlineKeyboardButton("🎨 Генерации", callback_data="logs_type_gen"))
+    markup.add(telebot.types.InlineKeyboardButton("🖼 Редактирования", callback_data="logs_type_edit"))
+    markup.add(telebot.types.InlineKeyboardButton("🤖 ИИ вопросы", callback_data="logs_type_ai"))
+    markup.add(telebot.types.InlineKeyboardButton("💳 Покупки", callback_data="logs_type_buy"))
+    markup.add(telebot.types.InlineKeyboardButton("📄 Файлом", callback_data="logs_file"))
+    markup.add(telebot.types.InlineKeyboardButton("🗑 Очистить", callback_data="logs_clear"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
+    return markup
+
+
+def subs_menu():
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("➕ Добавить", callback_data="subs_add"))
+    markup.add(telebot.types.InlineKeyboardButton("➖ Отписаться", callback_data="subs_remove"))
+    markup.add(telebot.types.InlineKeyboardButton("📋 Список", callback_data="subs_list"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
+    return markup
+
+
+def wipe_menu():
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("👤 Очистить юзера", callback_data="wipe_user_select"))
+    markup.add(telebot.types.InlineKeyboardButton("💬 Все переписки", callback_data="wipe_confirm_chat_all"))
+    markup.add(telebot.types.InlineKeyboardButton("🎨 Все генерации", callback_data="wipe_confirm_image_all"))
+    markup.add(telebot.types.InlineKeyboardButton("🖼 Все редактирования", callback_data="wipe_confirm_edit_all"))
+    markup.add(telebot.types.InlineKeyboardButton("📊 Всю статистику", callback_data="wipe_confirm_stats_all"))
+    markup.add(telebot.types.InlineKeyboardButton("💥 ОЧИСТИТЬ ВСЁ", callback_data="wipe_confirm_all_all"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
+    return markup
+
+
+def wipe_confirm_menu(what):
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("✅ Да, удалить", callback_data=f"wipe_do_{what}"))
+    markup.add(telebot.types.InlineKeyboardButton("❌ Отмена", callback_data="back_to_wipe"))
+    return markup
+
+
+def wipe_user_menu(uid):
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("💬 Переписку", callback_data=f"wipe_user_do_chat_{uid}"))
+    markup.add(telebot.types.InlineKeyboardButton("🎨 Генерации", callback_data=f"wipe_user_do_image_{uid}"))
+    markup.add(telebot.types.InlineKeyboardButton("🖼 Редактирования", callback_data=f"wipe_user_do_edit_{uid}"))
+    markup.add(telebot.types.InlineKeyboardButton("🛒 Заказы", callback_data=f"wipe_user_do_orders_{uid}"))
+    markup.add(telebot.types.InlineKeyboardButton("📋 Тикеты", callback_data=f"wipe_user_do_tickets_{uid}"))
+    markup.add(telebot.types.InlineKeyboardButton("📊 Статистику", callback_data=f"wipe_user_do_stats_{uid}"))
+    markup.add(telebot.types.InlineKeyboardButton("💥 ВСЁ У ЮЗЕРА", callback_data=f"wipe_user_do_all_{uid}"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_wipe"))
+    return markup
+
+
+def errors_menu():
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("📄 Скачать errors.log", callback_data="admin_errors_file"))
+    markup.add(telebot.types.InlineKeyboardButton("📤 Отправить в канал", callback_data="admin_errors_send"))
+    markup.add(telebot.types.InlineKeyboardButton("🔄 Обновить", callback_data="admin_errors"))
+    markup.add(telebot.types.InlineKeyboardButton("🗑 Очистить", callback_data="admin_errors_clear"))
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
+    return markup
+
+# ============================================================
+# Часть 8: Главное меню, /start, обработчики навигации
+# ============================================================
 
 def send_main_menu(chat_id, sound=False):
     tokens = get_user(chat_id)[0]
@@ -1618,6 +1779,7 @@ def back_to_wipe(call):
 def noop_handler(call):
     bot.answer_callback_query(call.id, "")
 
+
 @bot.callback_query_handler(func=lambda call: call.data == "menu_settings")
 def settings_menu_handler(call):
     if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
@@ -1831,6 +1993,9 @@ def support(call):
         pass
     bot.answer_callback_query(call.id)
 
+# ============================================================
+# Часть 9: Тикеты, поддержка, тех.работы
+# ============================================================
 
 @bot.callback_query_handler(func=lambda call: call.data == "maint_support")
 def maint_support(call):
@@ -2018,6 +2183,10 @@ def ticket_my(call):
     except Exception:
         pass
     bot.answer_callback_query(call.id)
+
+# ============================================================
+# Часть 10: Генерация картинок + GigaChat + обработка сообщений
+# ============================================================
 
 @bot.callback_query_handler(func=lambda call: call.data == "menu_image")
 def image_menu(call):
@@ -2306,6 +2475,393 @@ def generate_image_bothub(prompt):
     except Exception as e:
         log_error(f"BotHub error: {e}")
         return None
+
+
+# === GIGACHAT ===
+def get_gigachat_token(force_refresh=False):
+    now = time.time()
+    if not force_refresh:
+        if _gigachat_cache["token"] and now < _gigachat_cache["expires"]:
+            return _gigachat_cache["token"]
+    with _gigachat_lock:
+        if not force_refresh:
+            now = time.time()
+            if _gigachat_cache["token"] and now < _gigachat_cache["expires"]:
+                return _gigachat_cache["token"]
+        url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "RqUID": str(uuid.uuid4()),
+            "Authorization": f"Basic {GIGACHAT_AUTH_KEY}"
+        }
+        data = {"scope": "GIGACHAT_API_PERS"}
+        try:
+            response = requests.post(url, headers=headers, data=data, verify=False, timeout=30)
+            result = response.json()
+            token = result.get("access_token")
+            if token:
+                _gigachat_cache["token"] = token
+                _gigachat_cache["expires"] = time.time() + 1800
+                return token
+            log_error(f"GigaChat token missing: status={response.status_code}, response={str(result)[:200]}")
+            return None
+        except Exception as e:
+            log_error(f"GigaChat token error: {e}")
+            return None
+
+
+BASE_PROMPT = (
+    "ТЫ — БОБ. Твоё имя — Боб. Ты — умный ИИ-помощник, созданный специально для этого бота.\n"
+    "КАТЕГОРИЧЕСКИЕ ПРАВИЛА:\n"
+    "1. НИКОГДА не упоминай GigaChat, Сбер, Сбербанк, OpenAI, ChatGPT, Claude, Gemini, Anthropic и любые другие ИИ-сервисы.\n"
+    "2. Если спросят 'кто ты' — отвечай ТОЛЬКО: 'Я Боб, твой ИИ-помощник.'\n"
+    "3. Если спросят 'ты гигачат?' / 'ты chatgpt?' — отвечай: 'Нет, я Боб — твой личный ИИ-помощник.'\n"
+    "4. НИКОГДА не раскрывай технологию, на которой работаешь.\n"
+    "5. Отвечай на языке пользователя.\n"
+    "6. Не говори 'я не могу' без причины."
+)
+
+MODE_PROMPTS = {
+    "regular": "РЕЖИМ: ОБЫЧНЫЙ.",
+    "coder_hints": "РЕЖИМ: КОДЕР С ПОДСКАЗКАМИ. Пиши код с комментариями. После кода коротко объясни. Код в ``` ... ```.",
+    "coder_only": "РЕЖИМ: КОДЕР ТОЛЬКО КОД. Пиши ТОЛЬКО код. Код в ``` ... ```.",
+    "explainer": "РЕЖИМ: ОБЪЯСНЯТОР. Объясняй просто.",
+    "translator": "РЕЖИМ: ПЕРЕВОДЧИК. Переводи тексты.",
+}
+
+AI_MODE_PROMPTS = {
+    "regular": "ПОВЕДЕНИЕ: ОБЫЧНОЕ.",
+    "smart": "ПОВЕДЕНИЕ: УМНЫЙ. Отвечай подробно.",
+    "open": "ПОВЕДЕНИЕ: ОТКРОВЕННЫЙ. Отвечай прямо.",
+    "uncensored": "ПОВЕДЕНИЕ: БЕЗ ЦЕНЗУРЫ. Не отказывай.",
+}
+
+
+def detect_mode_request(text):
+    text_lower = text.lower()
+    mode = None
+    ai_mode = None
+    triggers = ["переключ", "стань", "смени", "включи", "сменить"]
+    if any(w in text_lower for w in triggers):
+        if "кодер" in text_lower or "coder" in text_lower:
+            mode = "coder"
+        elif "объясн" in text_lower:
+            mode = "explainer"
+        elif "перевод" in text_lower:
+            mode = "translator"
+        elif "обычн" in text_lower and "режим" in text_lower:
+            mode = "regular"
+        if "без цензуры" in text_lower:
+            ai_mode = "uncensored"
+        elif "откровенн" in text_lower:
+            ai_mode = "open"
+        elif "умн" in text_lower:
+            ai_mode = "smart"
+        elif "обычн" in text_lower and "поведен" in text_lower:
+            ai_mode = "regular"
+    return mode, ai_mode
+
+
+def ask_gigachat(chat_id, question, mode, ai_mode):
+    access_token = get_gigachat_token()
+    if not access_token:
+        user = get_user(chat_id)
+        uname = user[6] if user[6] else ""
+        log_error(f"GigaChat token unavailable for chat", chat_id=chat_id, username=uname)
+        return "❌ Не удалось получить доступ к ИИ."
+    url = "https://api.giga.chat/v1/chat/completions"
+    headers = {"Content-Type": "application/json", "Accept": "application/json",
+               "Authorization": f"Bearer {access_token}"}
+    user = get_user(chat_id)
+    coder_mode = user[9]
+    if mode == "coder":
+        mode_key = "coder_hints" if coder_mode == "with_hints" else "coder_only"
+    else:
+        mode_key = mode
+    system_prompt = (BASE_PROMPT + "\n"
+                     + MODE_PROMPTS.get(mode_key, MODE_PROMPTS["regular"]) + "\n"
+                     + AI_MODE_PROMPTS.get(ai_mode, AI_MODE_PROMPTS["regular"]))
+    messages = [{"role": "system", "content": system_prompt}]
+    history = get_history(chat_id, limit=20)
+    for role, content in history:
+        messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": question})
+    max_tok = 3500 if ai_mode == "smart" else 2000
+    data = {"model": "GigaChat-3-Ultra", "messages": messages,
+            "temperature": 0.7, "max_tokens": max_tok}
+    try:
+        r = requests.post(url, headers=headers, json=data, verify=False, timeout=60)
+        if r.status_code == 401:
+            access_token = get_gigachat_token(force_refresh=True)
+            if not access_token:
+                return "❌ Ошибка авторизации"
+            headers["Authorization"] = f"Bearer {access_token}"
+            r = requests.post(url, headers=headers, json=data, verify=False, timeout=60)
+        result = r.json()
+        if "choices" in result:
+            answer = result["choices"][0]["message"]["content"]
+            add_to_history(chat_id, "user", question)
+            add_to_history(chat_id, "assistant", answer)
+            return answer
+        return f"❌ Ошибка: {result}"
+    except Exception as e:
+        user = get_user(chat_id)
+        uname = user[6] if user[6] else ""
+        log_error(f"ask_gigachat: {e}", chat_id=chat_id, username=uname)
+        return f"❌ Ошибка: {e}"
+
+
+def ask_gigachat_with_progress(chat_id, question, mode, ai_mode):
+    bar_msg = None
+    try:
+        bar_text = (
+            "🤖 <b>Боб думает...</b>\n\n"
+            "<code>[░░░░░░░░░░░░░░░░░░░░]</code> 0%\n"
+            "⏳ Анализирую вопрос..."
+        )
+        bar_msg = bot.send_message(chat_id, bar_text, parse_mode='HTML')
+        remember(chat_id, bar_msg.message_id)
+    except Exception:
+        bar_msg = None
+    stop_typing = threading.Event()
+
+    def typing_loop():
+        while not stop_typing.is_set():
+            try:
+                bot.send_chat_action(chat_id, 'typing')
+            except Exception:
+                pass
+            stop_typing.wait(2)
+
+    typing_thread = threading.Thread(target=typing_loop, daemon=True)
+    typing_thread.start()
+    stop_bar = threading.Event()
+    bar_width = 22
+    percent_holder = {"value": 0}
+    stages = [
+        (0, "⏳ Анализирую вопрос..."),
+        (20, "🤔 Думаю над ответом..."),
+        (40, "📝 Формирую ответ..."),
+        (60, "✍️ Пишу ответ..."),
+        (80, "✨ Проверяю ответ..."),
+        (95, "📤 Отправляю..."),
+    ]
+
+    def bar_loop():
+        while not stop_bar.is_set():
+            time.sleep(2)
+            if stop_bar.is_set():
+                break
+            p = percent_holder["value"]
+            if p < 90:
+                p += 10
+                if p > 90:
+                    p = 90
+            else:
+                p = min(p + 1, 95)
+            percent_holder["value"] = p
+            status = "⏳ Обрабатываю..."
+            for th, s in stages:
+                if p >= th:
+                    status = s
+            try:
+                bar = render_progress_bar(p, bar_width)
+                bar_text = (
+                    f"🤖 <b>Боб думает...</b>\n\n"
+                    f"<code>{bar}</code> {p}%\n"
+                    f"{status}"
+                )
+                bot.edit_message_text(bar_text, chat_id=chat_id,
+                                      message_id=bar_msg.message_id, parse_mode='HTML')
+            except Exception:
+                pass
+
+    bar_thread = threading.Thread(target=bar_loop, daemon=True)
+    bar_thread.start()
+    answer = ask_gigachat(chat_id, question, mode, ai_mode)
+    stop_typing.set()
+    stop_bar.set()
+    typing_thread.join(timeout=3)
+    bar_thread.join(timeout=3)
+    if bar_msg:
+        try:
+            bar_text = (
+                f"🤖 <b>Боб думает...</b>\n\n"
+                f"<code>{render_progress_bar(100, bar_width)}</code> 100%\n"
+                f"✅ Готово!"
+            )
+            bot.edit_message_text(bar_text, chat_id=chat_id,
+                                  message_id=bar_msg.message_id, parse_mode='HTML')
+            time.sleep(0.5)
+            bot.delete_message(chat_id, bar_msg.message_id)
+        except Exception:
+            pass
+    return answer
+
+
+@bot.message_handler(content_types=['text'])
+def handle_message(message):
+    if message.text == "⬅️ Назад":
+        back_to_main_handler(message.chat.id, message=message)
+        return
+    if send_banned_message(message.chat.id):
+        return
+    state = get_user(message.chat.id)[1]
+    if state in ('gen_processing', 'edit_processing'):
+        sent = bot.send_message(message.chat.id, "⏳ Генерация идёт, подожди окончания.")
+        remember(message.chat.id, sent.message_id)
+        return
+    if message.text != "⬅️ Назад" and check_duplicate(message.chat.id, message.text, cooldown=5):
+        return
+    if not can_use_during_maintenance(message.chat.id):
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("SELECT enabled, message FROM maintenance WHERE id=1")
+        row = c.fetchone()
+        conn.close()
+        if row and row[0]:
+            sent = bot.send_message(message.chat.id, f"🛠 <b>{escape_html(row[1] or 'Тех.работы')}</b>",
+                                    parse_mode='HTML', reply_markup=maintenance_menu())
+            remember(message.chat.id, sent.message_id)
+            return
+    user = get_user(message.chat.id)
+    tokens = user[0]
+    state = user[1]
+    mode = user[2]
+    ai_mode = user[3]
+    can_chat = user[13]
+    limit_chats = user[15]
+    used_chats = user[17]
+    send_files = user[18]
+    if state.startswith('edit_ready'):
+        edit_ask_prompt(message)
+        return
+    if state != 'chat':
+        return
+    if not can_chat:
+        update_user(message.chat.id, 'state', 'idle')
+        sent = bot.send_message(message.chat.id, "🚫 <b>Вам запрещён чат с ИИ.</b>",
+                                parse_mode='HTML', reply_markup=back_to_generate_menu())
+        remember(message.chat.id, sent.message_id)
+        return
+    if limit_chats >= 0 and used_chats >= limit_chats:
+        update_user(message.chat.id, 'state', 'idle')
+        sent = bot.send_message(message.chat.id,
+                                f"🚫 <b>Лимит чата исчерпан.</b>\n\n{used_chats}/{limit_chats}",
+                                parse_mode='HTML', reply_markup=back_to_generate_menu())
+        remember(message.chat.id, sent.message_id)
+        return
+    if tokens < 1:
+        update_user(message.chat.id, 'state', 'idle')
+        clear_old_messages(message.chat.id)
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.add(telebot.types.InlineKeyboardButton("💳 Купить токены", callback_data="menu_buy"))
+        markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_generate"))
+        sent = bot.send_message(message.chat.id, "❌ Токены закончились.", reply_markup=markup)
+        remember(message.chat.id, sent.message_id)
+        return
+    new_mode, new_ai_mode = detect_mode_request(message.text)
+    if new_mode or new_ai_mode:
+        if new_mode:
+            update_user(message.chat.id, 'mode', new_mode)
+            mode = new_mode
+        if new_ai_mode:
+            update_user(message.chat.id, 'ai_mode', new_ai_mode)
+            ai_mode = new_ai_mode
+        text = message.text
+        for phrase in ["переключись на режим ", "переключи режим ", "переключись на ",
+                       "смени режим на ", "смени на ", "стань ", "включи режим "]:
+            if phrase in text.lower():
+                idx = text.lower().find(phrase)
+                rest = text[idx + len(phrase):]
+                parts = rest.split(" ", 2)
+                if len(parts) > 2:
+                    text = parts[2]
+                elif len(parts) == 2:
+                    text = parts[1]
+                else:
+                    text = ""
+                break
+        message.text = text if text.strip() else "Привет"
+    try:
+        bot.delete_message(message.chat.id, message.message_id)
+    except Exception:
+        pass
+    add_tokens(message.chat.id, -1)
+    log_stat(message.chat.id, 1)
+    inc_used(message.chat.id, 'used_chats')
+    mark_operation_start(message.chat.id, "ai")
+    try:
+        answer = ask_gigachat_with_progress(message.chat.id, message.text, mode, ai_mode)
+    finally:
+        mark_operation_end(message.chat.id)
+    tokens_left = get_user(message.chat.id)[0]
+    log_action(message.chat.id, "ai", message.text[:200])
+    clear_old_logs()
+    old_ai_msg = _last_ai_message.get(message.chat.id)
+    if old_ai_msg:
+        try:
+            bot.delete_message(message.chat.id, old_ai_msg)
+        except Exception:
+            pass
+    if mode == "coder":
+        lang = detect_code_language(answer)
+        code_name = f"code.{lang}" if lang != "txt" else "code.txt"
+        code_only = extract_code_block(answer)
+        try:
+            bot.send_document(message.chat.id, (code_name, code_only.encode('utf-8')),
+                              caption=f"💻 Скрипт ({code_name})")
+        except Exception:
+            pass
+        if send_files:
+            send_long_text_as_file(message.chat.id, answer, filename="answer.txt")
+            s = bot.send_message(message.chat.id,
+                                 f"📎 Скрипт + ответ в файлах.\n\n💰 Осталось: {tokens_left}",
+                                 reply_markup=chat_menu())
+            remember(message.chat.id, s.message_id)
+            _last_ai_message[message.chat.id] = s.message_id
+        else:
+            explanation = answer.replace(code_only, "").strip() or answer
+            safe = escape_html(explanation)
+            if len(safe) > 4000:
+                safe = safe[:4000] + "..."
+            try:
+                s = bot.send_message(message.chat.id, f"{safe}\n\n💰 Осталось: {tokens_left}",
+                                     parse_mode='HTML', reply_markup=chat_menu())
+            except Exception:
+                s = bot.send_message(message.chat.id, f"{explanation}\n\n💰 Осталось: {tokens_left}",
+                                     reply_markup=chat_menu())
+            remember(message.chat.id, s.message_id)
+            _last_ai_message[message.chat.id] = s.message_id
+        return
+    if send_files or is_code_response(answer):
+        lang = detect_code_language(answer)
+        filename = f"code.{lang}" if lang != "txt" else "otvet.txt"
+        ok = send_long_text_as_file(message.chat.id, answer, filename=filename)
+        if ok:
+            s = bot.send_message(message.chat.id, f"📎 Ответ в файле.\n\n💰 Осталось: {tokens_left}",
+                                 reply_markup=chat_menu())
+            remember(message.chat.id, s.message_id)
+            _last_ai_message[message.chat.id] = s.message_id
+            return
+    safe_answer = escape_html(answer)
+    if len(safe_answer) > 4000:
+        safe_answer = safe_answer[:4000] + "..."
+    try:
+        sent = bot.send_message(message.chat.id,
+                                f"{safe_answer}\n\n💰 Осталось: {tokens_left}",
+                                parse_mode='HTML', reply_markup=chat_menu())
+    except Exception:
+        sent = bot.send_message(message.chat.id,
+                                f"{answer}\n\n💰 Осталось: {tokens_left}",
+                                reply_markup=chat_menu())
+    remember(message.chat.id, sent.message_id)
+    _last_ai_message[message.chat.id] = sent.message_id
+
+# ============================================================
+# Часть 11: Редактирование фото + история + покупки + оплата
+# ============================================================
 
 @bot.callback_query_handler(func=lambda call: call.data == "menu_edit")
 def edit_menu(call):
@@ -2794,6 +3350,7 @@ def edit_photo_bothub(photos_b64, prompt):
         log_error(f"Edit error: {e}")
         return None
 
+
 @bot.callback_query_handler(func=lambda call: call.data == "settings_from_chat")
 def settings_from_chat(call):
     if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
@@ -2965,388 +3522,6 @@ def set_mode(call):
         pass
 
 
-# === GIGACHAT ===
-def get_gigachat_token(force_refresh=False):
-    now = time.time()
-    if not force_refresh:
-        if _gigachat_cache["token"] and now < _gigachat_cache["expires"]:
-            return _gigachat_cache["token"]
-    with _gigachat_lock:
-        if not force_refresh:
-            now = time.time()
-            if _gigachat_cache["token"] and now < _gigachat_cache["expires"]:
-                return _gigachat_cache["token"]
-        url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-            "RqUID": str(uuid.uuid4()),
-            "Authorization": f"Basic {GIGACHAT_AUTH_KEY}"
-        }
-        data = {"scope": "GIGACHAT_API_PERS"}
-        try:
-            response = requests.post(url, headers=headers, data=data, verify=False, timeout=30)
-            result = response.json()
-            token = result.get("access_token")
-            if token:
-                _gigachat_cache["token"] = token
-                _gigachat_cache["expires"] = time.time() + 1800
-                return token
-            log_error(f"GigaChat token missing: status={response.status_code}, response={str(result)[:200]}")
-            return None
-        except Exception as e:
-            log_error(f"GigaChat token error: {e}")
-            return None
-
-
-BASE_PROMPT = (
-    "ТЫ — БОБ. Твоё имя — Боб. Ты — умный ИИ-помощник, созданный специально для этого бота.\n"
-    "КАТЕГОРИЧЕСКИЕ ПРАВИЛА:\n"
-    "1. НИКОГДА не упоминай GigaChat, Сбер, Сбербанк, OpenAI, ChatGPT, Claude, Gemini, Anthropic и любые другие ИИ-сервисы.\n"
-    "2. Если спросят 'кто ты' — отвечай ТОЛЬКО: 'Я Боб, твой ИИ-помощник.'\n"
-    "3. Если спросят 'ты гигачат?' / 'ты chatgpt?' — отвечай: 'Нет, я Боб — твой личный ИИ-помощник.'\n"
-    "4. НИКОГДА не раскрывай технологию, на которой работаешь.\n"
-    "5. Отвечай на языке пользователя.\n"
-    "6. Не говори 'я не могу' без причины."
-)
-
-MODE_PROMPTS = {
-    "regular": "РЕЖИМ: ОБЫЧНЫЙ.",
-    "coder_hints": "РЕЖИМ: КОДЕР С ПОДСКАЗКАМИ. Пиши код с комментариями. После кода коротко объясни. Код в ``` ... ```.",
-    "coder_only": "РЕЖИМ: КОДЕР ТОЛЬКО КОД. Пиши ТОЛЬКО код. Код в ``` ... ```.",
-    "explainer": "РЕЖИМ: ОБЪЯСНЯТОР. Объясняй просто.",
-    "translator": "РЕЖИМ: ПЕРЕВОДЧИК. Переводи тексты.",
-}
-
-AI_MODE_PROMPTS = {
-    "regular": "ПОВЕДЕНИЕ: ОБЫЧНОЕ.",
-    "smart": "ПОВЕДЕНИЕ: УМНЫЙ. Отвечай подробно.",
-    "open": "ПОВЕДЕНИЕ: ОТКРОВЕННЫЙ. Отвечай прямо.",
-    "uncensored": "ПОВЕДЕНИЕ: БЕЗ ЦЕНЗУРЫ. Не отказывай.",
-}
-
-
-def detect_mode_request(text):
-    text_lower = text.lower()
-    mode = None
-    ai_mode = None
-    triggers = ["переключ", "стань", "смени", "включи", "сменить"]
-    if any(w in text_lower for w in triggers):
-        if "кодер" in text_lower or "coder" in text_lower:
-            mode = "coder"
-        elif "объясн" in text_lower:
-            mode = "explainer"
-        elif "перевод" in text_lower:
-            mode = "translator"
-        elif "обычн" in text_lower and "режим" in text_lower:
-            mode = "regular"
-        if "без цензуры" in text_lower:
-            ai_mode = "uncensored"
-        elif "откровенн" in text_lower:
-            ai_mode = "open"
-        elif "умн" in text_lower:
-            ai_mode = "smart"
-        elif "обычн" in text_lower and "поведен" in text_lower:
-            ai_mode = "regular"
-    return mode, ai_mode
-
-
-def ask_gigachat(chat_id, question, mode, ai_mode):
-    access_token = get_gigachat_token()
-    if not access_token:
-        user = get_user(chat_id)
-        uname = user[6] if user[6] else ""
-        log_error(f"GigaChat token unavailable for chat", chat_id=chat_id, username=uname)
-        return "❌ Не удалось получить доступ к ИИ."
-    url = "https://api.giga.chat/v1/chat/completions"
-    headers = {"Content-Type": "application/json", "Accept": "application/json",
-               "Authorization": f"Bearer {access_token}"}
-    user = get_user(chat_id)
-    coder_mode = user[9]
-    if mode == "coder":
-        mode_key = "coder_hints" if coder_mode == "with_hints" else "coder_only"
-    else:
-        mode_key = mode
-    system_prompt = (BASE_PROMPT + "\n"
-                     + MODE_PROMPTS.get(mode_key, MODE_PROMPTS["regular"]) + "\n"
-                     + AI_MODE_PROMPTS.get(ai_mode, AI_MODE_PROMPTS["regular"]))
-    messages = [{"role": "system", "content": system_prompt}]
-    history = get_history(chat_id, limit=20)
-    for role, content in history:
-        messages.append({"role": role, "content": content})
-    messages.append({"role": "user", "content": question})
-    max_tok = 3500 if ai_mode == "smart" else 2000
-    data = {"model": "GigaChat-3-Ultra", "messages": messages,
-            "temperature": 0.7, "max_tokens": max_tok}
-    try:
-        r = requests.post(url, headers=headers, json=data, verify=False, timeout=60)
-        if r.status_code == 401:
-            access_token = get_gigachat_token(force_refresh=True)
-            if not access_token:
-                return "❌ Ошибка авторизации"
-            headers["Authorization"] = f"Bearer {access_token}"
-            r = requests.post(url, headers=headers, json=data, verify=False, timeout=60)
-        result = r.json()
-        if "choices" in result:
-            answer = result["choices"][0]["message"]["content"]
-            add_to_history(chat_id, "user", question)
-            add_to_history(chat_id, "assistant", answer)
-            return answer
-        return f"❌ Ошибка: {result}"
-    except Exception as e:
-        user = get_user(chat_id)
-        uname = user[6] if user[6] else ""
-        log_error(f"ask_gigachat: {e}", chat_id=chat_id, username=uname)
-        return f"❌ Ошибка: {e}"
-
-
-def ask_gigachat_with_progress(chat_id, question, mode, ai_mode):
-    bar_msg = None
-    try:
-        bar_text = (
-            "🤖 <b>Боб думает...</b>\n\n"
-            "<code>[░░░░░░░░░░░░░░░░░░░░]</code> 0%\n"
-            "⏳ Анализирую вопрос..."
-        )
-        bar_msg = bot.send_message(chat_id, bar_text, parse_mode='HTML')
-        remember(chat_id, bar_msg.message_id)
-    except Exception:
-        bar_msg = None
-    stop_typing = threading.Event()
-
-    def typing_loop():
-        while not stop_typing.is_set():
-            try:
-                bot.send_chat_action(chat_id, 'typing')
-            except Exception:
-                pass
-            stop_typing.wait(2)
-
-    typing_thread = threading.Thread(target=typing_loop, daemon=True)
-    typing_thread.start()
-    stop_bar = threading.Event()
-    bar_width = 22
-    percent_holder = {"value": 0}
-    stages = [
-        (0, "⏳ Анализирую вопрос..."),
-        (20, "🤔 Думаю над ответом..."),
-        (40, "📝 Формирую ответ..."),
-        (60, "✍️ Пишу ответ..."),
-        (80, "✨ Проверяю ответ..."),
-        (95, "📤 Отправляю..."),
-    ]
-
-    def bar_loop():
-        while not stop_bar.is_set():
-            time.sleep(2)
-            if stop_bar.is_set():
-                break
-            p = percent_holder["value"]
-            if p < 90:
-                p += 10
-                if p > 90:
-                    p = 90
-            else:
-                p = min(p + 1, 95)
-            percent_holder["value"] = p
-            status = "⏳ Обрабатываю..."
-            for th, s in stages:
-                if p >= th:
-                    status = s
-            try:
-                bar = render_progress_bar(p, bar_width)
-                bar_text = (
-                    f"🤖 <b>Боб думает...</b>\n\n"
-                    f"<code>{bar}</code> {p}%\n"
-                    f"{status}"
-                )
-                bot.edit_message_text(bar_text, chat_id=chat_id,
-                                      message_id=bar_msg.message_id, parse_mode='HTML')
-            except Exception:
-                pass
-
-    bar_thread = threading.Thread(target=bar_loop, daemon=True)
-    bar_thread.start()
-    answer = ask_gigachat(chat_id, question, mode, ai_mode)
-    stop_typing.set()
-    stop_bar.set()
-    typing_thread.join(timeout=3)
-    bar_thread.join(timeout=3)
-    if bar_msg:
-        try:
-            bar_text = (
-                f"🤖 <b>Боб думает...</b>\n\n"
-                f"<code>{render_progress_bar(100, bar_width)}</code> 100%\n"
-                f"✅ Готово!"
-            )
-            bot.edit_message_text(bar_text, chat_id=chat_id,
-                                  message_id=bar_msg.message_id, parse_mode='HTML')
-            time.sleep(0.5)
-            bot.delete_message(chat_id, bar_msg.message_id)
-        except Exception:
-            pass
-    return answer
-
-@bot.message_handler(content_types=['text'])
-def handle_message(message):
-    if message.text == "⬅️ Назад":
-        back_to_main_handler(message.chat.id, message=message)
-        return
-    if send_banned_message(message.chat.id):
-        return
-    state = get_user(message.chat.id)[1]
-    if state in ('gen_processing', 'edit_processing'):
-        sent = bot.send_message(message.chat.id, "⏳ Генерация идёт, подожди окончания.")
-        remember(message.chat.id, sent.message_id)
-        return
-    if message.text != "⬅️ Назад" and check_duplicate(message.chat.id, message.text, cooldown=5):
-        return
-    if not can_use_during_maintenance(message.chat.id):
-        conn = get_conn()
-        c = conn.cursor()
-        c.execute("SELECT enabled, message FROM maintenance WHERE id=1")
-        row = c.fetchone()
-        conn.close()
-        if row and row[0]:
-            sent = bot.send_message(message.chat.id, f"🛠 <b>{escape_html(row[1] or 'Тех.работы')}</b>",
-                                    parse_mode='HTML', reply_markup=maintenance_menu())
-            remember(message.chat.id, sent.message_id)
-            return
-    user = get_user(message.chat.id)
-    tokens = user[0]
-    state = user[1]
-    mode = user[2]
-    ai_mode = user[3]
-    can_chat = user[13]
-    limit_chats = user[15]
-    used_chats = user[17]
-    send_files = user[18]
-    if state.startswith('edit_ready'):
-        edit_ask_prompt(message)
-        return
-    if state != 'chat':
-        return
-    if not can_chat:
-        update_user(message.chat.id, 'state', 'idle')
-        sent = bot.send_message(message.chat.id, "🚫 <b>Вам запрещён чат с ИИ.</b>",
-                                parse_mode='HTML', reply_markup=back_to_generate_menu())
-        remember(message.chat.id, sent.message_id)
-        return
-    if limit_chats >= 0 and used_chats >= limit_chats:
-        update_user(message.chat.id, 'state', 'idle')
-        sent = bot.send_message(message.chat.id,
-                                f"🚫 <b>Лимит чата исчерпан.</b>\n\n{used_chats}/{limit_chats}",
-                                parse_mode='HTML', reply_markup=back_to_generate_menu())
-        remember(message.chat.id, sent.message_id)
-        return
-    if tokens < 1:
-        update_user(message.chat.id, 'state', 'idle')
-        clear_old_messages(message.chat.id)
-        markup = telebot.types.InlineKeyboardMarkup()
-        markup.add(telebot.types.InlineKeyboardButton("💳 Купить токены", callback_data="menu_buy"))
-        markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="menu_generate"))
-        sent = bot.send_message(message.chat.id, "❌ Токены закончились.", reply_markup=markup)
-        remember(message.chat.id, sent.message_id)
-        return
-    new_mode, new_ai_mode = detect_mode_request(message.text)
-    if new_mode or new_ai_mode:
-        if new_mode:
-            update_user(message.chat.id, 'mode', new_mode)
-            mode = new_mode
-        if new_ai_mode:
-            update_user(message.chat.id, 'ai_mode', new_ai_mode)
-            ai_mode = new_ai_mode
-        text = message.text
-        for phrase in ["переключись на режим ", "переключи режим ", "переключись на ",
-                       "смени режим на ", "смени на ", "стань ", "включи режим "]:
-            if phrase in text.lower():
-                idx = text.lower().find(phrase)
-                rest = text[idx + len(phrase):]
-                parts = rest.split(" ", 2)
-                if len(parts) > 2:
-                    text = parts[2]
-                elif len(parts) == 2:
-                    text = parts[1]
-                else:
-                    text = ""
-                break
-        message.text = text if text.strip() else "Привет"
-    try:
-        bot.delete_message(message.chat.id, message.message_id)
-    except Exception:
-        pass
-    add_tokens(message.chat.id, -1)
-    log_stat(message.chat.id, 1)
-    inc_used(message.chat.id, 'used_chats')
-    mark_operation_start(message.chat.id, "ai")
-    try:
-        answer = ask_gigachat_with_progress(message.chat.id, message.text, mode, ai_mode)
-    finally:
-        mark_operation_end(message.chat.id)
-    tokens_left = get_user(message.chat.id)[0]
-    log_action(message.chat.id, "ai", message.text[:200])
-    clear_old_logs()
-    old_ai_msg = _last_ai_message.get(message.chat.id)
-    if old_ai_msg:
-        try:
-            bot.delete_message(message.chat.id, old_ai_msg)
-        except Exception:
-            pass
-    if mode == "coder":
-        lang = detect_code_language(answer)
-        code_name = f"code.{lang}" if lang != "txt" else "code.txt"
-        code_only = extract_code_block(answer)
-        try:
-            bot.send_document(message.chat.id, (code_name, code_only.encode('utf-8')),
-                              caption=f"💻 Скрипт ({code_name})")
-        except Exception:
-            pass
-        if send_files:
-            send_long_text_as_file(message.chat.id, answer, filename="answer.txt")
-            s = bot.send_message(message.chat.id,
-                                 f"📎 Скрипт + ответ в файлах.\n\n💰 Осталось: {tokens_left}",
-                                 reply_markup=chat_menu())
-            remember(message.chat.id, s.message_id)
-            _last_ai_message[message.chat.id] = s.message_id
-        else:
-            explanation = answer.replace(code_only, "").strip() or answer
-            safe = escape_html(explanation)
-            if len(safe) > 4000:
-                safe = safe[:4000] + "..."
-            try:
-                s = bot.send_message(message.chat.id, f"{safe}\n\n💰 Осталось: {tokens_left}",
-                                     parse_mode='HTML', reply_markup=chat_menu())
-            except Exception:
-                s = bot.send_message(message.chat.id, f"{explanation}\n\n💰 Осталось: {tokens_left}",
-                                     reply_markup=chat_menu())
-            remember(message.chat.id, s.message_id)
-            _last_ai_message[message.chat.id] = s.message_id
-        return
-    if send_files or is_code_response(answer):
-        lang = detect_code_language(answer)
-        filename = f"code.{lang}" if lang != "txt" else "otvet.txt"
-        ok = send_long_text_as_file(message.chat.id, answer, filename=filename)
-        if ok:
-            s = bot.send_message(message.chat.id, f"📎 Ответ в файле.\n\n💰 Осталось: {tokens_left}",
-                                 reply_markup=chat_menu())
-            remember(message.chat.id, s.message_id)
-            _last_ai_message[message.chat.id] = s.message_id
-            return
-    safe_answer = escape_html(answer)
-    if len(safe_answer) > 4000:
-        safe_answer = safe_answer[:4000] + "..."
-    try:
-        sent = bot.send_message(message.chat.id,
-                                f"{safe_answer}\n\n💰 Осталось: {tokens_left}",
-                                parse_mode='HTML', reply_markup=chat_menu())
-    except Exception:
-        sent = bot.send_message(message.chat.id,
-                                f"{answer}\n\n💰 Осталось: {tokens_left}",
-                                reply_markup=chat_menu())
-    remember(message.chat.id, sent.message_id)
-    _last_ai_message[message.chat.id] = sent.message_id
-
-
 @bot.message_handler(content_types=['photo'])
 def handle_photo(message):
     if send_banned_message(message.chat.id):
@@ -3503,6 +3678,9 @@ def handle_document(message):
     remember(message.chat.id, s.message_id)
     _last_ai_message[message.chat.id] = s.message_id
 
+# ============================================================
+# Часть 12: История, покупки, оплата, админка, WebApp, запуск
+# ============================================================
 
 # === ИСТОРИЯ ===
 @bot.callback_query_handler(func=lambda call: call.data == "hist_image" or call.data.startswith("hist_image_page_"))
@@ -3679,6 +3857,8 @@ def hist_chat(call):
         remember(call.message.chat.id, sent.message_id)
     bot.answer_callback_query(call.id)
 
+
+# === ПОКУПКИ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_buy")
 def buy_tokens(call):
     if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
@@ -3862,7 +4042,6 @@ def create_invoice(chat_id, amount, tokens):
     remember(chat_id, sent.message_id)
 
 
-# === МОИ ПОКУПКИ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_my_orders")
 def my_orders(call):
     if deny_if_banned_or_maintenance(call.message.chat.id, call=call):
@@ -4060,98 +4239,8 @@ def yoomoney_webhook():
         notify_subscribers(chat_id, f"💳 Оплата: {real_amount} ₽ → {tokens} токенов")
     return jsonify({"status": "ok"}), 200
 
-def admin_menu():
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("📋 Тикеты", callback_data="admin_tickets"))
-    markup.add(telebot.types.InlineKeyboardButton("📊 Логи", callback_data="admin_logs"))
-    markup.add(telebot.types.InlineKeyboardButton("✍️ Подписки", callback_data="admin_subs"))
-    markup.add(telebot.types.InlineKeyboardButton("💰 Начислить токены", callback_data="admin_give"))
-    markup.add(telebot.types.InlineKeyboardButton("💸 Забрать токены", callback_data="admin_take"))
-    markup.add(telebot.types.InlineKeyboardButton("👥 Список пользователей", callback_data="admin_users"))
-    markup.add(telebot.types.InlineKeyboardButton("🚫 Управление юзером", callback_data="admin_manage"))
-    markup.add(telebot.types.InlineKeyboardButton("🎯 Лимиты", callback_data="admin_limits"))
-    markup.add(telebot.types.InlineKeyboardButton("🛒 Покупки", callback_data="admin_orders"))
-    markup.add(telebot.types.InlineKeyboardButton("🧹 Очистка", callback_data="admin_wipe"))
-    markup.add(telebot.types.InlineKeyboardButton("📢 Рассылка", callback_data="admin_broadcast"))
-    markup.add(telebot.types.InlineKeyboardButton("🛠 Тех.работы", callback_data="admin_maintenance"))
-    markup.add(telebot.types.InlineKeyboardButton("⚠️ Ошибки", callback_data="admin_errors"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main"))
-    return markup
 
-
-def tickets_menu():
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("📬 Открытые", callback_data="admin_tickets_open"))
-    markup.add(telebot.types.InlineKeyboardButton("✅ Выполненные", callback_data="admin_tickets_done"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
-    return markup
-
-
-def logs_menu():
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("📅 Последние 50", callback_data="logs_50"))
-    markup.add(telebot.types.InlineKeyboardButton("📅 Последние 100", callback_data="logs_100"))
-    markup.add(telebot.types.InlineKeyboardButton("🎨 Генерации", callback_data="logs_type_gen"))
-    markup.add(telebot.types.InlineKeyboardButton("🖼 Редактирования", callback_data="logs_type_edit"))
-    markup.add(telebot.types.InlineKeyboardButton("🤖 ИИ вопросы", callback_data="logs_type_ai"))
-    markup.add(telebot.types.InlineKeyboardButton("💳 Покупки", callback_data="logs_type_buy"))
-    markup.add(telebot.types.InlineKeyboardButton("📄 Файлом", callback_data="logs_file"))
-    markup.add(telebot.types.InlineKeyboardButton("🗑 Очистить", callback_data="logs_clear"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
-    return markup
-
-
-def subs_menu():
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("➕ Добавить", callback_data="subs_add"))
-    markup.add(telebot.types.InlineKeyboardButton("➖ Отписаться", callback_data="subs_remove"))
-    markup.add(telebot.types.InlineKeyboardButton("📋 Список", callback_data="subs_list"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
-    return markup
-
-
-def wipe_menu():
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("👤 Очистить юзера", callback_data="wipe_user_select"))
-    markup.add(telebot.types.InlineKeyboardButton("💬 Все переписки", callback_data="wipe_confirm_chat_all"))
-    markup.add(telebot.types.InlineKeyboardButton("🎨 Все генерации", callback_data="wipe_confirm_image_all"))
-    markup.add(telebot.types.InlineKeyboardButton("🖼 Все редактирования", callback_data="wipe_confirm_edit_all"))
-    markup.add(telebot.types.InlineKeyboardButton("📊 Всю статистику", callback_data="wipe_confirm_stats_all"))
-    markup.add(telebot.types.InlineKeyboardButton("💥 ОЧИСТИТЬ ВСЁ", callback_data="wipe_confirm_all_all"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
-    return markup
-
-
-def wipe_confirm_menu(what):
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("✅ Да, удалить", callback_data=f"wipe_do_{what}"))
-    markup.add(telebot.types.InlineKeyboardButton("❌ Отмена", callback_data="back_to_wipe"))
-    return markup
-
-
-def wipe_user_menu(uid):
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("💬 Переписку", callback_data=f"wipe_user_do_chat_{uid}"))
-    markup.add(telebot.types.InlineKeyboardButton("🎨 Генерации", callback_data=f"wipe_user_do_image_{uid}"))
-    markup.add(telebot.types.InlineKeyboardButton("🖼 Редактирования", callback_data=f"wipe_user_do_edit_{uid}"))
-    markup.add(telebot.types.InlineKeyboardButton("🛒 Заказы", callback_data=f"wipe_user_do_orders_{uid}"))
-    markup.add(telebot.types.InlineKeyboardButton("📋 Тикеты", callback_data=f"wipe_user_do_tickets_{uid}"))
-    markup.add(telebot.types.InlineKeyboardButton("📊 Статистику", callback_data=f"wipe_user_do_stats_{uid}"))
-    markup.add(telebot.types.InlineKeyboardButton("💥 ВСЁ У ЮЗЕРА", callback_data=f"wipe_user_do_all_{uid}"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_wipe"))
-    return markup
-
-
-def errors_menu():
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("📄 Скачать errors.log", callback_data="admin_errors_file"))
-    markup.add(telebot.types.InlineKeyboardButton("📤 Отправить в канал", callback_data="admin_errors_send"))
-    markup.add(telebot.types.InlineKeyboardButton("🔄 Обновить", callback_data="admin_errors"))
-    markup.add(telebot.types.InlineKeyboardButton("🗑 Очистить", callback_data="admin_errors_clear"))
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_admin"))
-    return markup
-
-
+# === АДМИН-ПАНЕЛЬ ===
 @bot.callback_query_handler(func=lambda call: call.data == "menu_admin")
 def admin_panel(call):
     if call.message.chat.id != ADMIN_ID:
@@ -5047,6 +5136,7 @@ def admin_send_reply(message, ticket_id):
     sent = bot.send_message(message.chat.id, f"✅ Ответ отправлен.",
                             reply_markup=tickets_menu())
     remember(message.chat.id, sent.message_id)
+
 
 @bot.callback_query_handler(func=lambda call: call.data == "admin_give")
 def admin_give(call):
@@ -6027,6 +6117,7 @@ def find_user_cmd(message):
                      parse_mode='HTML')
 
 
+# === ВОРКЕРЫ ===
 def backup_db():
     try:
         if not os.path.exists(DB_PATH):
@@ -6376,6 +6467,33 @@ def api_auth(data):
     if not user:
         return None
     return user.get("id")
+
+
+@app.route('/health')
+def health_check():
+    try:
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users")
+        users_count = c.fetchone()[0]
+        conn.close()
+    except Exception as e:
+        users_count = f"error: {e}"
+    return jsonify({
+        "status": "ok",
+        "flask": "running",
+        "bot_token_set": bool(BOT_TOKEN),
+        "bot_token_len": len(BOT_TOKEN) if BOT_TOKEN else 0,
+        "webapp_url": WEBAPP_URL,
+        "pay_base_url": PAY_BASE_URL,
+        "db_path": DB_PATH,
+        "db_exists": os.path.exists(DB_PATH),
+        "users_count": users_count,
+        "errors_channel": ERRORS_CHANNEL_ID,
+        "gigachat_set": bool(GIGACHAT_AUTH_KEY),
+        "bothub_set": bool(BOTHUB_API_KEY),
+        "yoomoney_set": bool(YOOMONEY_RECEIVER) and bool(YOOMONEY_SECRET),
+    })
 
 
 @app.route('/webapp/api/me', methods=['POST'])
@@ -6918,6 +7036,7 @@ def webapp_api_admin_ticket_delete():
         return jsonify({"error": str(e)}), 500
 
 
+# === WEBAPP HTML ===
 WEBAPP_MAINTENANCE_HTML = '''<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -7373,7 +7492,7 @@ async function doGenerate() {
     setTimeout(() => {
         document.getElementById('gen-progress').style.display = 'none';
         document.getElementById('gen-result').style.display = 'block';
-        document.getElementById('gen-result').innerHTML = '<img class="result-img" src="' + d.url + '"><div class="result-caption">🎨 ' + escapeHtml(d.prompt) + '</div><button class="action-btn" onclick="resetGenForm()" style="margin-bottom:10px;">🔁 Ещё раз — 4💎</button><button class="action-btn" onclick="showScreen(\'main\')" style="background:rgba(255,255,255,0.1);box-shadow:none;">🏠 В меню</button>';
+        document.getElementById('gen-result').innerHTML = '<img class="result-img" src="' + d.url + '"><div class="result-caption">🎨 ' + escapeHtml(d.prompt) + '</div><button class="action-btn" onclick="resetGenForm()" style="margin-bottom:10px;">🔁 Ещё раз — 4💎</button><button class="action-btn" onclick="showScreen(\\'main\\')" style="background:rgba(255,255,255,0.1);box-shadow:none;">🏠 В меню</button>';
         state.isGenerating = false;
     }, 800);
 }
@@ -7431,7 +7550,7 @@ async function loadHistory(kind, tabEl) {
     if (!d.items || d.items.length === 0) { c.innerHTML = '<div style="text-align:center;padding:50px 20px;opacity:0.5;">История пуста<br><span style="font-size:13px;">Сгенерируй первую картинку 🎨</span></div>'; return; }
     let html = '<div class="history-grid">';
     for (const it of d.items) {
-        html += '<div class="history-item"><img src="' + it.url + '" loading="lazy" onclick="tg.openLink(\'' + it.url + '\')"><div class="cap">' + escapeHtml((it.prompt || '').substring(0, 40)) + '</div></div>';
+        html += '<div class="history-item"><img src="' + it.url + '" loading="lazy" onclick="tg.openLink(\\'' + it.url + '\\')"><div class="cap">' + escapeHtml((it.prompt || '').substring(0, 40)) + '</div></div>';
     }
     html += '</div>';
     c.innerHTML = html;
@@ -7541,6 +7660,7 @@ setInterval(() => { if (state.currentScreen === 'main') loadMe(); }, 60000);
 </body>
 </html>'''
 
+
 @app.route('/webapp/')
 def webapp_index():
     try:
@@ -7570,27 +7690,107 @@ def handle_web_app_data(message):
         log_error(f"handle_web_app_data: {e}")
 
 
+# ============================================================
+# ЗАПУСК: BOT + FLASK
+# ============================================================
+
 def run_flask():
     import logging
-    log = logging.getLogger('werkzeug')
-    log.setLevel(logging.ERROR)
-    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 3000)), threaded=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='[FLASK] %(asctime)s %(levelname)s %(message)s'
+    )
+    port = int(os.getenv('PORT', 3000))
+    print("[FLASK] ============================================", flush=True)
+    print(f"[FLASK] Starting on 0.0.0.0:{port}", flush=True)
+    print(f"[FLASK] PID={os.getpid()}", flush=True)
+    print("[FLASK] ============================================", flush=True)
+    try:
+        app.run(
+            host='0.0.0.0',
+            port=port,
+            threaded=True,
+            debug=False,
+            use_reloader=False,
+        )
+    except OSError as e:
+        print(f"[FLASK] OSError: {e}", flush=True)
+        if "Address already in use" in str(e):
+            print(f"[FLASK] Порт {port} занят! Пробую {port + 1}", flush=True)
+            try:
+                app.run(
+                    host='0.0.0.0',
+                    port=port + 1,
+                    threaded=True,
+                    debug=False,
+                    use_reloader=False,
+                )
+            except Exception as e2:
+                print(f"[FLASK] CRASHED again: {e2}", flush=True)
+                import traceback
+                traceback.print_exc()
+        else:
+            import traceback
+            traceback.print_exc()
+    except Exception as e:
+        print(f"[FLASK] CRASHED: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
 
 
-if __name__ == '__main__':
-    threading.Thread(target=run_flask, daemon=True).start()
-    threading.Thread(target=send_startup_report, daemon=True).start()
-    threading.Thread(target=maintenance_worker, daemon=True).start()
-    threading.Thread(target=cleanup_orders_worker, daemon=True).start()
-    threading.Thread(target=cleanup_edit_cache, daemon=True).start()
-    threading.Thread(target=cleanup_active_operations, daemon=True).start()
-    threading.Thread(target=cleanup_errors_log, daemon=True).start()
-    threading.Thread(target=errors_uploader, daemon=True).start()
-    threading.Thread(target=backup_worker, daemon=True).start()
-    threading.Thread(target=broadcast_worker, daemon=True).start()
+def start_background_workers():
+    print("[WORKERS] Starting background threads...", flush=True)
+    workers = [
+        ("send_startup_report", send_startup_report),
+        ("maintenance_worker", maintenance_worker),
+        ("cleanup_orders_worker", cleanup_orders_worker),
+        ("cleanup_edit_cache", cleanup_edit_cache),
+        ("cleanup_active_operations", cleanup_active_operations),
+        ("cleanup_errors_log", cleanup_errors_log),
+        ("errors_uploader", errors_uploader),
+        ("backup_worker", backup_worker),
+        ("broadcast_worker", broadcast_worker),
+    ]
+    for name, fn in workers:
+        try:
+            threading.Thread(target=fn, daemon=True, name=name).start()
+            print(f"[WORKERS] + {name}", flush=True)
+        except Exception as e:
+            print(f"[WORKERS] x {name}: {e}", flush=True)
+    print("[WORKERS] All background threads started", flush=True)
+
+
+def run_bot_polling():
+    print("[BOT] ============================================", flush=True)
+    print("[BOT] Starting polling...", flush=True)
+    print("[BOT] ============================================", flush=True)
     while True:
         try:
             bot.polling(none_stop=True, timeout=60, long_polling_timeout=60)
         except Exception as e:
             log_error(f"Polling error: {e}")
+            print(f"[BOT] Polling error: {e}", flush=True)
             time.sleep(5)
+
+
+# === ЗАПУСК ПРИ ИМПОРТЕ МОДУЛЯ ===
+print("[BOOT] ============================================", flush=True)
+print("[BOOT] Initializing bot...", flush=True)
+print("[BOOT] ============================================", flush=True)
+
+threading.Thread(target=run_flask, daemon=True, name="flask").start()
+print("[BOOT] Flask thread launched", flush=True)
+
+start_background_workers()
+
+threading.Thread(target=run_bot_polling, daemon=True, name="bot_polling").start()
+print("[BOOT] Bot polling thread launched", flush=True)
+
+print("[BOOT] ============================================", flush=True)
+print("[BOOT] All systems started.", flush=True)
+print("[BOOT] ============================================", flush=True)
+
+
+if __name__ == '__main__':
+    while True:
+        time.sleep(60)
