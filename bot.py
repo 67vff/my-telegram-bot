@@ -1,5 +1,6 @@
 # ============================================================
-# БОБ AI — Telegram Bot (только WebApp + админка)
+# БОБ AI — Telegram Bot + WebApp
+# Часть 1: Всё ядро (импорты, БД, утилиты, GigaChat, генерация, админка)
 # ============================================================
 
 import os
@@ -54,7 +55,6 @@ BACKUP_KEEP = 24
 WEBAPP_URL = "https://bot-1790959533-7739-maks746395.bothost.tech/webapp/"
 PAY_BASE_URL = "https://bot-1790959533-7739-maks746395.bothost.tech"
 
-# Максимум символов для прямого ответа в WebApp (если больше — шлём файлом)
 MAX_TEXT_RESPONSE = 3500
 
 # ============================================================
@@ -292,7 +292,7 @@ def init_db():
     )''')
     conn.commit()
 
-    # Миграции
+    # Миграции users
     for col, definition in [
         ("mode", "TEXT DEFAULT 'regular'"),
         ("ai_mode", "TEXT DEFAULT 'regular'"),
@@ -322,6 +322,7 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
+    # Миграции orders
     for col, definition in [
         ("created", "INTEGER DEFAULT 0"),
         ("paid", "INTEGER DEFAULT 0"),
@@ -334,6 +335,7 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
+    # Миграции image_history
     for col, definition in [
         ("timestamp", "INTEGER DEFAULT 0"),
         ("kind", "TEXT DEFAULT 'gen'"),
@@ -344,6 +346,7 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
+    # Миграции maintenance
     for col, definition in [
         ("message", "TEXT DEFAULT 'Технические работы'"),
         ("enabled", "INTEGER DEFAULT 0"),
@@ -355,6 +358,7 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
+    # Миграции bans
     for col, definition in [
         ("reason", "TEXT DEFAULT ''"),
         ("admin_id", "INTEGER DEFAULT 0"),
@@ -366,6 +370,7 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
+    # Миграции history
     for col, definition in [
         ("user_chat_id", "INTEGER DEFAULT 0"),
     ]:
@@ -803,15 +808,6 @@ def save_maintenance_notified(chat_id, message_id):
     conn.close()
 
 
-def get_maintenance_notified():
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT chat_id, message_id FROM maintenance_notified")
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-
 def clear_maintenance_notified():
     conn = get_conn()
     c = conn.cursor()
@@ -1076,7 +1072,7 @@ def get_user_tickets(chat_id):
 
 
 # ============================================================
-# АДМИНКА — кнопки и команды
+# АДМИН-МЕНЮ
 # ============================================================
 
 def admin_menu():
@@ -1096,19 +1092,6 @@ def admin_menu():
 def back_to_admin_menu():
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="adm_back"))
-    return markup
-
-
-def pagination_menu(prefix, page, total_pages, back_to="adm_back"):
-    markup = telebot.types.InlineKeyboardMarkup()
-    buttons = []
-    if page > 1:
-        buttons.append(telebot.types.InlineKeyboardButton("⬅️", callback_data=f"{prefix}_p{page - 1}"))
-    buttons.append(telebot.types.InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
-    if page < total_pages:
-        buttons.append(telebot.types.InlineKeyboardButton("➡️", callback_data=f"{prefix}_p{page + 1}"))
-    markup.row(*buttons)
-    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data=back_to))
     return markup
 
 
@@ -1134,31 +1117,21 @@ def start(message):
     banned, reason = check_banned(message.chat.id)
     if banned:
         markup = telebot.types.InlineKeyboardMarkup()
-        markup.add(telebot.types.InlineKeyboardButton(
-            "📱 Поддержка",
-            url=f"https://t.me/Bbelasobot"
-        ))
+        markup.add(telebot.types.InlineKeyboardButton("📱 Поддержка", url="https://t.me/Bbelasobot"))
         sent = bot.send_message(
             message.chat.id,
-            f"🚫 <b>Вы забанены</b>\n\n"
-            f"Причина: {escape_html(reason) if reason else 'не указана'}",
+            f"🚫 <b>Вы забанены</b>\n\nПричина: {escape_html(reason) if reason else 'не указана'}",
             parse_mode='HTML', reply_markup=markup)
         return
 
     tokens = user[0]
-    mode = user[2]
-    ai_mode = user[3]
-
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton(
         "🚀 ОТКРЫТЬ ПРИЛОЖЕНИЕ",
         web_app=telebot.types.WebAppInfo(url=WEBAPP_URL)
     ))
     if message.chat.id == ADMIN_ID:
-        markup.add(telebot.types.InlineKeyboardButton(
-            "👑 Админ-панель",
-            callback_data="adm_panel"
-        ))
+        markup.add(telebot.types.InlineKeyboardButton("👑 Админ-панель", callback_data="adm_panel"))
 
     text = (
         "╔══════════════════════════╗\n"
@@ -1236,8 +1209,7 @@ def adm_panel(call):
         return
     try:
         bot.edit_message_text(
-            "👑 <b>АДМИН-ПАНЕЛЬ</b>\n\n"
-            "Выбери раздел 👇",
+            "👑 <b>АДМИН-ПАНЕЛЬ</b>\n\nВыбери раздел 👇",
             chat_id=call.message.chat.id, message_id=call.message.message_id,
             parse_mode='HTML', reply_markup=admin_menu())
     except Exception:
@@ -1252,8 +1224,7 @@ def adm_back(call):
         return
     try:
         bot.edit_message_text(
-            "👑 <b>АДМИН-ПАНЕЛЬ</b>\n\n"
-            "Выбери раздел 👇",
+            "👑 <b>АДМИН-ПАНЕЛЬ</b>\n\nВыбери раздел 👇",
             chat_id=call.message.chat.id, message_id=call.message.message_id,
             parse_mode='HTML', reply_markup=admin_menu())
     except Exception:
@@ -1446,11 +1417,6 @@ def adm_lim(call):
     uid = int(call.data.replace("adm_lim_", ""))
     text = (
         f"🎯 <b>Лимиты</b> <code>{uid}</code>\n\n"
-        f"1️⃣ Лимит картинок\n"
-        f"2️⃣ Лимит правок\n"
-        f"3️⃣ Лимит чата\n"
-        f"4️⃣ Сбросить использованные\n"
-        f"5️⃣ Снять все лимиты\n\n"
         f"Отправь команду вида:\n"
         f"<code>/lim {uid} images 10</code>\n"
         f"<code>/lim {uid} edits 10</code>\n"
@@ -1786,7 +1752,7 @@ def adm_tdel(call):
 
 # --- ЛОГИ ---
 
-@bot.callback_query_handler(func=lambda call: call.data == "adm_logs" or call.data.startswith("adm_logs_p"))
+@bot.callback_query_handler(func=lambda call: call.data == "adm_logs")
 def adm_logs(call):
     if call.message.chat.id != ADMIN_ID:
         return
@@ -2152,6 +2118,8 @@ def adm_err_clear(call):
     bot.answer_callback_query(call.id, "🗑 Очищено")
 
 
+print("[PART 1] Loaded successfully", flush=True)
+
 # ============================================================
 # ОПЛАТА (FLASK)
 # ============================================================
@@ -2213,7 +2181,7 @@ def yoomoney_webhook():
 
 
 # ============================================================
-# FLASK API ДЛЯ WEBAPP
+# API AUTH
 # ============================================================
 
 def verify_init_data(init_data):
@@ -2245,6 +2213,10 @@ def api_auth(data):
     return user.get("id")
 
 
+# ============================================================
+# HEALTH
+# ============================================================
+
 @app.route('/health')
 def health_check():
     try:
@@ -2257,6 +2229,10 @@ def health_check():
         users_count = f"error: {e}"
     return jsonify({"status": "ok", "users_count": users_count})
 
+
+# ============================================================
+# ME
+# ============================================================
 
 @app.route('/webapp/api/me', methods=['POST'])
 def api_me():
@@ -2282,6 +2258,10 @@ def api_me():
         log_error(f"api_me: {e}")
         return jsonify({"error": str(e)}), 500
 
+
+# ============================================================
+# GENERATE
+# ============================================================
 
 @app.route('/webapp/api/generate', methods=['POST'])
 def api_generate():
@@ -2314,6 +2294,10 @@ def api_generate():
         log_error(f"api_generate: {e}")
         return jsonify({"error": str(e)}), 500
 
+
+# ============================================================
+# EDIT PHOTO
+# ============================================================
 
 @app.route('/webapp/api/edit', methods=['POST'])
 def api_edit():
@@ -2369,6 +2353,10 @@ def api_edit():
         return jsonify({"error": str(e)}), 500
 
 
+# ============================================================
+# CHAT (AI)
+# ============================================================
+
 @app.route('/webapp/api/chat', methods=['POST'])
 def api_chat():
     try:
@@ -2403,10 +2391,8 @@ def api_chat():
             filename = None
             display = answer
 
-            # Если в режиме "Кодер" или ответ содержит код — всегда файлом
-            coder_mode = user[2] == "coder" or user[8]
-            is_coder = (user[2] == "coder")
-            if is_coder:
+            # Режим "Кодер" — ответ всегда файлом
+            if user[2] == "coder":
                 lang = detect_code_language(answer)
                 code = extract_code_block(answer)
                 file_content = code
@@ -2434,6 +2420,10 @@ def api_chat():
         log_error(f"api_chat: {e}")
         return jsonify({"error": str(e)}), 500
 
+
+# ============================================================
+# CHATS
+# ============================================================
 
 @app.route('/webapp/api/chats/list', methods=['POST'])
 def api_chats_list():
@@ -2520,6 +2510,10 @@ def api_chats_messages():
         return jsonify({"error": str(e)}), 500
 
 
+# ============================================================
+# HISTORY
+# ============================================================
+
 @app.route('/webapp/api/history/image', methods=['POST'])
 def api_history_image():
     try:
@@ -2535,6 +2529,10 @@ def api_history_image():
         log_error(f"api_history_image: {e}")
         return jsonify({"error": str(e)}), 500
 
+
+# ============================================================
+# PAY
+# ============================================================
 
 @app.route('/webapp/api/pay', methods=['POST'])
 def api_pay():
@@ -2555,6 +2553,10 @@ def api_pay():
         log_error(f"api_pay: {e}")
         return jsonify({"error": str(e)}), 500
 
+
+# ============================================================
+# SETTINGS
+# ============================================================
 
 @app.route('/webapp/api/settings', methods=['POST'])
 def api_settings():
@@ -2587,6 +2589,10 @@ def api_settings():
         log_error(f"api_settings: {e}")
         return jsonify({"error": str(e)}), 500
 
+
+# ============================================================
+# FILE UPLOAD
+# ============================================================
 
 @app.route('/webapp/api/file', methods=['POST'])
 def api_file():
@@ -2673,12 +2679,17 @@ def api_file():
         return jsonify({
             "answer": display, "filename": filename,
             "balance": new_balance, "chat_db_id": chat_db_id,
-            "is_file": is_file, "file_content": file_content, "out_filename": out_filename,
+            "is_file": is_file, "file_content": file_content,
+            "out_filename": out_filename,
         })
     except Exception as e:
         log_error(f"api_file: {e}")
         return jsonify({"error": str(e)}), 500
 
+
+# ============================================================
+# TICKETS
+# ============================================================
 
 @app.route('/webapp/api/tickets/list', methods=['POST'])
 def api_tickets_list():
@@ -2718,6 +2729,40 @@ def api_tickets_create():
         return jsonify({"ok": True, "ticket_id": ticket_id})
     except Exception as e:
         log_error(f"api_tickets_create: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# ============================================================
+# ADMIN STATS
+# ============================================================
+
+@app.route('/webapp/api/admin/stats', methods=['POST'])
+def api_admin_stats():
+    try:
+        data = request.get_json() or {}
+        chat_id = api_auth(data)
+        if chat_id != ADMIN_ID:
+            return jsonify({"error": "unauthorized"}), 401
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*), COALESCE(SUM(tokens), 0) FROM users")
+        users_count, total_tokens = c.fetchone()
+        c.execute("SELECT COUNT(*) FROM image_history WHERE kind='gen'")
+        images_gen = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM image_history WHERE kind='edit'")
+        images_edit = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM chats")
+        chats_count = c.fetchone()[0]
+        c.execute("SELECT COALESCE(SUM(amount), 0) FROM orders WHERE paid=1")
+        revenue = c.fetchone()[0]
+        conn.close()
+        return jsonify({
+            "users": users_count, "tokens": total_tokens,
+            "images_gen": images_gen, "images_edit": images_edit,
+            "chats": chats_count, "revenue": revenue,
+        })
+    except Exception as e:
+        log_error(f"api_admin_stats: {e}")
         return jsonify({"error": str(e)}), 500
 
 
@@ -2860,8 +2905,10 @@ def send_startup_report():
         print(f"Startup report error: {e}")
 
 
+print("[PART 2] API + Workers loaded", flush=True)
+
 # ============================================================
-# WEBAPP HTML
+# WEBAPP HTML + CSS
 # ============================================================
 
 WEBAPP_MAINTENANCE_HTML = '''<!DOCTYPE html>
@@ -2877,8 +2924,6 @@ p{font-size:16px;opacity:0.6;margin:0;}
 <h1>🛠</h1><h2>MSG_PLACEHOLDER</h2><p>🆘 Поддержка работает</p>
 </body></html>'''
 
-
-# Вставить сюда WEBAPP_HTML из следующей части
 
 WEBAPP_HTML = r'''<!DOCTYPE html>
 <html lang="ru">
@@ -2897,7 +2942,6 @@ html,body{overscroll-behavior:none;}
   --card:#132a45;
   --card2:#1a3757;
   --text:#e8f4ff;
-  --text-dim:#8fb8dc;
   --primary:#4a9eff;
   --primary-dark:#2c7be5;
   --primary-light:#7bc0ff;
@@ -2933,7 +2977,6 @@ body::before{
 }
 @keyframes waveMove{from{background-position:0 0;}to{background-position:1200px 0;}}
 
-/* Плавающие рыбки на фоне */
 .fish{
   position:fixed;
   font-size:22px;
@@ -2950,7 +2993,6 @@ body::before{
   to{transform:translateX(calc(100vw + 100px));}
 }
 
-/* ШАПКА */
 .app-header{
   position:sticky;top:0;z-index:100;
   background:var(--grad-header);
@@ -2966,8 +3008,7 @@ body::before{
   background:linear-gradient(180deg,rgba(255,255,255,0.45) 0%,rgba(255,255,255,0.15) 100%);
   border-radius:12px;
   display:flex;align-items:center;justify-content:center;
-  box-shadow:inset 0 1px 0 rgba(255,255,255,0.6),
-    0 2px 8px rgba(0,0,0,0.2);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.6),0 2px 8px rgba(0,0,0,0.2);
   font-size:22px;
 }
 .app-header .title{
@@ -2984,9 +3025,8 @@ body::before{
   text-shadow:0 1px 2px rgba(0,0,0,0.3);
 }
 
-.container{padding:16px;padding-bottom:100px;position:relative;z-index:1;}
+.container{padding:16px;padding-bottom:120px;position:relative;z-index:1;}
 
-/* КНОПКИ */
 .btn{
   display:flex;align-items:center;gap:14px;padding:16px 20px;
   background:linear-gradient(180deg,var(--card2) 0%,var(--card) 100%);
@@ -3015,7 +3055,6 @@ body::before{
   filter:drop-shadow(0 0 6px var(--glow));
 }
 
-/* ЭКРАНЫ */
 .screen{display:none;}
 .screen.active{display:block;animation:fadeIn 0.25s;}
 @keyframes fadeIn{from{opacity:0;transform:translateY(10px);}to{opacity:1;transform:translateY(0);}}
@@ -3040,7 +3079,6 @@ body::before{
   text-shadow:0 1px 2px rgba(0,0,0,0.4);
 }
 
-/* ИНПУТЫ */
 .input-wrap{margin-bottom:14px;}
 .input-wrap textarea,.input-wrap input{
   width:100%;padding:14px 16px;
@@ -3055,7 +3093,6 @@ body::before{
 }
 .input-wrap textarea{min-height:100px;}
 
-/* КНОПКА ДЕЙСТВИЯ */
 .action-btn{
   width:100%;padding:16px;border:none;border-radius:14px;
   background:var(--grad);color:#fff;font-size:16px;font-weight:700;
@@ -3073,7 +3110,6 @@ body::before{
   text-shadow:none;
 }
 
-/* ЧАТ */
 .chat-messages{
   display:flex;flex-direction:column;gap:12px;
   margin-bottom:16px;min-height:200px;
@@ -3106,7 +3142,6 @@ body::before{
 .msg.bot.file-msg .file-name{font-weight:700;color:var(--primary-light);}
 .msg.bot.file-msg .file-sub{font-size:11px;opacity:0.6;margin-top:2px;}
 
-/* ПРИКРЕПЛЕНИЕ ФАЙЛА */
 .attach-area{
   display:flex;align-items:center;gap:10px;padding:10px 14px;
   background:var(--card);
@@ -3142,12 +3177,11 @@ body::before{
   cursor:pointer;font-size:14px;
 }
 
-/* ФИКСИРОВАННАЯ ПАНЕЛЬ ВНИЗУ ЧАТА */
 .chat-bottom-panel{
   position:fixed;
   bottom:0;left:0;right:0;
   z-index:200;
-  background:linear-gradient(180deg,rgba(10,22,40,0.6) 0%,var(--bg) 30%);
+  background:linear-gradient(180deg,rgba(10,22,40,0.85) 0%,var(--bg) 30%);
   backdrop-filter:blur(12px);
   -webkit-backdrop-filter:blur(12px);
   padding:10px 14px 14px 14px;
@@ -3184,6 +3218,16 @@ body::before{
   transition:all 0.15s;
 }
 .chat-input-row .cancel-btn:active{transform:scale(0.92);}
+.chat-input-row .attach-btn{
+  width:44px;height:44px;flex-shrink:0;
+  border-radius:12px;border:1px solid var(--border);
+  background:rgba(74,158,255,0.15);
+  color:var(--primary-light);
+  display:flex;align-items:center;justify-content:center;
+  cursor:pointer;font-size:20px;
+  transition:all 0.15s;
+}
+.chat-input-row .attach-btn:active{transform:scale(0.92);}
 .chat-input-row .send-btn{
   width:44px;height:44px;flex-shrink:0;
   border-radius:12px;border:none;
@@ -3220,11 +3264,9 @@ body::before{
   box-shadow:inset 0 1px 0 rgba(255,255,255,0.2);
 }
 
-/* ПРОГРЕСС */
 .progress-wrap{margin:20px 0;}
 .progress-bar{
-  width:100%;height:10px;
-  background:rgba(0,0,0,0.4);
+  width:100%;height:10px;background:rgba(0,0,0,0.4);
   border-radius:10px;overflow:hidden;
   border:1px solid var(--border);
   box-shadow:inset 0 2px 6px rgba(0,0,0,0.5);
@@ -3240,7 +3282,6 @@ body::before{
   text-shadow:0 0 8px var(--glow);
 }
 
-/* РЕЗУЛЬТАТ */
 .result-img{
   width:100%;border-radius:16px;
   box-shadow:0 8px 32px var(--glow),0 0 0 1px var(--border);
@@ -3252,7 +3293,6 @@ body::before{
   padding:0 10px;font-weight:600;
 }
 
-/* ЗАГРУЗКА */
 .loading{
   text-align:center;padding:60px 20px;
   color:var(--primary-light);font-size:15px;
@@ -3267,7 +3307,6 @@ body::before{
   border-radius:12px;
 }
 
-/* ТАБЫ */
 .tabs{
   display:flex;gap:8px;margin-bottom:16px;
   background:var(--card);padding:5px;border-radius:14px;
@@ -3285,7 +3324,6 @@ body::before{
   box-shadow:inset 0 1px 0 rgba(255,255,255,0.35),0 2px 8px var(--glow);
 }
 
-/* ИСТОРИЯ */
 .history-grid{
   display:grid;grid-template-columns:1fr 1fr;gap:10px;
 }
@@ -3307,7 +3345,6 @@ body::before{
   background:rgba(0,0,0,0.3);font-weight:600;
 }
 
-/* ПОКУПКА */
 .buy-option{
   padding:18px;
   background:linear-gradient(180deg,var(--card2),var(--card));
@@ -3332,7 +3369,6 @@ body::before{
   text-shadow:0 0 8px var(--glow);
 }
 
-/* РЕЖИМЫ */
 .mode-option{
   padding:14px 18px;
   background:linear-gradient(180deg,var(--card2),var(--card));
@@ -3355,7 +3391,6 @@ body::before{
 }
 .mode-option.active .check{opacity:1;}
 
-/* СПИСОК ЧАТОВ */
 .chat-item{
   display:flex;align-items:center;gap:12px;
   padding:14px 16px;
@@ -3392,7 +3427,6 @@ body::before{
 }
 .chat-item .actions .mini-btn:active{transform:scale(0.9);}
 
-/* ТИКЕТЫ */
 .ticket-card{
   background:linear-gradient(180deg,var(--card2),var(--card));
   border:1px solid var(--border);border-radius:14px;
@@ -3419,13 +3453,12 @@ body::before{
 .ticket-card .msg{font-size:14px;line-height:1.4;margin-bottom:6px;}
 .ticket-card .answer{
   font-size:13px;padding:10px;
-  background:var(--glow);opacity:0.2;
+  background:rgba(74,158,255,0.15);
   border-radius:10px;
   border-left:3px solid var(--primary);
   margin-top:8px;
 }
 
-/* МОДАЛКА */
 .modal-overlay{
   position:fixed;top:0;left:0;right:0;bottom:0;
   background:rgba(0,0,0,0.75);z-index:1000;
@@ -3449,7 +3482,7 @@ body::before{
   font-size:15px;font-weight:600;cursor:pointer;
 }
 .modal-btn.cancel{
-  background:var(--glow);opacity:0.3;
+  background:rgba(74,158,255,0.15);
   color:var(--text);border:1px solid var(--border);
 }
 .modal-btn.confirm{
@@ -3457,7 +3490,6 @@ body::before{
   box-shadow:0 4px 12px var(--glow);
 }
 
-/* РЕДАКТИРОВАНИЕ */
 .edit-thumb{
   width:70px;height:70px;border-radius:12px;
   object-fit:cover;
@@ -3471,6 +3503,8 @@ body::before{
   background:rgba(74,158,255,0.05);
   border-radius:14px;
   border:1px dashed var(--border);
+  min-height:90px;
+  align-items:center;
 }
 .edit-add-btn{
   width:70px;height:70px;
@@ -3498,7 +3532,6 @@ body::before{
 
 <div class="container">
 
-<!-- ГЛАВНОЕ МЕНЮ -->
 <div id="screen-main" class="screen active">
   <button class="btn" id="btn-open-generate">
     <div class="ico">🎨</div>
@@ -3532,7 +3565,6 @@ body::before{
   </button>
 </div>
 
-<!-- ГЕНЕРАЦИЯ -->
 <div id="screen-generate" class="screen">
   <div class="screen-header">
     <button class="back-btn" id="btn-back-gen">←</button>
@@ -3553,7 +3585,6 @@ body::before{
   <div id="gen-result" style="display:none;"></div>
 </div>
 
-<!-- РЕДАКТИРОВАНИЕ -->
 <div id="screen-edit" class="screen">
   <div class="screen-header">
     <button class="back-btn" id="btn-back-edit">←</button>
@@ -3563,9 +3594,7 @@ body::before{
     <div style="font-size:14px;opacity:0.8;margin-bottom:8px;">
       📸 Загрузи 1-3 фото и напиши задание:
     </div>
-    <div class="edit-thumbs" id="edit-thumbs">
-      <div class="edit-add-btn" id="edit-add-btn">+</div>
-    </div>
+    <div class="edit-thumbs" id="edit-thumbs"></div>
     <input type="file" id="edit-file-input" accept="image/*" multiple style="display:none;">
     <div class="input-wrap">
       <textarea id="edit-prompt" placeholder="Что сделать с фото? Например: убери фон, помести на пляж, сделай аниме..."></textarea>
@@ -3581,7 +3610,6 @@ body::before{
   <div id="edit-result" style="display:none;"></div>
 </div>
 
-<!-- ЧАТ -->
 <div id="screen-chat" class="screen">
   <div class="screen-header">
     <button class="back-btn" id="btn-back-chat">←</button>
@@ -3607,7 +3635,6 @@ body::before{
   <div style="height:100px;"></div>
 </div>
 
-<!-- ПАНЕЛЬ ЧАТА (ФИКСИРОВАННАЯ) -->
 <div class="chat-bottom-panel" id="chat-bottom-panel">
   <div class="attach-area" id="chat-attach-area" style="display:none;">
     <div class="att-ico">📎</div>
@@ -3621,12 +3648,11 @@ body::before{
   <div class="chat-input-row">
     <button class="cancel-btn" id="chat-cancel-btn" style="display:none;" title="Отменить">✕</button>
     <textarea id="chat-input" placeholder="Сообщение Бобу..." rows="1"></textarea>
-    <button class="cancel-btn" id="chat-attach-btn" style="background:rgba(74,158,255,0.15);color:var(--primary-light);" title="Прикрепить файл">📎</button>
+    <button class="attach-btn" id="chat-attach-btn" title="Прикрепить файл">📎</button>
     <button class="send-btn" id="chat-send-btn" title="Отправить">➤</button>
   </div>
 </div>
 
-<!-- СПИСОК ЧАТОВ -->
 <div id="screen-chats" class="screen">
   <div class="screen-header">
     <button class="back-btn" id="btn-back-chats">←</button>
@@ -3636,7 +3662,6 @@ body::before{
   <div id="chats-list"><div class="loading">Загрузка...</div></div>
 </div>
 
-<!-- НАСТРОЙКИ ИИ -->
 <div id="screen-ai-settings" class="screen">
   <div class="screen-header">
     <button class="back-btn" id="btn-back-ai-set">←</button>
@@ -3648,7 +3673,6 @@ body::before{
   <div id="chat-ai-modes-list"></div>
 </div>
 
-<!-- ИСТОРИЯ -->
 <div id="screen-history" class="screen">
   <div class="screen-header">
     <button class="back-btn" id="btn-back-hist">←</button>
@@ -3661,7 +3685,6 @@ body::before{
   <div id="history-content"><div class="loading">Загрузка...</div></div>
 </div>
 
-<!-- ПОКУПКА -->
 <div id="screen-buy" class="screen">
   <div class="screen-header">
     <button class="back-btn" id="btn-back-buy">←</button>
@@ -3689,7 +3712,6 @@ body::before{
   <button class="action-btn" id="buy-custom-btn">✏️ Купить свою сумму</button>
 </div>
 
-<!-- ПОДДЕРЖКА -->
 <div id="screen-support" class="screen">
   <div class="screen-header">
     <button class="back-btn" id="btn-back-sup">←</button>
@@ -3718,12 +3740,20 @@ body::before{
 </div>
 
 <script>
-/* JS из следующей части */
+/* JS из Части 4 */
 </script>
 </body>
 </html>'''
 
-<script>
+print("[PART 3] WebApp HTML+CSS loaded", flush=True)
+
+# ============================================================
+# WEBAPP JS — замена блока <script>
+# ============================================================
+
+WEBAPP_HTML = WEBAPP_HTML.replace(
+    "<script>\n/* JS из Части 4 */\n</script>",
+    r"""<script>
 (function() {
   'use strict';
 
@@ -3785,8 +3815,7 @@ body::before{
     var el = $('screen-' + name);
     if (el) el.classList.add('active');
     state.currentScreen = name;
-    
-    // Панель чата внизу
+
     if (name === 'chat') {
       $('chat-bottom-panel').classList.add('active');
       loadChatHistory();
@@ -3794,7 +3823,7 @@ body::before{
     } else {
       $('chat-bottom-panel').classList.remove('active');
     }
-    
+
     if (name === 'history') loadHistory('gen', $('tab-hist-gen'));
     if (name === 'chats') loadChatsList();
     if (name === 'ai-settings') loadAISettings();
@@ -3846,9 +3875,7 @@ body::before{
     });
   }
 
-  // ============================================
   // ГЕНЕРАЦИЯ
-  // ============================================
   function resetGenForm() {
     $('gen-form').style.display = 'block';
     $('gen-progress').style.display = 'none';
@@ -3921,9 +3948,7 @@ body::before{
     });
   }
 
-  // ============================================
-  // РЕДАКТИРОВАНИЕ ФОТО
-  // ============================================
+  // РЕДАКТИРОВАНИЕ
   function resetEditForm() {
     $('edit-form').style.display = 'block';
     $('edit-progress').style.display = 'none';
@@ -3983,7 +4008,7 @@ body::before{
     if (!prompt) { try{tg.showAlert('❌ Напиши задание');}catch(e){} return; }
     if (state.pendingEditFiles.length === 0) { try{tg.showAlert('❌ Загрузи хотя бы 1 фото');}catch(e){} return; }
     if (!state.me || state.me.tokens < 4) { try{tg.showAlert('❌ Нужно 4 токена');}catch(e){} return; }
-    
+
     state.isEditing = true;
     $('edit-form').style.display = 'none';
     $('edit-progress').style.display = 'block';
@@ -4044,7 +4069,7 @@ body::before{
           state.isEditing = false;
         }, 800);
       })
-      .catch(function(e) {
+      .catch(function() {
         clearInterval(interval);
         resetEditForm();
         try{tg.showAlert('❌ Ошибка сети');}catch(e){}
@@ -4052,9 +4077,7 @@ body::before{
       });
   }
 
-  // ============================================
   // ЧАТ
-  // ============================================
   function loadChatHistory() {
     if (!state.currentChatId) {
       apiCall('chats/list').then(function(d) {
@@ -4148,7 +4171,6 @@ body::before{
     setTimeout(function() { window.scrollTo({top: document.body.scrollHeight, behavior:'smooth'}); }, 100);
   }
 
-  // Прикрепление файла в чате
   function chatAttachClick() {
     var inp = document.createElement('input');
     inp.type = 'file';
@@ -4300,7 +4322,6 @@ body::before{
       return;
     }
 
-    // Файл
     if (file) {
       state.isChatting = true;
       appendMessage('user', '📎 ' + file.name + (question ? '\n' + question : ''), false);
@@ -4350,7 +4371,6 @@ body::before{
       return;
     }
 
-    // Обычное сообщение
     state.isChatting = true;
     input.value = '';
     autoResizeInput();
@@ -4389,9 +4409,7 @@ body::before{
     });
   }
 
-  // ============================================
   // НАСТРОЙКИ ИИ
-  // ============================================
   function loadAISettings() {
     if (!state.me) return;
     var modes = [
@@ -4440,9 +4458,7 @@ body::before{
     });
   }
 
-  // ============================================
   // ИСТОРИЯ
-  // ============================================
   function loadHistory(kind, tabEl) {
     var tabs = document.querySelectorAll('#screen-history .tab');
     for (var i = 0; i < tabs.length; i++) tabs[i].classList.remove('active');
@@ -4475,9 +4491,7 @@ body::before{
     });
   }
 
-  // ============================================
   // ПОКУПКА
-  // ============================================
   function buyTokens(amount, tokens) {
     try {
       tg.showConfirm('Купить ' + tokens + ' токенов за ' + amount + ' ₽?', function(ok) {
@@ -4490,9 +4504,7 @@ body::before{
     } catch(e){}
   }
 
-  // ============================================
   // ПОДДЕРЖКА
-  // ============================================
   function loadTickets() {
     apiCall('tickets/list').then(function(d) {
       var c = $('support-tickets');
@@ -4537,9 +4549,7 @@ body::before{
     });
   }
 
-  // ============================================
   // BIND
-  // ============================================
   $('btn-open-generate').addEventListener('click', function() { showScreen('generate'); });
   $('btn-open-edit').addEventListener('click', function() { showScreen('edit'); });
   $('btn-open-chat').addEventListener('click', function() { showScreen('chat'); });
@@ -4562,7 +4572,6 @@ body::before{
 
   $('gen-btn').addEventListener('click', doGenerate);
   $('edit-btn').addEventListener('click', doEdit);
-  $('edit-add-btn').addEventListener('click', function() { $('edit-file-input').click(); });
   $('edit-file-input').addEventListener('change', function() { editFileSelected(this); });
 
   $('chat-send-btn').addEventListener('click', doChat);
@@ -4610,12 +4619,14 @@ body::before{
   updateBackButton();
   setInterval(function() { if (state.currentScreen === 'main') loadMe(); }, 60000);
 })();
-</script>
+</script>""",
+    1
+)
+
 
 # ============================================================
-# Часть 4: WebApp route + Flask API + Запуск
+# WEBAPP ROUTE
 # ============================================================
-
 
 @app.route('/webapp/')
 @app.route('/webapp')
@@ -4630,36 +4641,6 @@ def webapp_index():
     except Exception as e:
         log_error(f"webapp_index: {e}")
         return WEBAPP_HTML
-
-
-@app.route('/webapp/api/admin/stats', methods=['POST'])
-def api_admin_stats():
-    try:
-        data = request.get_json() or {}
-        chat_id = api_auth(data)
-        if chat_id != ADMIN_ID:
-            return jsonify({"error": "unauthorized"}), 401
-        conn = get_conn()
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*), COALESCE(SUM(tokens), 0) FROM users")
-        users_count, total_tokens = c.fetchone()
-        c.execute("SELECT COUNT(*) FROM image_history WHERE kind='gen'")
-        images_gen = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM image_history WHERE kind='edit'")
-        images_edit = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM chats")
-        chats_count = c.fetchone()[0]
-        c.execute("SELECT COALESCE(SUM(amount), 0) FROM orders WHERE paid=1")
-        revenue = c.fetchone()[0]
-        conn.close()
-        return jsonify({
-            "users": users_count, "tokens": total_tokens,
-            "images_gen": images_gen, "images_edit": images_edit,
-            "chats": chats_count, "revenue": revenue,
-        })
-    except Exception as e:
-        log_error(f"api_admin_stats: {e}")
-        return jsonify({"error": str(e)}), 500
 
 
 # ============================================================
